@@ -72,10 +72,16 @@ fn malformed_data_is_partial_not_empty_success() {
 #[test]
 fn html_is_private_escaped_and_evidence_links_resolve() {
     let path = temp("report.html");
+    let input = temp("escaped.jsonl");
+    std::fs::write(
+        &input,
+        include_str!("../examples/claude.jsonl").replace("anthropic", "<script>untrusted</script>"),
+    )
+    .unwrap();
     let args = [
         "report",
         "--input",
-        "examples/claude.jsonl",
+        input.to_str().unwrap(),
         "--input",
         "examples/codex.jsonl",
         "--output",
@@ -90,8 +96,8 @@ fn html_is_private_escaped_and_evidence_links_resolve() {
     let html = std::fs::read_to_string(&path).unwrap();
     assert!(!html.contains("<script>"));
     assert!(html.contains("&lt;script&gt;"));
-    assert!(html.contains("possible correction"));
-    assert!(html.contains("repeated user text"));
+    assert!(!html.contains("I already told you"));
+    assert!(!html.contains("pattern candidates"));
     for part in html.split("href=\"#").skip(1) {
         let target = part.split('"').next().unwrap();
         assert!(
@@ -109,6 +115,21 @@ fn html_is_private_escaped_and_evidence_links_resolve() {
     }
     assert!(!cli(&args).status.success());
     std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(input).unwrap();
+}
+
+#[test]
+fn usage_export_has_no_conversation_payload() {
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        "examples/claude.jsonl",
+        "--json",
+    ]));
+    assert_eq!(v["schema"], "vessa-usage.v1");
+    assert!(v["sessions"][0].get("messages").is_none());
+    assert!(!v.to_string().contains("I already told you"));
+    assert!(!cli(&["patterns"]).status.success());
 }
 
 #[test]

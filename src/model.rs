@@ -3,16 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Message {
-    pub id: String,
-    pub role: String,
-    pub text: String,
-    pub at: Option<String>,
-    pub source: String,
-    pub line: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Entry {
     pub provider: String,
     pub model: String,
@@ -50,7 +40,6 @@ pub struct Session {
     pub started_at: Option<String>,
     pub cwd: String,
     pub source: String,
-    pub messages: Vec<Message>,
     pub usage: Vec<Usage>,
     pub limitations: Vec<String>,
     pub ohjaa: Vec<serde_json::Value>,

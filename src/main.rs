@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(about = "Local agent usage and conversation evidence. No model calls.")]
+#[command(about = "Local agent usage and spending evidence. Estimates are not bills.")]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -38,8 +38,6 @@ enum Cmd {
         #[arg(long)]
         by_agent: bool,
     },
-    /// Evidence-linked pattern candidates; no causal or quality claims.
-    Patterns,
     /// Write a standalone, private HTML report. Refuses to overwrite.
     Report {
         #[arg(long)]
@@ -96,10 +94,9 @@ fn run(cli: Cli) -> Result<i32> {
             })?;
             file.write_all(html.as_bytes())?;
             println!(
-                "report: {} · {} sessions · {} pattern candidates",
+                "report: {} · {} sessions",
                 output.display(),
-                report.sessions.len(),
-                analysis::patterns(&report.sessions).len()
+                report.sessions.len()
             );
         }
         Cmd::Receipt => {
@@ -108,23 +105,6 @@ fn run(cli: Cli) -> Result<i32> {
                 "receipt needs exactly one session; select with --session"
             );
             json(&model::receipt(&report.sessions[0])?)?;
-        }
-        Cmd::Patterns => {
-            let findings = analysis::patterns(&report.sessions);
-            if cli.json {
-                json(&findings)?;
-            } else {
-                println!(
-                    "{} pattern candidates · hypotheses, not verified failures",
-                    findings.len()
-                );
-                for f in findings {
-                    println!("{} · {}", f.kind, f.method);
-                    for e in f.evidence {
-                        println!("  {} {} {}:{}", e.agent, e.session, e.source, e.line);
-                    }
-                }
-            }
         }
         Cmd::Usage { by_agent: true } => {
             let mut groups = std::collections::BTreeMap::<&str, Vec<&model::Usage>>::new();
@@ -157,10 +137,9 @@ fn run(cli: Cli) -> Result<i32> {
         Cmd::Sessions => {
             for s in &report.sessions {
                 println!(
-                    "{} {} · {} messages · {} usage records · {}",
+                    "{} {} · {} usage records · {}",
                     s.agent,
                     s.id,
-                    s.messages.len(),
                     s.usage.len(),
                     s.cwd
                 );

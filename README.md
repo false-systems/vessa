@@ -1,8 +1,8 @@
 # Vessa
 
-Local evidence for what agent sessions consume and how conversations unfold.
-One Rust binary: native transcript imports, usage reports, conversation pattern
-candidates and a standalone HTML report. No database, daemon, JavaScript or
+Local evidence for what agent sessions consume.
+One Rust binary: native usage imports, spending reports, JSON exports
+and a standalone HTML report. No database, daemon, JavaScript or
 network calls. Original files stay untouched.
 
 ```sh
@@ -10,7 +10,7 @@ cargo build --locked
 cargo run -- sessions --input /path/to/session.jsonl
 cargo run -- usage --input /path/to/session.jsonl
 cargo run -- usage --by-agent --input /path/to/sessions/
-cargo run -- patterns --input /path/to/session.jsonl --json
+cargo run -- usage --input /path/to/session.jsonl --json
 cargo run -- report --input /path/to/session.jsonl --output /tmp/vessa.html
 ```
 
@@ -52,19 +52,28 @@ Unknown token categories prevent repricing. Overlapping applicable rates fail.
 Keep plan multipliers, discounts and service tiers out of this simple API-rate
 estimate unless the supplied rate actually represents them.
 
-## Conversation patterns
+## Seula handoff
 
-`patterns` identifies repeated normalized user text and likely corrections
-using explicit English phrases. Every candidate links to native message IDs
-and source lines. Subagent conversations are excluded from human-pattern
-analysis. A repeated message is not proof of waste, and an agent saying
-"done" is not verified completion. Read the surrounding conversation.
+Conversation analysis is now a separate product, Seula. Vessa no longer has a
+`patterns` command, retains no native message bodies and does not render chats.
+Each product builds and runs independently. No sibling crate or binary is needed.
 
-This first implementation is deliberately deterministic. Jev is not connected;
-no conversations are sent to TypeSafe or another model. Semantic classification
-needs evaluation on labelled examples before its findings should guide work.
-Kide's source attribution, versioning and uncertainty principles inspired the
-design; Vessa neither links Kide nor changes its existing contract.
+```sh
+vessa usage --input /path/to/session.jsonl --json > /tmp/usage.private.json
+seula report --input /path/to/session.jsonl --usage /tmp/usage.private.json --output /tmp/conversations.html
+```
+
+`usage --json` and `sessions --json` emit `vessa-usage.v1`: `sessions` and
+`warnings`. Each session includes explicit `agent` and native `id`, source,
+lineage, limitations and request-level `usage`. Each usage record preserves
+source, line, time and its token/money `entry`. Optional `ohjaa` records are
+explicitly linked wrapper context. This replaces the initial local
+`vessa-report.v1` export; consumers must check the schema. `--by-agent --json`
+is an aggregate view, not this exchange format.
+
+Seula joins by agent and native session ID only, never directory or time.
+Whole-session spending does not establish spending caused by a conversation
+pattern. Incomplete source coverage remains visible in the export and exit code.
 
 ## Ohjaa handoff
 
@@ -79,7 +88,7 @@ vessa report --input /path/to/session.jsonl --input /tmp/ohjaa.json --output /tm
 
 `receipt` requires exactly one native session and emits `agent-usage.v1`.
 Ohjaa attaches it to an explicit wrapper session. Exported work, handover,
-knowledge and outcome evidence appears alongside the conversation only when
+knowledge and outcome evidence appears alongside the usage only when
 that explicit native-session association exists. Directory and time-window
 guesses never establish identity. Unmatched wrapper records are reported.
 Receipt totals and native totals are not added together.
@@ -92,9 +101,9 @@ Native agents do not emit this normalized receipt by themselves.
 
 The HTML is a local, standalone report. Native links, disclosure controls and
 browser Find provide navigation without a server or frontend dependencies.
-All transcript content is escaped, executable content is blocked by CSP, and
+All displayed source content is escaped, executable content is blocked by CSP, and
 new reports use mode 0600 on Unix. Existing report paths are never overwritten.
-Reports contain private conversations: generated files under `reports/` are
+Reports contain private usage and optional linked ohjaa context: files under `reports/` are
 ignored by Git. JSON printed to stdout inherits the destination permissions
 you choose. No knowledge becomes current automatically.
 

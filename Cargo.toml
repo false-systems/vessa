@@ -2,7 +2,7 @@
 name = "vessa"
 edition = "2021"
 publish = false
-description = "Local evidence for agent usage and conversation patterns"
+description = "Local agent usage and spending evidence"
 
 [dependencies]
 anyhow = "1"

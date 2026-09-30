@@ -1,6 +1,6 @@
 repo:
   name: vessa
-  role: Local agent-session usage accounting and evidence-linked conversation analysis; imports native transcripts and renders CLI and standalone HTML reports.
+  role: Local agent-session usage and spending accounting; imports native usage records and renders CLI, JSON exports and standalone HTML reports.
   not:
     - agent harness
     - billing authority

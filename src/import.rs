@@ -1,4 +1,4 @@
-use crate::model::{Entry, Message, Report, Session, Usage};
+use crate::model::{Entry, Report, Session, Usage};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -9,7 +9,7 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
     // ponytail: selected transcripts are held in memory; stream compact
     // summaries if archive size makes this one-shot reader too expensive.
     let mut report = Report {
-        schema: "vessa-report.v1".into(),
+        schema: "vessa-usage.v1".into(),
         ..Default::default()
     };
     let mut files = Vec::new();
@@ -39,7 +39,6 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
     for session in report.sessions {
         let key = (session.agent.clone(), session.id.clone());
         if let Some(old) = merged.get_mut(&key) {
-            old.messages.extend(session.messages);
             old.usage.extend(session.usage);
             old.limitations.extend(session.limitations);
         } else {
@@ -75,19 +74,6 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
         .collect();
     let mut seen: HashMap<(String, String), (Entry, String)> = HashMap::new();
     for session in &mut report.sessions {
-        let mut messages = HashMap::new();
-        session.messages.retain(|m| {
-            if let Some(old) = messages.insert(m.id.clone(), m.clone()) {
-                if old.text != m.text || old.role != m.role {
-                    session
-                        .limitations
-                        .push(format!("conflicting message {}", m.id));
-                }
-                false
-            } else {
-                true
-            }
-        });
         let mut usage = Vec::new();
         for item in session.usage.drain(..) {
             let started = session
@@ -122,11 +108,6 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             }
         }
         session.usage = usage;
-        session.messages.sort_by_key(|m| {
-            m.at.as_deref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|t| t.timestamp_millis())
-        });
         for wrapper in &wrappers {
             if wrapper["usage"].as_array().is_some_and(|receipts| {
                 receipts
@@ -270,7 +251,6 @@ fn parse_file(path: &Path) -> Result<Parsed> {
         started_at: timestamp(meta).or_else(|| timestamp(&header.1)),
         cwd: string(meta, "cwd"),
         source: source.clone(),
-        messages: Vec::new(),
         usage: Vec::new(),
         limitations,
         ohjaa: Vec::new(),
@@ -319,39 +299,6 @@ fn timestamp(v: &Value) -> Option<String> {
             .map(|t| t.to_rfc3339())
     }
 }
-fn text(content: &Value) -> String {
-    if let Some(text) = content.as_str() {
-        return text.to_owned();
-    }
-    content
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter(|v| {
-                    matches!(
-                        v["type"].as_str(),
-                        Some("text" | "input_text" | "output_text")
-                    )
-                })
-                .filter_map(|v| v["text"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default()
-}
-fn message(s: &mut Session, v: &Value, id: String, role: &str, content: &Value, line: usize) {
-    let body = text(content);
-    if !body.is_empty() && matches!(role, "user" | "assistant") {
-        s.messages.push(Message {
-            id,
-            role: role.into(),
-            text: body,
-            at: timestamp(v),
-            source: s.source.clone(),
-            line,
-        });
-    }
-}
 fn count(v: &Value, key: &str) -> Result<Option<u64>> {
     if v[key].is_null() {
         return Ok(None);
@@ -394,21 +341,7 @@ fn claude(v: &Value, line: usize, s: &mut Session) -> Result<()> {
             "mixed native session IDs"
         );
     }
-    let id = v["uuid"]
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| fallback(s, line));
     let m = &v["message"];
-    if v["isMeta"] != true && v["isCompactSummary"] != true {
-        message(
-            s,
-            v,
-            id,
-            m["role"].as_str().unwrap_or(""),
-            &m["content"],
-            line,
-        );
-    }
     if v["type"] == "assistant" && m["usage"].is_object() {
         let usage = &m["usage"];
         let mut entry = base(
@@ -447,20 +380,6 @@ fn codex(
         if let Some(p) = p["model_provider"].as_str() {
             *provider = p.into();
         }
-    }
-    // response_item is the transcript source; event_msg mirrors user text.
-    if v["type"] == "response_item" && p["type"] == "message" {
-        message(
-            s,
-            v,
-            p["id"]
-                .as_str()
-                .map(str::to_owned)
-                .unwrap_or_else(|| fallback(s, line)),
-            p["role"].as_str().unwrap_or(""),
-            &p["content"],
-            line,
-        );
     }
     if v["type"] == "event_msg" && p["type"] == "token_count" && p["info"].is_object() {
         let total = &p["info"]["total_token_usage"];
@@ -552,16 +471,6 @@ fn pi(
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| fallback(s, line));
-    if v["type"] == "message" {
-        message(
-            s,
-            v,
-            id.clone(),
-            m["role"].as_str().unwrap_or(""),
-            &m["content"],
-            line,
-        );
-    }
     if m["usage"].is_object() {
         let u = &m["usage"];
         let mut entry = base(
