@@ -1,0 +1,4 @@
+[
+  {"provider":"anthropic","model":"demo-model","effective_from":"2026-09-01T00:00:00Z","effective_until":"2026-10-01T00:00:00Z","source":"SYNTHETIC TEST RATE, not a real provider price","input":3000000,"output":15000000,"cache_read":300000,"cache_write":3750000},
+  {"provider":"openai","model":"demo-codex","effective_from":"2026-09-01T00:00:00Z","effective_until":"2026-10-01T00:00:00Z","source":"SYNTHETIC TEST RATE, not a real provider price","input":2000000,"output":10000000,"cache_read":200000,"cache_write":0}
+]

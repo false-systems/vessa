@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"pi-demo","timestamp":"2026-09-30T11:00:00Z","cwd":"/demo/widget"}
+{"type":"model_change","provider":"zai","modelId":"demo-glm","id":"model1"}
+{"type":"message","id":"p1","timestamp":"2026-09-30T11:00:00Z","message":{"role":"user","content":[{"type":"text","text":"Find the error and show the fix working."}]}}
+{"type":"message","id":"p2","timestamp":"2026-09-30T11:01:00Z","message":{"role":"assistant","provider":"zai","model":"demo-glm","content":[{"type":"text","text":"The failing fixture is now passing."}],"usage":{"input":200,"output":100,"cacheRead":400,"cacheWrite":0,"cost":{"total":0.002}}}}
+{"type":"compaction","id":"p3","timestamp":"2026-09-30T11:02:00Z","usage":{"input":20,"output":10,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.0002}}}

@@ -1,0 +1,23 @@
+repo:
+  name: vessa
+  role: Local agent-session usage accounting and evidence-linked conversation analysis; imports native transcripts and renders CLI and standalone HTML reports.
+  not:
+    - agent harness
+    - billing authority
+    - knowledge authority
+    - daemon
+context:
+  important_docs:
+    - README.md
+    - AGENTS.md
+  safe_to_ignore:
+    - target/
+    - reports/
+validation:
+  replace_inferred: true
+  fast:
+    - cargo test
+  strict:
+    - cargo fmt --check
+    - cargo clippy --all-targets -- -D warnings
+    - cargo test

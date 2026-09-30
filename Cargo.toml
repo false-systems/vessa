@@ -1,0 +1,13 @@
+[package]
+name = "vessa"
+edition = "2021"
+publish = false
+description = "Local evidence for agent usage and conversation patterns"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Parse provider RFC3339 timestamps and date-specific rate cards correctly.
+chrono = { version = "0.4", default-features = false, features = ["std"] }

@@ -1,0 +1,7 @@
+{"type":"session_meta","payload":{"id":"codex-demo","cwd":"/demo/widget","model_provider":"openai","source":"cli"}}
+{"type":"turn_context","payload":{"model":"demo-codex"}}
+{"timestamp":"2026-09-30T10:00:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Please run the existing local checks before finishing."}]}}
+{"timestamp":"2026-09-30T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100}}}}
+{"timestamp":"2026-09-30T10:01:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":400,"output_tokens":100}}}}
+{"timestamp":"2026-09-30T10:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1500,"cached_input_tokens":700,"output_tokens":200}}}}
+{"timestamp":"2026-09-30T10:03:00Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The parser check passed. <script>alert('not executable')</script>"}]}}
