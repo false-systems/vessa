@@ -1,5 +1,6 @@
 mod analysis;
 mod import;
+mod metrics;
 mod model;
 mod render;
 
@@ -8,7 +9,7 @@ use clap::{Parser, Subcommand};
 use std::io::Write;
 use std::path::PathBuf;
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(about = "Local agent usage and spending evidence. Estimates are not bills.")]
 struct Cli {
     #[command(subcommand)]
@@ -26,9 +27,15 @@ struct Cli {
     rates: Option<PathBuf>,
     #[arg(long, global = true)]
     json: bool,
+    /// Refresh in the foreground; for status, usage or stats. Ctrl-C stops it.
+    #[arg(long, global = true, value_parser = clap::value_parser!(u64).range(1..))]
+    watch: Option<u64>,
+    /// Stop after this many refreshes; requires --watch.
+    #[arg(long, global = true, requires = "watch", value_parser = clap::value_parser!(u64).range(1..))]
+    samples: Option<u64>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Cmd {
     /// List native sessions and source coverage.
     Sessions,
@@ -45,9 +52,55 @@ enum Cmd {
     },
     /// Emit one agent-usage.v1 snapshot for `ohjaa usage import`.
     Receipt,
+    /// Current recorded usage for exactly one explicitly selected session.
+    Status,
+    /// Calendar usage statistics, in UTC. Weeks use ISO week years.
+    Stats {
+        #[arg(long, value_enum, default_value = "month")]
+        period: metrics::Period,
+    },
+    /// Render Claude Code's native status-line JSON from stdin.
+    ClaudeStatusline,
 }
 
 fn run(cli: Cli) -> Result<i32> {
+    if let Some(seconds) = cli.watch {
+        ensure!(
+            matches!(
+                cli.command,
+                Cmd::Usage { .. } | Cmd::Status | Cmd::Stats { .. }
+            ),
+            "--watch supports status, usage or stats only"
+        );
+        let mut sample = 0u64;
+        loop {
+            let code = run_once(cli.clone())?;
+            sample += 1;
+            if cli.samples.is_some_and(|n| sample >= n) {
+                return Ok(code);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+        }
+    }
+    run_once(cli)
+}
+
+fn run_once(cli: Cli) -> Result<i32> {
+    if matches!(cli.command, Cmd::ClaudeStatusline) {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::io::stdin().take(1_048_577).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 1_048_576, "statusline input exceeds 1 MiB");
+        let input = serde_json::from_slice(&bytes)?;
+        println!("{}", metrics::claude_statusline(&input)?);
+        return Ok(0);
+    }
+    if matches!(cli.command, Cmd::Status) {
+        ensure!(
+            !cli.input.is_empty() || cli.session.is_some(),
+            "status requires --input or --session; never guesses the latest session"
+        );
+    }
     let paths = if cli.input.is_empty() {
         let home =
             PathBuf::from(std::env::var_os("HOME").context("HOME unavailable; pass --input")?);
@@ -61,6 +114,10 @@ fn run(cli: Cli) -> Result<i32> {
     };
     let mut report = import::read(&paths)?;
     if let Some(agent) = cli.agent {
+        ensure!(
+            ["claude", "codex", "pi"].contains(&agent.as_str()),
+            "unsupported agent {agent}"
+        );
         report.sessions.retain(|s| s.agent == agent);
     }
     if let Some(id) = cli.session {
@@ -77,6 +134,62 @@ fn run(cli: Cli) -> Result<i32> {
     let incomplete =
         !report.warnings.is_empty() || report.sessions.iter().any(|s| !s.limitations.is_empty());
     match cli.command {
+        Cmd::ClaudeStatusline => unreachable!(),
+        Cmd::Status => {
+            ensure!(
+                report.sessions.len() == 1,
+                "status needs exactly one native session; select --session"
+            );
+            let s = &report.sessions[0];
+            let last = s
+                .usage
+                .iter()
+                .filter_map(|u| u.at.as_deref())
+                .filter_map(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .max()
+                .map(|t| t.to_rfc3339());
+            if cli.json {
+                json(
+                    &serde_json::json!({"schema":"vessa-status.v1", "agent":s.agent,"session_id":s.id,"last_recorded_at":last,"entries":model::aggregate(s)?,"limitations":s.limitations,"warnings":report.warnings}),
+                )?;
+            } else {
+                println!(
+                    "{} {} · last recorded {}",
+                    s.agent,
+                    s.id,
+                    last.as_deref().unwrap_or("unknown")
+                );
+                for e in model::aggregate(s)? {
+                    println!("  {}", render::usage_line(&e));
+                }
+                if s.usage.is_empty() {
+                    println!("  usage unknown");
+                }
+            }
+        }
+        Cmd::Stats { period } => {
+            let buckets = metrics::history(&report, period)?;
+            if cli.json {
+                json(
+                    &serde_json::json!({"schema":"vessa-statistics.v1","timezone":"UTC","buckets":buckets,"warnings":report.warnings,"limitations":report.sessions.iter().flat_map(|s| s.limitations.iter().map(move |l| format!("{}/{}: {l}",s.agent,s.id))).collect::<Vec<_>>() }),
+                )?;
+            } else {
+                println!("Calendar usage · UTC · selected local records · estimates are not bills");
+                for b in buckets {
+                    println!(
+                        "{} {} · {} sessions · known estimate subtotal={} · {} unpriced records",
+                        b.period,
+                        b.agent,
+                        b.sessions,
+                        render::dollars(Some(b.known_estimated_usd_micros)),
+                        b.unpriced_records
+                    );
+                    for e in b.entries {
+                        println!("  {}", render::usage_line(&e));
+                    }
+                }
+            }
+        }
         Cmd::Report { output } => {
             let html = render::html(&report)?;
             let mut options = std::fs::OpenOptions::new();

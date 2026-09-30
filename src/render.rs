@@ -68,7 +68,28 @@ pub fn html(report: &Report) -> Result<String> {
         }
         out.push_str("</td></tr>");
     }
-    out.push_str("</tbody></table></div><h2 id=\"sources\">Sources and coverage</h2>");
+    out.push_str("</tbody></table></div><h2>Usage over time</h2><p>UTC calendar periods. Known estimates are subtotals; unpriced records are not free. Sessions spanning periods appear in each applicable period.</p>");
+    for (label, period) in [
+        ("Daily", crate::metrics::Period::Day),
+        ("Weekly", crate::metrics::Period::Week),
+        ("Monthly", crate::metrics::Period::Month),
+        ("Yearly", crate::metrics::Period::Year),
+    ] {
+        let _ = write!(out, "<details><summary>{label} statistics</summary><div class=\"scroll\"><table><thead><tr><th>Period / agent</th><th>Sessions</th><th>Known estimate subtotal</th><th>Unpriced records</th></tr></thead><tbody>");
+        for b in crate::metrics::history(report, period)? {
+            let _ = write!(
+                out,
+                "<tr><td>{} / {}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                escape(&b.period),
+                escape(&b.agent),
+                b.sessions,
+                dollars(Some(b.known_estimated_usd_micros)),
+                b.unpriced_records
+            );
+        }
+        out.push_str("</tbody></table></div></details>");
+    }
+    out.push_str("<h2 id=\"sources\">Sources and coverage</h2>");
     for (i, s) in report.sessions.iter().enumerate() {
         let _ = write!(
             out,

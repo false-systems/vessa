@@ -266,3 +266,115 @@ fn ohjaa_links_require_explicit_identity_and_agent_totals_stay_deduplicated() {
     assert_eq!(v["pi"][0]["estimated_usd_micros"], 2200);
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn calendar_statistics_use_usage_time_utc_and_preserve_unknowns() {
+    let p = temp("calendar.jsonl");
+    let records = [
+        serde_json::json!({"type":"session","version":3,"id":"calendar"}),
+        serde_json::json!({"type":"message","id":"one","timestamp":"2026-01-01T00:30:00+02:00","message":{"role":"assistant","provider":"test","model":"model","usage":{"input":10,"output":2,"cacheRead":0,"cacheWrite":0,"cost":{"total":1.25}}}}),
+        serde_json::json!({"type":"message","id":"two","timestamp":"2026-01-01T01:00:00Z","message":{"role":"assistant","provider":"test","model":"model","usage":{"input":20,"output":3,"cacheRead":0,"cacheWrite":0}}}),
+        serde_json::json!({"type":"message","id":"three","message":{"role":"assistant","provider":"test","model":"model","usage":{"input":30,"output":4,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.5}}}}),
+    ];
+    std::fs::write(
+        &p,
+        records
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let v = value(cli(&[
+        "stats",
+        "--period",
+        "month",
+        "--input",
+        p.to_str().unwrap(),
+        "--input",
+        p.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(v["buckets"][0]["period"], "2025-12");
+    assert_eq!(v["buckets"][0]["known_estimated_usd_micros"], 1_250_000);
+    assert_eq!(v["buckets"][1]["period"], "2026-01");
+    assert_eq!(v["buckets"][1]["unpriced_records"], 1);
+    assert!(v["buckets"][1]["entries"][0]["estimated_usd_micros"].is_null());
+    assert_eq!(v["buckets"][2]["period"], "undated");
+    let v = value(cli(&[
+        "stats",
+        "--period",
+        "week",
+        "--input",
+        p.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(v["buckets"][0]["period"], "2026-W01");
+    assert_eq!(v["buckets"][0]["entries"][0]["input_tokens"], 30);
+    let v = value(cli(&[
+        "stats",
+        "--period",
+        "year",
+        "--input",
+        p.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(v["buckets"][0]["period"], "2025");
+    assert_eq!(v["buckets"][1]["period"], "2026");
+    std::fs::remove_file(p).unwrap();
+}
+
+#[test]
+fn live_status_requires_identity_and_watch_is_bounded_when_requested() {
+    assert!(!cli(&["status"]).status.success());
+    let v = value(cli(&["status", "--input", "examples/pi.jsonl", "--json"]));
+    assert_eq!(v["session_id"], "pi-demo");
+    assert_eq!(v["entries"][0]["estimated_usd_micros"], 2200);
+    let out = cli(&[
+        "status",
+        "--input",
+        "examples/pi.jsonl",
+        "--watch",
+        "1",
+        "--samples",
+        "2",
+    ]);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .matches("last recorded")
+            .count(),
+        2
+    );
+    assert!(
+        !cli(&["receipt", "--input", "examples/pi.jsonl", "--watch", "1"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn native_claude_status_uses_estimate_not_limits_and_sanitizes_terminal_text() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vessa"))
+        .arg("claude-statusline")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let payload = serde_json::json!({"session_id":"demo","model":{"display_name":"Model\u{1b}[31m"},"cost":{"total_cost_usd":4.451911},"rate_limits":{"five_hour":{"used_percentage":88}}});
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("session estimate $4.45"));
+    assert!(text.contains("billed unknown"));
+    assert!(!text.contains('\u{1b}'));
+    assert!(!text.contains("88") && !text.contains("limit"));
+}

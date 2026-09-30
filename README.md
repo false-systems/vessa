@@ -11,6 +11,9 @@ cargo run -- sessions --input /path/to/session.jsonl
 cargo run -- usage --input /path/to/session.jsonl
 cargo run -- usage --by-agent --input /path/to/sessions/
 cargo run -- usage --input /path/to/session.jsonl --json
+cargo run -- status --input /path/to/session.jsonl --watch 5
+cargo run -- stats --period month
+cargo run -- stats --period year
 cargo run -- report --input /path/to/session.jsonl --output /tmp/vessa.html
 ```
 
@@ -21,6 +24,44 @@ Use `--agent claude|codex|pi` or `--session NATIVE-ID` to filter results.
 Missing paths, malformed records and unsupported formats are reported, not
 silently treated as zero. Exit 4 means the output is partial; exit 1 means
 the requested operation failed. Use the emitted limitations to judge coverage.
+
+## Session display and statistics
+
+`status` shows the latest recorded usage for exactly one explicit session.
+It requires `--input` or `--session`, never selects the most recently modified
+file, and includes the last usage timestamp so an old transcript is not
+mistaken for a live balance. `--watch SECONDS` refreshes in the foreground;
+Ctrl-C stops it. `--samples N` bounds a watch for checks. Watch also works with
+`usage` and `stats`; each JSON refresh is a separate JSON document.
+
+`stats --period day|week|month|year` groups usage events by their own timestamp,
+agent and model. Calendar periods are UTC; weeks use ISO week years. A session
+crossing a period boundary appears in both periods, with only that period's
+usage. Missing/invalid timestamps remain in an `undated` group. Unpriced usage
+is counted explicitly alongside a **known estimate subtotal**, not priced at
+zero. JSON emits `vessa-statistics.v1`; HTML reports include all four periods.
+Default scans cover selected local transcript files, not every account/device.
+
+Claude Code can call the Rust binary directly in `~/.claude/settings.json`:
+
+```json
+{"statusLine":{"type":"command","command":"~/.cargo/bin/vessa claude-statusline"}}
+```
+
+This reads Claude's native session identity and running estimate on stdin and
+prints the session estimate separately from unknown actual billing. It makes
+no model calls and displays no budgets, quotas or limits. Preserve any existing
+status-line customization when installing. See the official
+[Claude status-line contract](https://code.claude.com/docs/en/statusline).
+
+Codex's native `tui.status_line` supports input/output token counters and,
+where supplied by the account, estimated thread cost and thread credits. A
+missing account cost is not fabricated from tokens. Use `vessa status` with
+an explicit transcript and dated `--rates` for an external priced view. Pi
+already shows accumulated usage/cost in its footer and `/session`; its cost is
+still an estimate. Native display support differs by agent/account; this is
+not a universal live billing API. Seula owns repeated-correction patterns and
+their calendar counts; Vessa does not call a whole session's spending waste.
 
 ## Usage evidence
 

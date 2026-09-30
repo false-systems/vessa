@@ -137,6 +137,11 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             ));
         }
     }
+    if report.sessions.is_empty() {
+        report
+            .warnings
+            .push("No supported native sessions found; usage is unknown".into());
+    }
     Ok(report)
 }
 
