@@ -114,6 +114,11 @@ explicitly linked wrapper context. This replaces the initial local
 `vessa-report.v1` export; consumers must check the schema. `--by-agent --json`
 is an aggregate view, not this exchange format.
 
+Each session also exports `totals`, calculated by Vessa from deduplicated
+records and grouped by provider/model. Consumers can display these beside work
+evidence without implementing accounting. Unknown categories remain null; older
+exports without this additive field still contain the original usage records.
+
 Seula joins by agent and native session ID only, never directory or time.
 Whole-session spending does not establish spending caused by a conversation
 pattern. Incomplete source coverage remains visible in the export and exit code.

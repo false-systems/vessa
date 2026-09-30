@@ -127,6 +127,8 @@ fn usage_export_has_no_conversation_payload() {
         "--json",
     ]));
     assert_eq!(v["schema"], "vessa-usage.v1");
+    assert_eq!(v["sessions"][0]["totals"][0]["input_tokens"], 1200);
+    assert!(v["sessions"][0]["totals"][0]["estimated_usd_micros"].is_null());
     assert!(v["sessions"][0].get("messages").is_none());
     assert!(!v.to_string().contains("I already told you"));
     assert!(!cli(&["patterns"]).status.success());

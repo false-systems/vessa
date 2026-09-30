@@ -246,7 +246,18 @@ fn run_once(cli: Cli) -> Result<i32> {
                 }
             }
         }
-        Cmd::Sessions | Cmd::Usage { .. } if cli.json => json(&report)?,
+        Cmd::Sessions | Cmd::Usage { .. } if cli.json => {
+            let mut export = serde_json::to_value(&report)?;
+            for (value, session) in export["sessions"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .zip(&report.sessions)
+            {
+                value["totals"] = serde_json::to_value(model::aggregate(session)?)?;
+            }
+            json(&export)?;
+        }
         Cmd::Sessions => {
             for s in &report.sessions {
                 println!(
