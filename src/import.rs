@@ -152,7 +152,12 @@ fn discover(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     }
     if meta.is_dir() {
         for item in std::fs::read_dir(path)? {
-            discover(&item?.path(), out)?;
+            let item = item?;
+            // Native session directories also hold JSON metadata, not usage
+            // exports. JSON exports must be selected explicitly with --input.
+            if item.file_type()?.is_dir() || item.path().extension().is_some_and(|s| s == "jsonl") {
+                discover(&item.path(), out)?;
+            }
         }
     } else if meta.is_file()
         && matches!(

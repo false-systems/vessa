@@ -378,3 +378,29 @@ fn native_claude_status_uses_estimate_not_limits_and_sanitizes_terminal_text() {
     assert!(!text.contains('\u{1b}'));
     assert!(!text.contains("88") && !text.contains("limit"));
 }
+
+#[test]
+fn native_directory_metadata_is_not_misread_as_an_export() {
+    let dir = temp("native-dir");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(
+        dir.join("session.jsonl"),
+        include_str!("../examples/pi.jsonl"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("session.meta.json"), "{\"agentType\":\"worker\"}").unwrap();
+    let v = value(cli(&["stats", "--input", dir.to_str().unwrap(), "--json"]));
+    assert!(v["warnings"].as_array().unwrap().is_empty());
+    assert_eq!(v["buckets"][0]["known_estimated_usd_micros"], 2200);
+    assert_eq!(
+        cli(&[
+            "usage",
+            "--input",
+            dir.join("session.meta.json").to_str().unwrap()
+        ])
+        .status
+        .code(),
+        Some(4)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

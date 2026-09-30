@@ -19,6 +19,8 @@ cargo run -- report --input /path/to/session.jsonl --output /tmp/vessa.html
 
 `--input` is repeatable and accepts a file or directory. Without it, Vessa
 reads `~/.claude/projects`, `~/.codex/sessions`, and `~/.pi/agent/sessions`.
+Directories discover native `.jsonl` transcripts; select ohjaa `.json` exports
+as explicit files so agent metadata JSON is not mistaken for a usage source.
 Pass explicit paths for relocated agent directories or a bounded selection.
 Use `--agent claude|codex|pi` or `--session NATIVE-ID` to filter results.
 Missing paths, malformed records and unsupported formats are reported, not
