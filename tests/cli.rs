@@ -119,6 +119,42 @@ fn html_is_private_escaped_and_evidence_links_resolve() {
 }
 
 #[test]
+fn report_explains_partial_spending_and_command_evidence() {
+    let path = temp("spending.html");
+    let output = cli(&[
+        "report",
+        "--input",
+        "examples/codex.jsonl",
+        "--input",
+        "examples/pi.jsonl",
+        "--output",
+        path.to_str().unwrap(),
+    ]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let html = std::fs::read_to_string(&path).unwrap();
+    assert!(html.contains("<strong>$0.002200</strong> known estimate subtotal"));
+    assert!(html.contains("<strong>2/4</strong> usage records priced"));
+    assert!(html.contains("<strong>2</strong> unpriced"));
+    let ranking = html
+        .split("Sessions by known estimate subtotal")
+        .nth(1)
+        .unwrap();
+    assert!(ranking.find("pi-demo").unwrap() < ranking.find("codex-demo").unwrap());
+    assert!(html.contains("Unpriced sessions can cost more"));
+    assert!(html.contains("Command 1 ·"));
+    assert!(html.contains("Uncached input</th>"));
+    assert!(html.contains("Cached input read</th>"));
+    assert!(html.contains("Savings are not measured here."));
+    assert!(html.contains("Do not nest a second wrapper."));
+    assert!(!html.contains("Please run the existing local checks"));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn usage_export_has_no_conversation_payload() {
     let v = value(cli(&[
         "usage",

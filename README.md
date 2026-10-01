@@ -173,6 +173,21 @@ Native agents do not emit this normalized receipt by themselves.
 
 ## UI and privacy
 
+The report starts with the known spending subtotal, priced/unpriced record
+coverage and sessions ranked by that subtotal. Rankings are not complete cost
+comparisons when prices are missing. Expand a command to see separate token
+categories, tool/failure/edit counts and the source location; full evidence is
+still available below it. No prompt bodies are retained to label commands.
+
+The report also explains the existing Ohjaa/Toimija workflow for reducing
+repeated discovery: launch once through `ohjaa run` (which invokes Toimija),
+use the delivered workset and handover, and refresh only when facts become
+stale. Use the receipt/export commands above to associate usage with an
+explicit Ohjaa session. These remain optional file exchanges, not runtime
+dependencies. Wrapper association does not prove savings: compare similar
+tasks, model/rates, token categories and verified outcomes before making that
+claim. Do not remove safety instructions or validation to lower usage.
+
 The HTML is a local, standalone report. Native links, disclosure controls and
 browser Find provide navigation without a server or frontend dependencies.
 All displayed source content is escaped, executable content is blocked by CSP, and
