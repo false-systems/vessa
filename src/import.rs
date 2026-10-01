@@ -40,6 +40,7 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
         let key = (session.agent.clone(), session.id.clone());
         if let Some(old) = merged.get_mut(&key) {
             old.usage.extend(session.usage);
+            old.work.extend(session.work);
             old.limitations.extend(session.limitations);
         } else {
             merged.insert(key, session);
@@ -264,12 +265,14 @@ fn parse_file(path: &Path) -> Result<Parsed> {
         usage: Vec::new(),
         limitations,
         ohjaa: Vec::new(),
+        work: Vec::new(),
     };
     let mut model = "unknown".to_owned();
     let mut provider = "unknown".to_owned();
     let mut previous: Option<[u64; 3]> = None;
     let mut pi_model_changed = false;
     for (line, value) in records {
+        crate::work::observe(&value, line, &mut session);
         let result = match agent {
             "claude" => claude(&value, line, &mut session),
             "codex" => codex(

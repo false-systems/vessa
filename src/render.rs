@@ -101,6 +101,12 @@ pub fn html(report: &Report) -> Result<String> {
         for limitation in &s.limitations {
             let _ = write!(out, "<p class=\"warning\">{}</p>", escape(limitation));
         }
+        let insights = crate::work::summarize(s)?;
+        let _ = write!(
+            out,
+            "<h4>Commands, changes and estimated waste</h4><pre>{}</pre><details><summary>How these estimates work</summary><p>{}</p></details>",
+            escape(&crate::work::text(&insights)), escape(insights.basis)
+        );
         if !s.ohjaa.is_empty() {
             out.push_str(
                 "<details><summary>Explicitly linked ohjaa session records</summary><pre>",

@@ -3,6 +3,7 @@ mod import;
 mod metrics;
 mod model;
 mod render;
+mod work;
 
 use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
@@ -150,7 +151,7 @@ fn run_once(cli: Cli) -> Result<i32> {
                 .map(|t| t.to_rfc3339());
             if cli.json {
                 json(
-                    &serde_json::json!({"schema":"vessa-status.v1", "agent":s.agent,"session_id":s.id,"last_recorded_at":last,"entries":model::aggregate(s)?,"limitations":s.limitations,"warnings":report.warnings}),
+                    &serde_json::json!({"schema":"vessa-status.v1", "agent":s.agent,"session_id":s.id,"last_recorded_at":last,"entries":model::aggregate(s)?,"insights":work::summarize(s)?,"limitations":s.limitations,"warnings":report.warnings}),
                 )?;
             } else {
                 println!(
@@ -162,6 +163,7 @@ fn run_once(cli: Cli) -> Result<i32> {
                 for e in model::aggregate(s)? {
                     println!("  {}", render::usage_line(&e));
                 }
+                println!("{}", work::text(&work::summarize(s)?));
                 if s.usage.is_empty() {
                     println!("  usage unknown");
                 }
@@ -255,6 +257,7 @@ fn run_once(cli: Cli) -> Result<i32> {
                 .zip(&report.sessions)
             {
                 value["totals"] = serde_json::to_value(model::aggregate(session)?)?;
+                value["insights"] = serde_json::to_value(work::summarize(session)?)?;
             }
             json(&export)?;
         }

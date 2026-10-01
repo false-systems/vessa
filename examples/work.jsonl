@@ -1,0 +1,8 @@
+{"type":"session","version":3,"id":"work-demo","timestamp":"2026-10-01T10:00:00Z","cwd":"/demo/widget"}
+{"type":"message","id":"u1","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"Fix the fixture. PRIVATE PROMPT"}}
+{"type":"message","id":"a1","timestamp":"2026-10-01T10:00:10Z","message":{"role":"assistant","provider":"test","model":"demo","content":[{"type":"toolCall","id":"call1","name":"bash","arguments":{"command":"PRIVATE COMMAND"}}],"usage":{"input":200,"output":100,"cacheRead":400,"cacheWrite":0,"cost":{"total":0.002}}}}
+{"type":"message","id":"r1","message":{"role":"toolResult","toolCallId":"call1","isError":true,"content":"PRIVATE OUTPUT"}}
+{"type":"message","id":"a2","timestamp":"2026-10-01T10:00:20Z","message":{"role":"assistant","provider":"test","model":"demo","content":[{"type":"toolCall","id":"call2","name":"edit","arguments":{"path":"PRIVATE PATH"}}],"usage":{"input":100,"output":50,"cacheRead":200,"cacheWrite":0,"cost":{"total":0.001}}}}
+{"type":"message","id":"r2","message":{"role":"toolResult","toolCallId":"call2","isError":false}}
+{"type":"message","id":"u2","timestamp":"2026-10-01T10:01:00Z","message":{"role":"user","content":"Check it."}}
+{"type":"message","id":"a3","timestamp":"2026-10-01T10:01:15Z","message":{"role":"assistant","provider":"test","model":"demo","usage":{"input":400,"output":100,"cacheRead":200,"cacheWrite":0,"cost":{"total":0.004}}}}

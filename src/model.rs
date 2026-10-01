@@ -43,6 +43,8 @@ pub struct Session {
     pub usage: Vec<Usage>,
     pub limitations: Vec<String>,
     pub ohjaa: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub work: Vec<crate::work::Event>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

@@ -36,6 +36,32 @@ mistaken for a live balance. `--watch SECONDS` refreshes in the foreground;
 Ctrl-C stops it. `--samples N` bounds a watch for checks. Watch also works with
 `usage` and `stats`; each JSON refresh is a separate JSON document.
 
+Status, HTML reports and usage JSON also show **command and change insights**.
+A command is a recorded user message and the usage up to the next user message;
+message bodies and tool arguments/output are never retained. Injected context
+can also appear as user messages. Each command shows usage, estimates, tool
+counts and elapsed time through its latest usage record. Initial request usage
+is shown separately but remains included in totals; logs do not isolate the
+cost of starting context from that request's generation.
+
+A change is an explicitly successful `apply_patch`, `Edit`, `Write`, `MultiEdit`,
+`edit` or `write` call. Its usage window starts after the previous successful
+edit result, or at command start, and ends at its result. These windows are
+included in command totals, not additional charges or causal allocation.
+Edits hidden inside shell commands or orchestration tools remain unmeasured;
+these are recorded operations, not verified surviving diffs or commits.
+
+**Estimated waste** is a low-confidence range: zero to the priced spending
+in a command with a recorded failed tool. A failure may be useful diagnosis,
+so the upper bound is not a claim that the spending was wasted. Missing prices
+or failure evidence leave waste unknown, not zero. No prompt classification
+or sibling product is involved. Source lines remain available in the JSON
+`insights` field and report. Try the synthetic example:
+
+```sh
+cargo run -- status --input examples/work.jsonl
+```
+
 `stats --period day|week|month|year` groups usage events by their own timestamp,
 agent and model. Calendar periods are UTC; weeks use ISO week years. A session
 crossing a period boundary appears in both periods, with only that period's

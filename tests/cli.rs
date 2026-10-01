@@ -406,3 +406,119 @@ fn native_directory_metadata_is_not_misread_as_an_export() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn command_change_and_waste_windows_preserve_totals_unknowns_and_privacy() {
+    let v = value(cli(&["status", "--input", "examples/work.jsonl", "--json"]));
+    assert_eq!(v["entries"][0]["estimated_usd_micros"], 7000);
+    let insights = &v["insights"];
+    assert_eq!(insights["initial_request"][0]["estimated_usd_micros"], 2000);
+    assert_eq!(insights["commands"].as_array().unwrap().len(), 2);
+    let first = &insights["commands"][0];
+    assert_eq!(first["entries"][0]["estimated_usd_micros"], 3000);
+    assert_eq!(first["elapsed_seconds"], 20);
+    assert_eq!(first["failed_tools"], 1);
+    assert_eq!(
+        first["changes"][0]["entries"][0]["estimated_usd_micros"],
+        3000
+    );
+    assert_eq!(first["waste_upper_bound_usd_micros"], 3000);
+    assert!(insights["commands"][1]["waste_upper_bound_usd_micros"].is_null());
+    assert!(insights["unattributed"].as_array().unwrap().is_empty());
+    let export = value(cli(&["usage", "--input", "examples/work.jsonl", "--json"]));
+    assert!(!export.to_string().contains("PRIVATE"));
+    let input = temp("unpriced-work.jsonl");
+    std::fs::write(
+        &input,
+        include_str!("../examples/work.jsonl").replace(",\"cost\":{\"total\":0.002}", ""),
+    )
+    .unwrap();
+    let v = value(cli(&[
+        "status",
+        "--input",
+        input.to_str().unwrap(),
+        "--json",
+    ]));
+    assert!(v["insights"]["commands"][0]["waste_upper_bound_usd_micros"].is_null());
+    std::fs::remove_file(input).unwrap();
+    let html = temp("work.html");
+    assert!(cli(&[
+        "report",
+        "--input",
+        "examples/work.jsonl",
+        "--output",
+        html.to_str().unwrap()
+    ])
+    .status
+    .success());
+    let report = std::fs::read_to_string(&html).unwrap();
+    assert!(report.contains("Command 1") && report.contains("Change 1"));
+    assert!(report.contains("$0 to $0.003000"));
+    assert!(!report.contains("PRIVATE"));
+    std::fs::remove_file(html).unwrap();
+}
+
+#[test]
+fn native_tool_results_are_not_user_commands_and_unknown_results_are_not_changes() {
+    let input = temp("claude-work.jsonl");
+    let mut rows: Vec<Value> = include_str!("../examples/claude.jsonl")
+        .lines()
+        .take(2)
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    rows[1]["message"]["content"] = serde_json::json!([
+        {"type":"tool_use","id":"edit1","name":"Edit"}
+    ]);
+    rows.push(serde_json::json!({"type":"user","sessionId":"claude-demo","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"edit1","content":"PRIVATE RESULT"}]}}));
+    // Repeated native result must not double-count a change.
+    rows.push(rows[2].clone());
+    std::fs::write(
+        &input,
+        rows.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let v = value(cli(&[
+        "status",
+        "--input",
+        input.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(v["insights"]["commands"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        v["insights"]["commands"][0]["changes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    std::fs::remove_file(input).unwrap();
+
+    let input = temp("codex-work.jsonl");
+    let original = include_str!("../examples/codex.jsonl");
+    let call = serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"edit1","name":"apply_patch","input":"PRIVATE PATCH"}});
+    for (output, expected) in [
+        (serde_json::json!({"metadata":{"exit_code":0}}), 1),
+        (serde_json::json!("unrecognized result"), 0),
+    ] {
+        let result = serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"edit1","output":output.to_string()}});
+        std::fs::write(&input, format!("{original}\n{call}\n{result}\n")).unwrap();
+        let v = value(cli(&[
+            "status",
+            "--input",
+            input.to_str().unwrap(),
+            "--json",
+        ]));
+        assert_eq!(
+            v["insights"]["commands"][0]["changes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            expected
+        );
+        assert_eq!(v["entries"][0]["input_tokens"], 800);
+    }
+    std::fs::remove_file(input).unwrap();
+}
