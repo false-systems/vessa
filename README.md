@@ -77,7 +77,10 @@ Claude Code can call the Rust binary directly in `~/.claude/settings.json`:
 ```
 
 This reads Claude's native session identity and running estimate on stdin and
-prints the session estimate separately from unknown actual billing. It makes
+prints the session estimate first, separately from unknown actual billing.
+A second line shows the last API call's input, output, cache-read and
+cache-write tokens. These are not cumulative session counts; absent categories
+remain unknown, including before the first response or after compaction. It makes
 no model calls and displays no budgets, quotas or limits. Preserve any existing
 status-line customization when installing. See the official
 [Claude status-line contract](https://code.claude.com/docs/en/statusline).
@@ -90,6 +93,13 @@ already shows accumulated usage/cost in its footer and `/session`; its cost is
 still an estimate. Native display support differs by agent/account; this is
 not a universal live billing API. Seula owns repeated-correction patterns and
 their calendar counts; Vessa does not call a whole session's spending waste.
+
+In Codex, use `/statusline` to move spending/token fields before long model and
+session labels; `/status` opens the native usage details. The footer supports
+native fields, not a Vessa shell-command renderer. Keep account-provided cost
+distinct from Vessa's rate-card estimate. In Pi, use its existing footer and
+`/session` rather than installing a second token counter. Vessa's full command
+breakdown remains available in its reports; it is not injected into agent prompts.
 
 ## Usage evidence
 

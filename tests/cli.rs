@@ -401,7 +401,7 @@ fn native_claude_status_uses_estimate_not_limits_and_sanitizes_terminal_text() {
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
-    let payload = serde_json::json!({"session_id":"demo","model":{"display_name":"Model\u{1b}[31m"},"cost":{"total_cost_usd":4.451911},"rate_limits":{"five_hour":{"used_percentage":88}}});
+    let payload = serde_json::json!({"session_id":"demo","model":{"display_name":"Model\u{1b}[31m"},"cost":{"total_cost_usd":4.451911},"context_window":{"current_usage":{"input_tokens":120,"output_tokens":35,"cache_read_input_tokens":400,"cache_creation_input_tokens":null}},"rate_limits":{"five_hour":{"used_percentage":88}}});
     child
         .stdin
         .take()
@@ -413,6 +413,9 @@ fn native_claude_status_uses_estimate_not_limits_and_sanitizes_terminal_text() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains("session estimate $4.45"));
     assert!(text.contains("billed unknown"));
+    assert!(text.starts_with("session estimate $4.45"));
+    assert!(text
+        .contains("Last API call: input 120 · output 35 · cache read 400 · cache write unknown"));
     assert!(!text.contains('\u{1b}'));
     assert!(!text.contains("88") && !text.contains("limit"));
 }

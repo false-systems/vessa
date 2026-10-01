@@ -99,9 +99,24 @@ pub fn claude_statusline(input: &serde_json::Value) -> Result<String> {
             .take(100)
             .collect::<String>()
     };
+    let usage = &input["context_window"]["current_usage"];
+    let tokens = |key: &str| -> Result<String> {
+        let value = &usage[key];
+        if value.is_null() {
+            return Ok("unknown".into());
+        }
+        Ok(value
+            .as_u64()
+            .context("invalid status-line token count")?
+            .to_string())
+    };
     Ok(format!(
-        "{} · {} · session estimate {estimate} · billed unknown",
+        "session estimate {estimate} · billed unknown · {} · {}\nLast API call: input {} · output {} · cache read {} · cache write {}",
         clean(model),
-        clean(id)
+        clean(id),
+        tokens("input_tokens")?,
+        tokens("output_tokens")?,
+        tokens("cache_read_input_tokens")?,
+        tokens("cache_creation_input_tokens")?,
     ))
 }
