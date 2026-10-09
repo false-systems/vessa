@@ -124,8 +124,11 @@ never adds a reasoning subcategory a second time.
   totals, and associates deltas with the current model context. Counter resets
   are flagged, with a new baseline, rather than inventing negative usage. The
   provider is the session's `model_provider`, else `openai`. Cache writes come
-  from `cache_write_input_tokens`, part of the inclusive input like cached
-  reads; counters that predate the field record zero cache writes.
+  from `cache_write_input_tokens`. That they are part of the inclusive input,
+  like cached reads, is an **assumption**: every value seen so far (32,548
+  counters, all OpenAI) is zero, so nothing confirms it. A non-zero value is
+  reported as a session limitation (exit 4) until a provider that reports writes
+  settles it. Counters that predate the field record zero cache writes.
 * Pi: reads assistant, compaction, branch-summary and standalone usage entries.
   Recorded costs are estimates. Copied entry IDs across forks are counted once,
   with parent sessions processed first when available.

@@ -761,8 +761,9 @@ fn full_runs_are_partial_only_for_real_gaps() {
 
 #[test]
 fn codex_cache_writes_are_read_when_present() {
-    // Newer Codex counters also report cache writes. Like cached reads, they
-    // are part of the inclusive input count.
+    // Newer Codex counters also report cache writes. Vessa assumes that, like
+    // cached reads, they are part of the inclusive input count. Every real
+    // value seen so far is zero, so a non-zero one is reported as unconfirmed.
     let path = temp("codex-cache-write.jsonl");
     let total = |input: u64, cached: u64, written: u64, output: u64| serde_json::json!({"input_tokens":input,"cached_input_tokens":cached,"cache_write_input_tokens":written,"output_tokens":output,"reasoning_output_tokens":0,"total_tokens":input + output});
     let rows = [
@@ -771,8 +772,22 @@ fn codex_cache_writes_are_read_when_present() {
         serde_json::json!({"timestamp":"2026-09-30T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":total(1000, 400, 100, 100)}}}),
         serde_json::json!({"timestamp":"2026-09-30T10:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":total(1500, 700, 150, 200)}}}),
     ];
+    let unconfirmed = |path: &PathBuf| {
+        let output = cli(&["receipt", "--input", path.to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(4));
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            v["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l.as_str().unwrap().contains("cache_write_input_tokens")),
+            "{v}"
+        );
+        v
+    };
     write_lines(&path, &rows);
-    let v = value(cli(&["receipt", "--input", path.to_str().unwrap()]));
+    let v = unconfirmed(&path);
     assert_eq!(v["entries"][0]["input_tokens"], 1500 - 700 - 150);
     assert_eq!(v["entries"][0]["cache_read_tokens"], 700);
     assert_eq!(v["entries"][0]["cache_write_tokens"], 150);
@@ -784,9 +799,18 @@ fn codex_cache_writes_are_read_when_present() {
     child[2]["payload"]["info"]["last_token_usage"] = total(100, 40, 10, 10);
     child.truncate(3);
     write_lines(&path, &child);
-    let v = value(cli(&["receipt", "--input", path.to_str().unwrap()]));
+    let v = unconfirmed(&path);
     assert_eq!(v["entries"][0]["input_tokens"], 100 - 40 - 10);
     assert_eq!(v["entries"][0]["cache_write_tokens"], 10);
+
+    // Zero writes, as every real counter reports so far, are complete.
+    let mut zero = rows.to_vec();
+    zero[2]["payload"]["info"]["total_token_usage"] = total(1000, 400, 0, 100);
+    zero[3]["payload"]["info"]["total_token_usage"] = total(1500, 700, 0, 200);
+    write_lines(&path, &zero);
+    let v = value(cli(&["receipt", "--input", path.to_str().unwrap()]));
+    assert_eq!(v["entries"][0]["input_tokens"], 800);
+    assert_eq!(v["entries"][0]["cache_write_tokens"], 0);
 
     // Older Codex omits the field; OpenAI caching has no separate write.
     let v = value(cli(&["receipt", "--input", "examples/codex.jsonl"]));

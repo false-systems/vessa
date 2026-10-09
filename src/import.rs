@@ -504,10 +504,17 @@ fn codex(
         let [Some(input), Some(output), Some(cached)] = values else {
             bail!("missing cumulative token categories; cannot safely derive request usage");
         };
-        // Newer Codex also counts cache writes, which like cached reads are part
-        // of the inclusive input. Older Codex omits them: OpenAI prompt caching
-        // has no separate write category, so there they are zero.
+        // Newer Codex also counts cache writes. Vessa assumes that, like cached
+        // reads, they are part of the inclusive input; every real value seen so
+        // far is zero, so a non-zero one is reported until that is confirmed.
+        // Older Codex omits them: OpenAI prompt caching has no write category.
         let written = cache_writes(total)?;
+        if written > 0 {
+            let note = "cache_write_input_tokens is non-zero: Vessa assumes cache writes are part of input_tokens, which no transcript has confirmed; uncached input may be undercounted";
+            if !s.limitations.iter().any(|l| l == note) {
+                s.limitations.push(note.into());
+            }
+        }
         ensure!(
             cached
                 .checked_add(written)
