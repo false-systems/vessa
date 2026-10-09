@@ -431,10 +431,11 @@ fn claude(v: &Value, line: usize, s: &mut Session) -> Result<()> {
     let m = &v["message"];
     if v["type"] == "assistant" && m["usage"].is_object() {
         let usage = &m["usage"];
-        // Claude Code transcripts never name a provider; the source does.
-        // The model name alone would not prove which service served it.
         let mut entry = base(
-            v["provider"].as_str().unwrap_or("anthropic").into(),
+            v["provider"]
+                .as_str()
+                .unwrap_or_else(|| claude_provider(v))
+                .into(),
             m["model"].as_str().unwrap_or("unknown").into(),
         );
         entry.input_tokens = count(usage, "input_tokens")?;
@@ -452,6 +453,28 @@ fn claude(v: &Value, line: usize, s: &mut Session) -> Result<()> {
         add(s, v, line, id, entry);
     }
     Ok(())
+}
+
+/// Claude Code transcripts never name a provider, and the same transcript
+/// shape comes from Anthropic's API, Amazon Bedrock, Google Vertex AI or an
+/// Anthropic-compatible gateway. The response ids tell them apart: Anthropic
+/// returns `msg_01…` with `req_…` request ids, Bedrock `msg_bdrk_…` and Vertex
+/// `msg_vrtx_…`. Anything else stays unknown; a model name proves nothing.
+fn claude_provider(v: &Value) -> &'static str {
+    let message = v["message"]["id"].as_str().unwrap_or_default();
+    if message.starts_with("msg_bdrk_") {
+        "bedrock"
+    } else if message.starts_with("msg_vrtx_") {
+        "vertex"
+    } else if message.starts_with("msg_01")
+        || v["requestId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("req_"))
+    {
+        "anthropic"
+    } else {
+        "unknown"
+    }
 }
 
 fn codex(

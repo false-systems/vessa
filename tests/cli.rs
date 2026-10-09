@@ -646,7 +646,7 @@ fn disagreeing_claude_snapshots_are_flagged_not_merged() {
     assert!(session["limitations"][0]
         .as_str()
         .unwrap()
-        .contains("conflicting usage request-sub-1"));
+        .contains("conflicting usage req_011CdemoSub1"));
     // The first record is retained; the conflicting one is not summed.
     assert_eq!(session["totals"][0]["output_tokens"], 3 + 731);
     assert_eq!(session["totals"][0]["cache_read_tokens"], 2500);
@@ -747,7 +747,7 @@ fn full_runs_are_partial_only_for_real_gaps() {
     assert_eq!(output.status.code(), Some(4));
     // The limitation says what disagreed, and the run says why it is partial.
     assert!(
-        stderr.contains("conflicting usage request-sub-1 (first seen in claude-demo/subagent-demo): model demo-model then fallback-model"),
+        stderr.contains("conflicting usage req_011CdemoSub1 (first seen in claude-demo/subagent-demo): model demo-model then fallback-model"),
         "{stderr}"
     );
     assert!(
@@ -791,5 +791,46 @@ fn codex_cache_writes_are_read_when_present() {
     // Older Codex omits the field; OpenAI caching has no separate write.
     let v = value(cli(&["receipt", "--input", "examples/codex.jsonl"]));
     assert_eq!(v["entries"][0]["cache_write_tokens"], 0);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn claude_provider_comes_from_response_ids_not_the_source() {
+    // Claude Code also runs on Bedrock, Vertex and Anthropic-compatible
+    // gateways with the same transcript shape. Only the ids tell them apart.
+    let path = temp("claude-provider.jsonl");
+    for (message_id, request_id, expected) in [
+        (
+            "msg_011CdemoMessage1",
+            Some("req_011CdemoRequest1"),
+            "anthropic",
+        ),
+        ("msg_011CdemoMessage1", None, "anthropic"),
+        ("msg_bdrk_01demoMessage1", None, "bedrock"),
+        ("msg_vrtx_01demoMessage1", None, "vertex"),
+        ("chatcmpl-demo1", None, "unknown"),
+        ("gen-demo1", Some("gateway-request-1"), "unknown"),
+    ] {
+        let mut row = serde_json::json!({"type":"assistant","uuid":"a1","sessionId":"claude-demo","timestamp":"2026-09-30T09:01:00Z","message":{"id":message_id,"role":"assistant","model":"demo-model","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":1200,"output_tokens":300,"cache_read_input_tokens":800,"cache_creation_input_tokens":100}}});
+        if let Some(request_id) = request_id {
+            row["requestId"] = request_id.into();
+        }
+        write_lines(&path, &[row]);
+        let output = cli(&[
+            "receipt",
+            "--input",
+            path.to_str().unwrap(),
+            "--rates",
+            "examples/rates.json",
+        ]);
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(v["entries"][0]["provider"], expected, "{message_id}");
+        // Only Anthropic's own usage meets the anthropic rate card.
+        assert_eq!(
+            v["entries"][0]["estimated_usd_micros"].is_null(),
+            expected != "anthropic",
+            "{message_id}"
+        );
+    }
     std::fs::remove_file(path).unwrap();
 }

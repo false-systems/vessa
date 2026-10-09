@@ -115,8 +115,11 @@ never adds a reasoning subcategory a second time.
   agrees, the largest snapshot is kept and its line is the evidence. Snapshots
   that disagree in any other way (input or cache counts, model) are flagged and
   the first is retained; the result is partial. Claude Code transcripts never
-  name a provider, so the provider is `anthropic`, taken from the source (Claude
-  Code) and not from the model name.
+  name a provider, and Anthropic's API, Amazon Bedrock, Google Vertex AI and
+  Anthropic-compatible gateways write the same shape. The provider comes from
+  the response ids: `msg_01…` or a `req_…` request id is `anthropic`,
+  `msg_bdrk_…` is `bedrock`, `msg_vrtx_…` is `vertex`, and anything else is
+  `unknown`. A model name proves nothing about who served the request.
 * Codex: differences cumulative input/output/cache counters, ignores repeated
   totals, and associates deltas with the current model context. Counter resets
   are flagged, with a new baseline, rather than inventing negative usage. The
