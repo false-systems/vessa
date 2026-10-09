@@ -125,6 +125,10 @@ fn run_once(cli: Cli) -> Result<i32> {
         report.sessions.retain(|s| s.id == id);
         ensure!(!report.sessions.is_empty(), "native session {id} not found");
     }
+    // Partial means the usage evidence itself is incomplete. Rate-card notices
+    // added below concern pricing only; unpriced usage is already shown as such.
+    let incomplete =
+        !report.warnings.is_empty() || report.sessions.iter().any(|s| !s.limitations.is_empty());
     if let Some(path) = cli.rates {
         let rates: Vec<analysis::Rate> = serde_json::from_reader(std::fs::File::open(path)?)?;
         analysis::apply_rates(&mut report, &rates)?;
@@ -132,8 +136,6 @@ fn run_once(cli: Cli) -> Result<i32> {
     for warning in &report.warnings {
         eprintln!("vessa: {warning}");
     }
-    let incomplete =
-        !report.warnings.is_empty() || report.sessions.iter().any(|s| !s.limitations.is_empty());
     match cli.command {
         Cmd::ClaudeStatusline => unreachable!(),
         Cmd::Status => {

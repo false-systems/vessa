@@ -110,14 +110,15 @@ never adds a reasoning subcategory a second time.
 * Claude Code: deduplicates request IDs across repeated assistant content blocks.
   Claude Code writes one line per content block, and in subagent transcripts
   the output count grows across the lines of one request; when everything else
-  agrees, the largest snapshot is kept and its line is the evidence.
-  Provider is `unknown` when the transcript does not identify it; a model name
-  does not prove which service billed the request. Snapshots that disagree in
-  any other way (input or cache counts, model) are flagged and the first is
-  retained; the result is partial.
+  agrees, the largest snapshot is kept and its line is the evidence. Snapshots
+  that disagree in any other way (input or cache counts, model) are flagged and
+  the first is retained; the result is partial. Claude Code transcripts never
+  name a provider, so the provider is `anthropic`, taken from the source (Claude
+  Code) and not from the model name.
 * Codex: differences cumulative input/output/cache counters, ignores repeated
   totals, and associates deltas with the current model context. Counter resets
-  are flagged, with a new baseline, rather than inventing negative usage.
+  are flagged, with a new baseline, rather than inventing negative usage. The
+  provider is the session's `model_provider`, else `openai`.
 * Pi: reads assistant, compaction, branch-summary and standalone usage entries.
   Recorded costs are estimates. Copied entry IDs across forks are counted once,
   with parent sessions processed first when available.
@@ -132,6 +133,9 @@ imports do not establish actual plan consumption or invoice charges.
 are not provider prices. Rates use integer USD millionths per million tokens,
 and require provider/model, an RFC3339 validity interval, and a source.
 Unknown token categories prevent repricing. Overlapping applicable rates fail.
+A card that prices no selected usage record is named in a warning, since it
+usually means a provider, model or date mismatch; pricing notices do not make
+the output partial (exit 4).
 Keep plan multipliers, discounts and service tiers out of this simple API-rate
 estimate unless the supplied rate actually represents them.
 

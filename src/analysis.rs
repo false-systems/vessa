@@ -30,6 +30,7 @@ pub fn apply_rates(report: &mut Report, rates: &[Rate]) -> Result<()> {
             Ok((r, start, end))
         })
         .collect::<Result<Vec<_>>>()?;
+    let mut priced = vec![0usize; parsed.len()];
     for session in &mut report.sessions {
         for usage in &mut session.usage {
             let Some(at) = usage
@@ -41,7 +42,8 @@ pub fn apply_rates(report: &mut Report, rates: &[Rate]) -> Result<()> {
             };
             let matching: Vec<_> = parsed
                 .iter()
-                .filter(|(r, start, end)| {
+                .enumerate()
+                .filter(|(_, (r, start, end))| {
                     r.provider == usage.entry.provider
                         && r.model == usage.entry.model
                         && at >= *start
@@ -54,7 +56,7 @@ pub fn apply_rates(report: &mut Report, rates: &[Rate]) -> Result<()> {
                 usage.entry.provider,
                 usage.entry.model
             );
-            let Some((r, _, _)) = matching.first() else {
+            let Some(&(card, (r, _, _))) = matching.first() else {
                 continue;
             };
             let e = &mut usage.entry;
@@ -81,9 +83,20 @@ pub fn apply_rates(report: &mut Report, rates: &[Rate]) -> Result<()> {
                 total.checked_add(500_000).context("rounding overflow")? / 1_000_000,
             )?;
             e.estimated_usd_micros = Some(micros);
+            priced[card] += 1;
             e.estimate_basis = Some(format!(
                 "API-equivalent estimate; {}; {} to {}",
                 r.source, r.effective_from, r.effective_until
+            ));
+        }
+    }
+    // A card that matches nothing is almost always a provider, model or date
+    // mismatch. Say so, rather than leaving every estimate silently unknown.
+    for (r, count) in rates.iter().zip(priced) {
+        if count == 0 {
+            report.warnings.push(format!(
+                "rate card {}/{} ({} to {}) priced no usage records; compare its provider, model and dates with `vessa usage`",
+                r.provider, r.model, r.effective_from, r.effective_until
             ));
         }
     }

@@ -296,7 +296,14 @@ fn parse_file(path: &Path) -> Result<Parsed> {
         work: Vec::new(),
     };
     let mut model = "unknown".to_owned();
-    let mut provider = "unknown".to_owned();
+    // Codex is OpenAI's agent; its session_meta names the provider when it
+    // is another one. Pi is multi-provider and gets no default.
+    let mut provider = if agent == "codex" {
+        "openai"
+    } else {
+        "unknown"
+    }
+    .to_owned();
     let mut previous: Option<[u64; 3]> = None;
     let mut pi_model_changed = false;
     for (line, value) in records {
@@ -385,8 +392,10 @@ fn claude(v: &Value, line: usize, s: &mut Session) -> Result<()> {
     let m = &v["message"];
     if v["type"] == "assistant" && m["usage"].is_object() {
         let usage = &m["usage"];
+        // Claude Code transcripts never name a provider; the source does.
+        // The model name alone would not prove which service served it.
         let mut entry = base(
-            v["provider"].as_str().unwrap_or("unknown").into(),
+            v["provider"].as_str().unwrap_or("anthropic").into(),
             m["model"].as_str().unwrap_or("unknown").into(),
         );
         entry.input_tokens = count(usage, "input_tokens")?;

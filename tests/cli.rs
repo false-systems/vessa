@@ -37,6 +37,8 @@ fn native_usage_is_not_double_counted_and_costs_are_not_bills() {
         "--rates",
         "examples/rates.json",
     ]));
+    // Real Claude transcripts never name a provider; the source does.
+    assert_eq!(v["entries"][0]["provider"], "anthropic");
     assert_eq!(v["entries"][0]["input_tokens"], 1200);
     assert_eq!(v["entries"][0]["estimated_usd_micros"], 8715);
     assert!(v["entries"][0]["billed"].is_null());
@@ -75,7 +77,8 @@ fn html_is_private_escaped_and_evidence_links_resolve() {
     let input = temp("escaped.jsonl");
     std::fs::write(
         &input,
-        include_str!("../examples/claude.jsonl").replace("anthropic", "<script>untrusted</script>"),
+        include_str!("../examples/claude.jsonl")
+            .replace("demo-model", "<script>untrusted</script>"),
     )
     .unwrap();
     let args = [
@@ -659,4 +662,59 @@ fn disagreeing_claude_snapshots_are_flagged_not_merged() {
         Some(4)
     );
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn codex_provider_is_inferred_and_unused_rate_cards_warn() {
+    // Without model_provider, a Codex transcript is still OpenAI's.
+    let path = temp("codex-no-provider.jsonl");
+    std::fs::write(
+        &path,
+        include_str!("../examples/codex.jsonl").replace(",\"model_provider\":\"openai\"", ""),
+    )
+    .unwrap();
+    let v = value(cli(&[
+        "receipt",
+        "--input",
+        path.to_str().unwrap(),
+        "--rates",
+        "examples/rates.json",
+    ]));
+    assert_eq!(v["entries"][0]["provider"], "openai");
+    assert_eq!(v["entries"][0]["estimated_usd_micros"], 3740);
+    std::fs::remove_file(path).unwrap();
+
+    // A rate card that prices nothing is named, not silently ignored.
+    let rates = temp("unused-rates.json");
+    let mut cards: Vec<Value> =
+        serde_json::from_str(include_str!("../examples/rates.json")).unwrap();
+    let mut unused = cards[0].clone();
+    unused["provider"] = "nobody".into();
+    cards.push(unused);
+    std::fs::write(&rates, serde_json::to_vec(&cards).unwrap()).unwrap();
+    let output = cli(&[
+        "usage",
+        "--input",
+        "examples/claude.jsonl",
+        "--rates",
+        rates.to_str().unwrap(),
+        "--json",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let warnings = v["warnings"].as_array().unwrap();
+    // The Claude card priced the session; the OpenAI and "nobody" cards did not.
+    assert_eq!(v["sessions"][0]["totals"][0]["estimated_usd_micros"], 8715);
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(warnings.iter().any(|w| w
+        .as_str()
+        .unwrap()
+        .starts_with("rate card nobody/demo-model")));
+    assert!(warnings
+        .iter()
+        .all(|w| w.as_str().unwrap().contains("priced no usage records")));
+    assert!(stderr.contains("rate card nobody/demo-model"));
+    // A pricing notice does not make the usage evidence partial.
+    assert_eq!(output.status.code(), Some(0));
+    std::fs::remove_file(rates).unwrap();
 }
