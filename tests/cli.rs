@@ -858,3 +858,39 @@ fn claude_provider_comes_from_response_ids_not_the_source() {
     }
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn non_openai_codex_providers_are_never_priced_as_openai() {
+    // Codex can run against other providers; their usage must not meet an
+    // OpenAI rate card just because Codex is OpenAI's agent.
+    let path = temp("codex-ollama.jsonl");
+    std::fs::write(
+        &path,
+        include_str!("../examples/codex.jsonl").replace(
+            "\"model_provider\":\"openai\"",
+            "\"model_provider\":\"ollama\"",
+        ),
+    )
+    .unwrap();
+    let output = cli(&[
+        "usage",
+        "--input",
+        path.to_str().unwrap(),
+        "--rates",
+        "examples/rates.json",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let totals = &v["sessions"][0]["totals"][0];
+    assert_eq!(totals["provider"], "ollama");
+    assert_eq!(totals["model"], "demo-codex");
+    assert!(totals["estimated_usd_micros"].is_null());
+    // The OpenAI card matched nothing here, and says so.
+    assert!(v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().starts_with("rate card openai/demo-codex")));
+    std::fs::remove_file(path).unwrap();
+}
