@@ -108,9 +108,13 @@ output includes reasoning tokens where the producer includes them, so Vessa
 never adds a reasoning subcategory a second time.
 
 * Claude Code: deduplicates request IDs across repeated assistant content blocks.
+  Claude Code writes one line per content block, and in subagent transcripts
+  the output count grows across the lines of one request; when everything else
+  agrees, the largest snapshot is kept and its line is the evidence.
   Provider is `unknown` when the transcript does not identify it; a model name
-  does not prove which service billed the request. Conflicting usage snapshots
-  are flagged and the first is retained; the result is partial.
+  does not prove which service billed the request. Snapshots that disagree in
+  any other way (input or cache counts, model) are flagged and the first is
+  retained; the result is partial.
 * Codex: differences cumulative input/output/cache counters, ignores repeated
   totals, and associates deltas with the current model context. Counter resets
   are flagged, with a new baseline, rather than inventing negative usage.

@@ -561,3 +561,102 @@ fn native_tool_results_are_not_user_commands_and_unknown_results_are_not_changes
     }
     std::fs::remove_file(input).unwrap();
 }
+
+fn write_lines(path: &PathBuf, rows: &[Value]) {
+    std::fs::write(
+        path,
+        rows.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn claude_subagent_snapshots_keep_the_final_output_count() {
+    // Claude Code writes one line per content block. In subagent transcripts
+    // the output count grows across the lines of one request (3, 3, 644).
+    let output = cli(&[
+        "usage",
+        "--input",
+        "examples/claude-subagent.jsonl",
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session = &v["sessions"][0];
+    assert_eq!(session["id"], "claude-demo/subagent-demo");
+    assert_eq!(session["totals"][0]["output_tokens"], 644 + 731);
+    assert_eq!(session["totals"][0]["input_tokens"], 6);
+    assert_eq!(session["totals"][0]["cache_read_tokens"], 2500);
+    assert_eq!(session["totals"][0]["cache_write_tokens"], 80);
+    // One record per request, pointing at the line that carries its count.
+    let usage = session["usage"].as_array().unwrap();
+    assert_eq!(usage.len(), 2);
+    assert_eq!(usage[0]["line"], 4);
+    assert_eq!(usage[1]["line"], 7);
+    assert!(session["limitations"].as_array().unwrap().is_empty());
+
+    // A copy holding only an earlier, smaller snapshot is not a conflict.
+    let copy = temp("subagent-copy.jsonl");
+    std::fs::write(
+        &copy,
+        include_str!("../examples/claude-subagent.jsonl")
+            .lines()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        "examples/claude-subagent.jsonl",
+        "--input",
+        copy.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(v["sessions"][0]["totals"][0]["output_tokens"], 1375);
+    std::fs::remove_file(copy).unwrap();
+}
+
+#[test]
+fn disagreeing_claude_snapshots_are_flagged_not_merged() {
+    // Same request, but the inputs differ: that is a true conflict, not growth.
+    let path = temp("conflict.jsonl");
+    let mut rows: Vec<Value> = include_str!("../examples/claude-subagent.jsonl")
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    rows[3]["message"]["usage"]["cache_read_input_tokens"] = 901.into();
+    write_lines(&path, &rows);
+    let output = cli(&["usage", "--input", path.to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session = &v["sessions"][0];
+    assert!(session["limitations"][0]
+        .as_str()
+        .unwrap()
+        .contains("conflicting usage request-sub-1"));
+    // The first record is retained; the conflicting one is not summed.
+    assert_eq!(session["totals"][0]["output_tokens"], 3 + 731);
+    assert_eq!(session["totals"][0]["cache_read_tokens"], 2500);
+
+    // A shrinking count is not growth either when the inputs also change.
+    rows[3]["message"]["usage"]["cache_read_input_tokens"] = 900.into();
+    rows[2]["message"]["usage"]["input_tokens"] = 5.into();
+    write_lines(&path, &rows);
+    assert_eq!(
+        cli(&["usage", "--input", path.to_str().unwrap()])
+            .status
+            .code(),
+        Some(4)
+    );
+    std::fs::remove_file(path).unwrap();
+}

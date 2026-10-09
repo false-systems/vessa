@@ -73,9 +73,10 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             (s.id.clone(), current.id.clone())
         })
         .collect();
-    let mut seen: HashMap<(String, String), (Entry, String)> = HashMap::new();
-    for session in &mut report.sessions {
-        let mut usage = Vec::new();
+    // One record per usage identity: (owning session, slot, owner ID).
+    let mut seen: HashMap<(String, String), (usize, usize, String)> = HashMap::new();
+    let mut kept: Vec<Vec<Usage>> = report.sessions.iter().map(|_| Vec::new()).collect();
+    for (index, session) in report.sessions.iter_mut().enumerate() {
         for item in session.usage.drain(..) {
             let started = session
                 .started_at
@@ -96,18 +97,30 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
                 item.id.clone()
             };
             let key = (session.agent.clone(), event_id);
-            if let Some((old, owner)) = seen.get(&key) {
-                if old != &item.entry {
+            if let Some((owner, slot, owner_id)) = seen.get(&key) {
+                let old = &mut kept[*owner][*slot];
+                if extends(&old.entry, &item.entry) {
+                    // A later snapshot of the same request. Within one file it
+                    // becomes the evidence line; a copy elsewhere only supplies
+                    // the count, so the record stays with its owner's source.
+                    if old.source == item.source {
+                        *old = item;
+                    } else {
+                        old.entry = item.entry;
+                    }
+                } else if !extends(&item.entry, &old.entry) && old.entry != item.entry {
                     session.limitations.push(format!(
-                        "conflicting usage {} (first seen in {owner}); first record retained",
+                        "conflicting usage {} (first seen in {owner_id}); first record retained",
                         item.id
                     ));
                 }
             } else {
-                seen.insert(key, (item.entry.clone(), session.id.clone()));
-                usage.push(item);
+                seen.insert(key, (index, kept[index].len(), session.id.clone()));
+                kept[index].push(item);
             }
         }
+    }
+    for (session, usage) in report.sessions.iter_mut().zip(kept) {
         session.usage = usage;
         for wrapper in &wrappers {
             if wrapper["usage"].as_array().is_some_and(|receipts| {
@@ -144,6 +157,21 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             .push("No supported native sessions found; usage is unknown".into());
     }
     Ok(report)
+}
+
+/// True when `new` is a strictly later snapshot of the same request as `old`:
+/// only the output count has grown, and everything else, including the input
+/// and cache counts, agrees. Claude Code writes one line per content block,
+/// and in subagent transcripts the output count grows across those lines.
+fn extends(old: &Entry, new: &Entry) -> bool {
+    let (Some(before), Some(after)) = (old.output_tokens, new.output_tokens) else {
+        return false;
+    };
+    after > before
+        && Entry {
+            output_tokens: old.output_tokens,
+            ..new.clone()
+        } == *old
 }
 
 fn discover(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -370,8 +398,9 @@ fn claude(v: &Value, line: usize, s: &mut Session) -> Result<()> {
             .or_else(|| m["id"].as_str())
             .map(str::to_owned)
             .unwrap_or_else(|| fallback(s, line));
-        // Claude may emit multiple content blocks for one request. Equal usage
-        // deduplicates; conflicting snapshots are reported instead of summed.
+        // Claude writes a line per content block of one request. Equal usage
+        // deduplicates, a growing output count keeps the largest snapshot, and
+        // conflicting snapshots are reported instead of summed (see `read`).
         add(s, v, line, id, entry);
     }
     Ok(())
