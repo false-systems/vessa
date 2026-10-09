@@ -343,7 +343,7 @@ fn parse_file(path: &Path) -> Result<Parsed> {
         "unknown"
     }
     .to_owned();
-    let mut previous: Option<[u64; 3]> = None;
+    let mut previous: Option<[u64; 4]> = None;
     let mut pi_model_changed = false;
     for (line, value) in records {
         crate::work::observe(&value, line, &mut session);
@@ -460,7 +460,7 @@ fn codex(
     s: &mut Session,
     model: &mut String,
     provider: &mut String,
-    previous: &mut Option<[u64; 3]>,
+    previous: &mut Option<[u64; 4]>,
 ) -> Result<()> {
     let p = &v["payload"];
     if matches!(v["type"].as_str(), Some("session_meta" | "turn_context")) {
@@ -481,24 +481,31 @@ fn codex(
         let [Some(input), Some(output), Some(cached)] = values else {
             bail!("missing cumulative token categories; cannot safely derive request usage");
         };
+        // Newer Codex also counts cache writes, which like cached reads are part
+        // of the inclusive input. Older Codex omits them: OpenAI prompt caching
+        // has no separate write category, so there they are zero.
+        let written = cache_writes(total)?;
         ensure!(
-            cached <= input,
+            cached
+                .checked_add(written)
+                .is_some_and(|cache| cache <= input),
             "cached tokens exceed inclusive input tokens"
         );
-        let current = [input, output, cached];
-        let mut prior = previous.unwrap_or([0; 3]);
+        let current = [input, output, cached, written];
+        let mut prior = previous.unwrap_or([0; 4]);
         if previous.is_none() && s.parent.is_some() {
-            let last = &p["info"]["last_token_usage"];
+            let breakdown = &p["info"]["last_token_usage"];
             let last = [
-                count(last, "input_tokens")?,
-                count(last, "output_tokens")?,
-                count(last, "cached_input_tokens")?,
+                count(breakdown, "input_tokens")?,
+                count(breakdown, "output_tokens")?,
+                count(breakdown, "cached_input_tokens")?,
             ];
+            let lw = cache_writes(breakdown)?;
             *previous = Some(current);
             let [Some(li), Some(lo), Some(lc)] = last else {
                 bail!("first child counter has no last-request breakdown; inherited usage cannot be attributed");
             };
-            for (i, last) in [li, lo, lc].into_iter().enumerate() {
+            for (i, last) in [li, lo, lc, lw].into_iter().enumerate() {
                 prior[i] = current[i]
                     .checked_sub(last)
                     .context("last-request tokens exceed cumulative total")?;
@@ -516,12 +523,15 @@ fn codex(
         if delta.iter().all(|n| *n == 0) {
             return Ok(());
         }
-        ensure!(delta[2] <= delta[0], "cache delta exceeds input delta");
+        let uncached = delta[0]
+            .checked_sub(delta[2])
+            .and_then(|rest| rest.checked_sub(delta[3]))
+            .context("cache delta exceeds input delta")?;
         let mut entry = base(provider.clone(), model.clone());
-        entry.input_tokens = Some(delta[0] - delta[2]);
+        entry.input_tokens = Some(uncached);
         entry.output_tokens = Some(delta[1]);
         entry.cache_read_tokens = Some(delta[2]);
-        entry.cache_write_tokens = Some(0);
+        entry.cache_write_tokens = Some(delta[3]);
         add(
             s,
             v,
@@ -531,6 +541,11 @@ fn codex(
         );
     }
     Ok(())
+}
+
+/// Codex cache writes, zero when the counter predates the field.
+fn cache_writes(usage: &Value) -> Result<u64> {
+    Ok(count(usage, "cache_write_input_tokens")?.unwrap_or(0))
 }
 
 fn pi(

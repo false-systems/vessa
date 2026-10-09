@@ -758,3 +758,38 @@ fn full_runs_are_partial_only_for_real_gaps() {
     );
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn codex_cache_writes_are_read_when_present() {
+    // Newer Codex counters also report cache writes. Like cached reads, they
+    // are part of the inclusive input count.
+    let path = temp("codex-cache-write.jsonl");
+    let total = |input: u64, cached: u64, written: u64, output: u64| serde_json::json!({"input_tokens":input,"cached_input_tokens":cached,"cache_write_input_tokens":written,"output_tokens":output,"reasoning_output_tokens":0,"total_tokens":input + output});
+    let rows = [
+        serde_json::json!({"type":"session_meta","payload":{"id":"codex-writes","cwd":"/demo/widget","model_provider":"openai","source":"cli"}}),
+        serde_json::json!({"type":"turn_context","payload":{"model":"demo-codex"}}),
+        serde_json::json!({"timestamp":"2026-09-30T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":total(1000, 400, 100, 100)}}}),
+        serde_json::json!({"timestamp":"2026-09-30T10:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":total(1500, 700, 150, 200)}}}),
+    ];
+    write_lines(&path, &rows);
+    let v = value(cli(&["receipt", "--input", path.to_str().unwrap()]));
+    assert_eq!(v["entries"][0]["input_tokens"], 1500 - 700 - 150);
+    assert_eq!(v["entries"][0]["cache_read_tokens"], 700);
+    assert_eq!(v["entries"][0]["cache_write_tokens"], 150);
+    assert_eq!(v["entries"][0]["output_tokens"], 200);
+
+    // A child session's first counter excludes inherited writes as well.
+    let mut child = rows.to_vec();
+    child[0]["payload"]["source"] = serde_json::json!({"subagent":"review"});
+    child[2]["payload"]["info"]["last_token_usage"] = total(100, 40, 10, 10);
+    child.truncate(3);
+    write_lines(&path, &child);
+    let v = value(cli(&["receipt", "--input", path.to_str().unwrap()]));
+    assert_eq!(v["entries"][0]["input_tokens"], 100 - 40 - 10);
+    assert_eq!(v["entries"][0]["cache_write_tokens"], 10);
+
+    // Older Codex omits the field; OpenAI caching has no separate write.
+    let v = value(cli(&["receipt", "--input", "examples/codex.jsonl"]));
+    assert_eq!(v["entries"][0]["cache_write_tokens"], 0);
+    std::fs::remove_file(path).unwrap();
+}
