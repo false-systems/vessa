@@ -718,3 +718,43 @@ fn codex_provider_is_inferred_and_unused_rate_cards_warn() {
     assert_eq!(output.status.code(), Some(0));
     std::fs::remove_file(rates).unwrap();
 }
+
+#[test]
+fn full_runs_are_partial_only_for_real_gaps() {
+    // Every realistic fixture together, as a full run reads them: complete.
+    let output = cli(&["usage", "--input", "examples", "--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(v["warnings"].as_array().unwrap().is_empty());
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 5);
+    for session in v["sessions"].as_array().unwrap() {
+        assert!(session["limitations"].as_array().unwrap().is_empty());
+    }
+    assert!(stderr.is_empty(), "{stderr}");
+
+    // A real gap: Claude falls back to another model inside one request and
+    // repeats the earlier counts, so the fallback's usage is unknown.
+    let path = temp("fallback.jsonl");
+    let mut rows: Vec<Value> = include_str!("../examples/claude-subagent.jsonl")
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    rows[2]["message"]["model"] = "fallback-model".into();
+    write_lines(&path, &rows);
+    let output = cli(&["usage", "--input", path.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(4));
+    // The limitation says what disagreed, and the run says why it is partial.
+    assert!(
+        stderr.contains("conflicting usage request-sub-1 (first seen in claude-demo/subagent-demo): model demo-model then fallback-model"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.trim_end().ends_with(
+            "vessa: partial usage evidence (exit 4): 1 session with limitations, 0 source warnings"
+        ),
+        "{stderr}"
+    );
+    std::fs::remove_file(path).unwrap();
+}

@@ -125,10 +125,16 @@ fn run_once(cli: Cli) -> Result<i32> {
         report.sessions.retain(|s| s.id == id);
         ensure!(!report.sessions.is_empty(), "native session {id} not found");
     }
-    // Partial means the usage evidence itself is incomplete. Rate-card notices
-    // added below concern pricing only; unpriced usage is already shown as such.
-    let incomplete =
-        !report.warnings.is_empty() || report.sessions.iter().any(|s| !s.limitations.is_empty());
+    // Partial means the usage evidence itself is incomplete: a source warning
+    // or a session limitation. Rate-card notices added below concern pricing
+    // only; unpriced usage is already shown as such.
+    let source_warnings = report.warnings.len();
+    let limited = report
+        .sessions
+        .iter()
+        .filter(|s| !s.limitations.is_empty())
+        .count();
+    let incomplete = source_warnings > 0 || limited > 0;
     if let Some(path) = cli.rates {
         let rates: Vec<analysis::Rate> = serde_json::from_reader(std::fs::File::open(path)?)?;
         analysis::apply_rates(&mut report, &rates)?;
@@ -293,7 +299,16 @@ fn run_once(cli: Cli) -> Result<i32> {
             eprintln!("vessa: {} {}: {limitation}", s.agent, s.id);
         }
     }
-    Ok(if incomplete { 4 } else { 0 })
+    if incomplete {
+        // Last, so a long list of limitations still ends with why exit is 4.
+        eprintln!(
+            "vessa: partial usage evidence (exit 4): {limited} {} with limitations, {source_warnings} source {}",
+            if limited == 1 { "session" } else { "sessions" },
+            if source_warnings == 1 { "warning" } else { "warnings" },
+        );
+        return Ok(4);
+    }
+    Ok(0)
 }
 
 fn json(value: &impl serde::Serialize) -> Result<()> {

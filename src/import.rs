@@ -110,8 +110,9 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
                     }
                 } else if !extends(&item.entry, &old.entry) && old.entry != item.entry {
                     session.limitations.push(format!(
-                        "conflicting usage {} (first seen in {owner_id}); first record retained",
-                        item.id
+                        "conflicting usage {} (first seen in {owner_id}): {}; first record retained",
+                        item.id,
+                        difference(&old.entry, &item.entry)
                     ));
                 }
             } else {
@@ -172,6 +173,44 @@ fn extends(old: &Entry, new: &Entry) -> bool {
             output_tokens: old.output_tokens,
             ..new.clone()
         } == *old
+}
+
+/// Names what two snapshots of one request disagree on, so a partial result
+/// can be judged: a model fallback reads differently from changed counts.
+fn difference(old: &Entry, new: &Entry) -> String {
+    let show = |n: Option<u64>| n.map_or("unknown".into(), |n| n.to_string());
+    let mut parts = Vec::new();
+    for (name, a, b) in [
+        ("provider", &old.provider, &new.provider),
+        ("model", &old.model, &new.model),
+    ] {
+        if a != b {
+            parts.push(format!("{name} {a} then {b}"));
+        }
+    }
+    for (name, a, b) in [
+        ("input", old.input_tokens, new.input_tokens),
+        ("output", old.output_tokens, new.output_tokens),
+        ("cache read", old.cache_read_tokens, new.cache_read_tokens),
+        (
+            "cache write",
+            old.cache_write_tokens,
+            new.cache_write_tokens,
+        ),
+        (
+            "estimate",
+            old.estimated_usd_micros,
+            new.estimated_usd_micros,
+        ),
+    ] {
+        if a != b {
+            parts.push(format!("{name} {} then {}", show(a), show(b)));
+        }
+    }
+    if parts.is_empty() {
+        parts.push("recorded amounts differ".into());
+    }
+    parts.join(", ")
 }
 
 fn discover(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
