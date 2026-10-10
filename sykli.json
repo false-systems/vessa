@@ -1,0 +1,100 @@
+{
+  "schema": "sykli-contract.v1",
+  "tasks": [
+    {
+      "name": "fmt",
+      "run": "cargo fmt --check",
+      "inputs": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "rust-toolchain.toml",
+        "src/analysis.rs",
+        "src/import.rs",
+        "src/main.rs",
+        "src/metrics.rs",
+        "src/model.rs",
+        "src/render.rs",
+        "src/work.rs",
+        "tests/cli.rs"
+      ]
+    },
+    {
+      "name": "clippy",
+      "run": "cargo clippy --workspace --all-targets -- -D warnings",
+      "after": [
+        "fmt"
+      ],
+      "inputs": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "examples/claude-subagent.jsonl",
+        "examples/claude.jsonl",
+        "examples/codex.jsonl",
+        "examples/pi.jsonl",
+        "examples/rates.json",
+        "examples/work.jsonl",
+        "rust-toolchain.toml",
+        "src/analysis.rs",
+        "src/import.rs",
+        "src/main.rs",
+        "src/metrics.rs",
+        "src/model.rs",
+        "src/render.rs",
+        "src/work.rs",
+        "tests/cli.rs"
+      ]
+    },
+    {
+      "name": "test",
+      "run": "cargo test --workspace",
+      "after": [
+        "fmt"
+      ],
+      "inputs": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "examples/claude-subagent.jsonl",
+        "examples/claude.jsonl",
+        "examples/codex.jsonl",
+        "examples/pi.jsonl",
+        "examples/rates.json",
+        "examples/work.jsonl",
+        "rust-toolchain.toml",
+        "src/analysis.rs",
+        "src/import.rs",
+        "src/main.rs",
+        "src/metrics.rs",
+        "src/model.rs",
+        "src/render.rs",
+        "src/work.rs",
+        "tests/cli.rs"
+      ]
+    },
+    {
+      "name": "fixtures",
+      "run": "cargo run --quiet -- usage --input examples",
+      "inputs": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "examples/claude-subagent.jsonl",
+        "examples/claude.jsonl",
+        "examples/codex.jsonl",
+        "examples/pi.jsonl",
+        "examples/rates.json",
+        "examples/work.jsonl",
+        "rust-toolchain.toml",
+        "src/analysis.rs",
+        "src/import.rs",
+        "src/main.rs",
+        "src/metrics.rs",
+        "src/model.rs",
+        "src/render.rs",
+        "src/work.rs",
+        "tests/cli.rs"
+      ],
+      "after": [
+        "test"
+      ]
+    }
+  ]
+}

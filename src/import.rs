@@ -73,9 +73,10 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             (s.id.clone(), current.id.clone())
         })
         .collect();
-    let mut seen: HashMap<(String, String), (Entry, String)> = HashMap::new();
-    for session in &mut report.sessions {
-        let mut usage = Vec::new();
+    // One record per usage identity: (owning session, slot, owner ID).
+    let mut seen: HashMap<(String, String), (usize, usize, String)> = HashMap::new();
+    let mut kept: Vec<Vec<Usage>> = report.sessions.iter().map(|_| Vec::new()).collect();
+    for (index, session) in report.sessions.iter_mut().enumerate() {
         for item in session.usage.drain(..) {
             let started = session
                 .started_at
@@ -96,18 +97,31 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
                 item.id.clone()
             };
             let key = (session.agent.clone(), event_id);
-            if let Some((old, owner)) = seen.get(&key) {
-                if old != &item.entry {
+            if let Some((owner, slot, owner_id)) = seen.get(&key) {
+                let old = &mut kept[*owner][*slot];
+                if extends(&old.entry, &item.entry) {
+                    // A later snapshot of the same request. Within one file it
+                    // becomes the evidence line; a copy elsewhere only supplies
+                    // the count, so the record stays with its owner's source.
+                    if old.source == item.source {
+                        *old = item;
+                    } else {
+                        old.entry = item.entry;
+                    }
+                } else if !extends(&item.entry, &old.entry) && old.entry != item.entry {
                     session.limitations.push(format!(
-                        "conflicting usage {} (first seen in {owner}); first record retained",
-                        item.id
+                        "conflicting usage {} (first seen in {owner_id}): {}; first record retained",
+                        item.id,
+                        difference(&old.entry, &item.entry)
                     ));
                 }
             } else {
-                seen.insert(key, (item.entry.clone(), session.id.clone()));
-                usage.push(item);
+                seen.insert(key, (index, kept[index].len(), session.id.clone()));
+                kept[index].push(item);
             }
         }
+    }
+    for (session, usage) in report.sessions.iter_mut().zip(kept) {
         session.usage = usage;
         for wrapper in &wrappers {
             if wrapper["usage"].as_array().is_some_and(|receipts| {
@@ -144,6 +158,59 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             .push("No supported native sessions found; usage is unknown".into());
     }
     Ok(report)
+}
+
+/// True when `new` is a strictly later snapshot of the same request as `old`:
+/// only the output count has grown, and everything else, including the input
+/// and cache counts, agrees. Claude Code writes one line per content block,
+/// and in subagent transcripts the output count grows across those lines.
+fn extends(old: &Entry, new: &Entry) -> bool {
+    let (Some(before), Some(after)) = (old.output_tokens, new.output_tokens) else {
+        return false;
+    };
+    after > before
+        && Entry {
+            output_tokens: old.output_tokens,
+            ..new.clone()
+        } == *old
+}
+
+/// Names what two snapshots of one request disagree on, so a partial result
+/// can be judged: a model fallback reads differently from changed counts.
+fn difference(old: &Entry, new: &Entry) -> String {
+    let show = |n: Option<u64>| n.map_or("unknown".into(), |n| n.to_string());
+    let mut parts = Vec::new();
+    for (name, a, b) in [
+        ("provider", &old.provider, &new.provider),
+        ("model", &old.model, &new.model),
+    ] {
+        if a != b {
+            parts.push(format!("{name} {a} then {b}"));
+        }
+    }
+    for (name, a, b) in [
+        ("input", old.input_tokens, new.input_tokens),
+        ("output", old.output_tokens, new.output_tokens),
+        ("cache read", old.cache_read_tokens, new.cache_read_tokens),
+        (
+            "cache write",
+            old.cache_write_tokens,
+            new.cache_write_tokens,
+        ),
+        (
+            "estimate",
+            old.estimated_usd_micros,
+            new.estimated_usd_micros,
+        ),
+    ] {
+        if a != b {
+            parts.push(format!("{name} {} then {}", show(a), show(b)));
+        }
+    }
+    if parts.is_empty() {
+        parts.push("recorded amounts differ".into());
+    }
+    parts.join(", ")
 }
 
 fn discover(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -268,8 +335,15 @@ fn parse_file(path: &Path) -> Result<Parsed> {
         work: Vec::new(),
     };
     let mut model = "unknown".to_owned();
-    let mut provider = "unknown".to_owned();
-    let mut previous: Option<[u64; 3]> = None;
+    // Codex is OpenAI's agent; its session_meta names the provider when it
+    // is another one. Pi is multi-provider and gets no default.
+    let mut provider = if agent == "codex" {
+        "openai"
+    } else {
+        "unknown"
+    }
+    .to_owned();
+    let mut previous: Option<[u64; 4]> = None;
     let mut pi_model_changed = false;
     for (line, value) in records {
         crate::work::observe(&value, line, &mut session);
@@ -358,7 +432,10 @@ fn claude(v: &Value, line: usize, s: &mut Session) -> Result<()> {
     if v["type"] == "assistant" && m["usage"].is_object() {
         let usage = &m["usage"];
         let mut entry = base(
-            v["provider"].as_str().unwrap_or("unknown").into(),
+            v["provider"]
+                .as_str()
+                .unwrap_or_else(|| claude_provider(v))
+                .into(),
             m["model"].as_str().unwrap_or("unknown").into(),
         );
         entry.input_tokens = count(usage, "input_tokens")?;
@@ -370,11 +447,34 @@ fn claude(v: &Value, line: usize, s: &mut Session) -> Result<()> {
             .or_else(|| m["id"].as_str())
             .map(str::to_owned)
             .unwrap_or_else(|| fallback(s, line));
-        // Claude may emit multiple content blocks for one request. Equal usage
-        // deduplicates; conflicting snapshots are reported instead of summed.
+        // Claude writes a line per content block of one request. Equal usage
+        // deduplicates, a growing output count keeps the largest snapshot, and
+        // conflicting snapshots are reported instead of summed (see `read`).
         add(s, v, line, id, entry);
     }
     Ok(())
+}
+
+/// Claude Code transcripts never name a provider, and the same transcript
+/// shape comes from Anthropic's API, Amazon Bedrock, Google Vertex AI or an
+/// Anthropic-compatible gateway. The response ids tell them apart: Anthropic
+/// returns `msg_01…` with `req_…` request ids, Bedrock `msg_bdrk_…` and Vertex
+/// `msg_vrtx_…`. Anything else stays unknown; a model name proves nothing.
+fn claude_provider(v: &Value) -> &'static str {
+    let message = v["message"]["id"].as_str().unwrap_or_default();
+    if message.starts_with("msg_bdrk_") {
+        "bedrock"
+    } else if message.starts_with("msg_vrtx_") {
+        "vertex"
+    } else if message.starts_with("msg_01")
+        || v["requestId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("req_"))
+    {
+        "anthropic"
+    } else {
+        "unknown"
+    }
 }
 
 fn codex(
@@ -383,7 +483,7 @@ fn codex(
     s: &mut Session,
     model: &mut String,
     provider: &mut String,
-    previous: &mut Option<[u64; 3]>,
+    previous: &mut Option<[u64; 4]>,
 ) -> Result<()> {
     let p = &v["payload"];
     if matches!(v["type"].as_str(), Some("session_meta" | "turn_context")) {
@@ -404,24 +504,38 @@ fn codex(
         let [Some(input), Some(output), Some(cached)] = values else {
             bail!("missing cumulative token categories; cannot safely derive request usage");
         };
+        // Newer Codex also counts cache writes. Vessa assumes that, like cached
+        // reads, they are part of the inclusive input; every real value seen so
+        // far is zero, so a non-zero one is reported until that is confirmed.
+        // Older Codex omits them: OpenAI prompt caching has no write category.
+        let written = cache_writes(total)?;
+        if written > 0 {
+            let note = "cache_write_input_tokens is non-zero: Vessa assumes cache writes are part of input_tokens, which no transcript has confirmed; uncached input may be undercounted";
+            if !s.limitations.iter().any(|l| l == note) {
+                s.limitations.push(note.into());
+            }
+        }
         ensure!(
-            cached <= input,
+            cached
+                .checked_add(written)
+                .is_some_and(|cache| cache <= input),
             "cached tokens exceed inclusive input tokens"
         );
-        let current = [input, output, cached];
-        let mut prior = previous.unwrap_or([0; 3]);
+        let current = [input, output, cached, written];
+        let mut prior = previous.unwrap_or([0; 4]);
         if previous.is_none() && s.parent.is_some() {
-            let last = &p["info"]["last_token_usage"];
+            let breakdown = &p["info"]["last_token_usage"];
             let last = [
-                count(last, "input_tokens")?,
-                count(last, "output_tokens")?,
-                count(last, "cached_input_tokens")?,
+                count(breakdown, "input_tokens")?,
+                count(breakdown, "output_tokens")?,
+                count(breakdown, "cached_input_tokens")?,
             ];
+            let lw = cache_writes(breakdown)?;
             *previous = Some(current);
             let [Some(li), Some(lo), Some(lc)] = last else {
                 bail!("first child counter has no last-request breakdown; inherited usage cannot be attributed");
             };
-            for (i, last) in [li, lo, lc].into_iter().enumerate() {
+            for (i, last) in [li, lo, lc, lw].into_iter().enumerate() {
                 prior[i] = current[i]
                     .checked_sub(last)
                     .context("last-request tokens exceed cumulative total")?;
@@ -439,12 +553,15 @@ fn codex(
         if delta.iter().all(|n| *n == 0) {
             return Ok(());
         }
-        ensure!(delta[2] <= delta[0], "cache delta exceeds input delta");
+        let uncached = delta[0]
+            .checked_sub(delta[2])
+            .and_then(|rest| rest.checked_sub(delta[3]))
+            .context("cache delta exceeds input delta")?;
         let mut entry = base(provider.clone(), model.clone());
-        entry.input_tokens = Some(delta[0] - delta[2]);
+        entry.input_tokens = Some(uncached);
         entry.output_tokens = Some(delta[1]);
         entry.cache_read_tokens = Some(delta[2]);
-        entry.cache_write_tokens = Some(0);
+        entry.cache_write_tokens = Some(delta[3]);
         add(
             s,
             v,
@@ -454,6 +571,11 @@ fn codex(
         );
     }
     Ok(())
+}
+
+/// Codex cache writes, zero when the counter predates the field.
+fn cache_writes(usage: &Value) -> Result<u64> {
+    Ok(count(usage, "cache_write_input_tokens")?.unwrap_or(0))
 }
 
 fn pi(

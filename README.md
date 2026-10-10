@@ -24,8 +24,10 @@ as explicit files so agent metadata JSON is not mistaken for a usage source.
 Pass explicit paths for relocated agent directories or a bounded selection.
 Use `--agent claude|codex|pi` or `--session NATIVE-ID` to filter results.
 Missing paths, malformed records and unsupported formats are reported, not
-silently treated as zero. Exit 4 means the output is partial; exit 1 means
-the requested operation failed. Use the emitted limitations to judge coverage.
+silently treated as zero. Exit 4 means the usage evidence is partial: a source
+warning or a session limitation, each printed to stderr, and a last line that
+counts them. Rate-card notices do not set it. Exit 1 means the requested
+operation failed. Use the emitted limitations to judge coverage.
 
 ## Session display and statistics
 
@@ -108,12 +110,25 @@ output includes reasoning tokens where the producer includes them, so Vessa
 never adds a reasoning subcategory a second time.
 
 * Claude Code: deduplicates request IDs across repeated assistant content blocks.
-  Provider is `unknown` when the transcript does not identify it; a model name
-  does not prove which service billed the request. Conflicting usage snapshots
-  are flagged and the first is retained; the result is partial.
+  Claude Code writes one line per content block, and in subagent transcripts
+  the output count grows across the lines of one request; when everything else
+  agrees, the largest snapshot is kept and its line is the evidence. Snapshots
+  that disagree in any other way (input or cache counts, model) are flagged and
+  the first is retained; the result is partial. Claude Code transcripts never
+  name a provider, and Anthropic's API, Amazon Bedrock, Google Vertex AI and
+  Anthropic-compatible gateways write the same shape. The provider comes from
+  the response ids: `msg_01…` or a `req_…` request id is `anthropic`,
+  `msg_bdrk_…` is `bedrock`, `msg_vrtx_…` is `vertex`, and anything else is
+  `unknown`. A model name proves nothing about who served the request.
 * Codex: differences cumulative input/output/cache counters, ignores repeated
   totals, and associates deltas with the current model context. Counter resets
-  are flagged, with a new baseline, rather than inventing negative usage.
+  are flagged, with a new baseline, rather than inventing negative usage. The
+  provider is the session's `model_provider`, else `openai`. Cache writes come
+  from `cache_write_input_tokens`. That they are part of the inclusive input,
+  like cached reads, is an **assumption**: every value seen so far (32,548
+  counters, all OpenAI) is zero, so nothing confirms it. A non-zero value is
+  reported as a session limitation (exit 4) until a provider that reports writes
+  settles it. Counters that predate the field record zero cache writes.
 * Pi: reads assistant, compaction, branch-summary and standalone usage entries.
   Recorded costs are estimates. Copied entry IDs across forks are counted once,
   with parent sessions processed first when available.
@@ -128,6 +143,9 @@ imports do not establish actual plan consumption or invoice charges.
 are not provider prices. Rates use integer USD millionths per million tokens,
 and require provider/model, an RFC3339 validity interval, and a source.
 Unknown token categories prevent repricing. Overlapping applicable rates fail.
+A card that prices no selected usage record is named in a warning, since it
+usually means a provider, model or date mismatch; pricing notices do not make
+the output partial (exit 4).
 Keep plan multipliers, discounts and service tiers out of this simple API-rate
 estimate unless the supplied rate actually represents them.
 

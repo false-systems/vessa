@@ -37,6 +37,8 @@ fn native_usage_is_not_double_counted_and_costs_are_not_bills() {
         "--rates",
         "examples/rates.json",
     ]));
+    // Real Claude transcripts never name a provider; the source does.
+    assert_eq!(v["entries"][0]["provider"], "anthropic");
     assert_eq!(v["entries"][0]["input_tokens"], 1200);
     assert_eq!(v["entries"][0]["estimated_usd_micros"], 8715);
     assert!(v["entries"][0]["billed"].is_null());
@@ -75,7 +77,8 @@ fn html_is_private_escaped_and_evidence_links_resolve() {
     let input = temp("escaped.jsonl");
     std::fs::write(
         &input,
-        include_str!("../examples/claude.jsonl").replace("anthropic", "<script>untrusted</script>"),
+        include_str!("../examples/claude.jsonl")
+            .replace("demo-model", "<script>untrusted</script>"),
     )
     .unwrap();
     let args = [
@@ -560,4 +563,333 @@ fn native_tool_results_are_not_user_commands_and_unknown_results_are_not_changes
         assert_eq!(v["entries"][0]["input_tokens"], 800);
     }
     std::fs::remove_file(input).unwrap();
+}
+
+fn write_lines(path: &PathBuf, rows: &[Value]) {
+    std::fs::write(
+        path,
+        rows.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn claude_subagent_snapshots_keep_the_final_output_count() {
+    // Claude Code writes one line per content block. In subagent transcripts
+    // the output count grows across the lines of one request (3, 3, 644).
+    let output = cli(&[
+        "usage",
+        "--input",
+        "examples/claude-subagent.jsonl",
+        "--json",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session = &v["sessions"][0];
+    assert_eq!(session["id"], "claude-demo/subagent-demo");
+    assert_eq!(session["totals"][0]["output_tokens"], 644 + 731);
+    assert_eq!(session["totals"][0]["input_tokens"], 6);
+    assert_eq!(session["totals"][0]["cache_read_tokens"], 2500);
+    assert_eq!(session["totals"][0]["cache_write_tokens"], 80);
+    // One record per request, pointing at the line that carries its count.
+    let usage = session["usage"].as_array().unwrap();
+    assert_eq!(usage.len(), 2);
+    assert_eq!(usage[0]["line"], 4);
+    assert_eq!(usage[1]["line"], 7);
+    assert!(session["limitations"].as_array().unwrap().is_empty());
+
+    // A copy holding only an earlier, smaller snapshot is not a conflict.
+    let copy = temp("subagent-copy.jsonl");
+    std::fs::write(
+        &copy,
+        include_str!("../examples/claude-subagent.jsonl")
+            .lines()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        "examples/claude-subagent.jsonl",
+        "--input",
+        copy.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(v["sessions"][0]["totals"][0]["output_tokens"], 1375);
+    std::fs::remove_file(copy).unwrap();
+}
+
+#[test]
+fn disagreeing_claude_snapshots_are_flagged_not_merged() {
+    // Same request, but the inputs differ: that is a true conflict, not growth.
+    let path = temp("conflict.jsonl");
+    let mut rows: Vec<Value> = include_str!("../examples/claude-subagent.jsonl")
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    rows[3]["message"]["usage"]["cache_read_input_tokens"] = 901.into();
+    write_lines(&path, &rows);
+    let output = cli(&["usage", "--input", path.to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session = &v["sessions"][0];
+    assert!(session["limitations"][0]
+        .as_str()
+        .unwrap()
+        .contains("conflicting usage req_011CdemoSub1"));
+    // The first record is retained; the conflicting one is not summed.
+    assert_eq!(session["totals"][0]["output_tokens"], 3 + 731);
+    assert_eq!(session["totals"][0]["cache_read_tokens"], 2500);
+
+    // A shrinking count is not growth either when the inputs also change.
+    rows[3]["message"]["usage"]["cache_read_input_tokens"] = 900.into();
+    rows[2]["message"]["usage"]["input_tokens"] = 5.into();
+    write_lines(&path, &rows);
+    assert_eq!(
+        cli(&["usage", "--input", path.to_str().unwrap()])
+            .status
+            .code(),
+        Some(4)
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn codex_provider_is_inferred_and_unused_rate_cards_warn() {
+    // Without model_provider, a Codex transcript is still OpenAI's.
+    let path = temp("codex-no-provider.jsonl");
+    std::fs::write(
+        &path,
+        include_str!("../examples/codex.jsonl").replace(",\"model_provider\":\"openai\"", ""),
+    )
+    .unwrap();
+    let v = value(cli(&[
+        "receipt",
+        "--input",
+        path.to_str().unwrap(),
+        "--rates",
+        "examples/rates.json",
+    ]));
+    assert_eq!(v["entries"][0]["provider"], "openai");
+    assert_eq!(v["entries"][0]["estimated_usd_micros"], 3740);
+    std::fs::remove_file(path).unwrap();
+
+    // A rate card that prices nothing is named, not silently ignored.
+    let rates = temp("unused-rates.json");
+    let mut cards: Vec<Value> =
+        serde_json::from_str(include_str!("../examples/rates.json")).unwrap();
+    let mut unused = cards[0].clone();
+    unused["provider"] = "nobody".into();
+    cards.push(unused);
+    std::fs::write(&rates, serde_json::to_vec(&cards).unwrap()).unwrap();
+    let output = cli(&[
+        "usage",
+        "--input",
+        "examples/claude.jsonl",
+        "--rates",
+        rates.to_str().unwrap(),
+        "--json",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let warnings = v["warnings"].as_array().unwrap();
+    // The Claude card priced the session; the OpenAI and "nobody" cards did not.
+    assert_eq!(v["sessions"][0]["totals"][0]["estimated_usd_micros"], 8715);
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(warnings.iter().any(|w| w
+        .as_str()
+        .unwrap()
+        .starts_with("rate card nobody/demo-model")));
+    assert!(warnings
+        .iter()
+        .all(|w| w.as_str().unwrap().contains("priced no usage records")));
+    assert!(stderr.contains("rate card nobody/demo-model"));
+    // A pricing notice does not make the usage evidence partial.
+    assert_eq!(output.status.code(), Some(0));
+    std::fs::remove_file(rates).unwrap();
+}
+
+#[test]
+fn full_runs_are_partial_only_for_real_gaps() {
+    // Every realistic fixture together, as a full run reads them: complete.
+    let output = cli(&["usage", "--input", "examples", "--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(v["warnings"].as_array().unwrap().is_empty());
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 5);
+    for session in v["sessions"].as_array().unwrap() {
+        assert!(session["limitations"].as_array().unwrap().is_empty());
+    }
+    assert!(stderr.is_empty(), "{stderr}");
+
+    // A real gap: Claude falls back to another model inside one request and
+    // repeats the earlier counts, so the fallback's usage is unknown.
+    let path = temp("fallback.jsonl");
+    let mut rows: Vec<Value> = include_str!("../examples/claude-subagent.jsonl")
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    rows[2]["message"]["model"] = "fallback-model".into();
+    write_lines(&path, &rows);
+    let output = cli(&["usage", "--input", path.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(4));
+    // The limitation says what disagreed, and the run says why it is partial.
+    assert!(
+        stderr.contains("conflicting usage req_011CdemoSub1 (first seen in claude-demo/subagent-demo): model demo-model then fallback-model"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.trim_end().ends_with(
+            "vessa: partial usage evidence (exit 4): 1 session with limitations, 0 source warnings"
+        ),
+        "{stderr}"
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn codex_cache_writes_are_read_when_present() {
+    // Newer Codex counters also report cache writes. Vessa assumes that, like
+    // cached reads, they are part of the inclusive input count. Every real
+    // value seen so far is zero, so a non-zero one is reported as unconfirmed.
+    let path = temp("codex-cache-write.jsonl");
+    let total = |input: u64, cached: u64, written: u64, output: u64| serde_json::json!({"input_tokens":input,"cached_input_tokens":cached,"cache_write_input_tokens":written,"output_tokens":output,"reasoning_output_tokens":0,"total_tokens":input + output});
+    let rows = [
+        serde_json::json!({"type":"session_meta","payload":{"id":"codex-writes","cwd":"/demo/widget","model_provider":"openai","source":"cli"}}),
+        serde_json::json!({"type":"turn_context","payload":{"model":"demo-codex"}}),
+        serde_json::json!({"timestamp":"2026-09-30T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":total(1000, 400, 100, 100)}}}),
+        serde_json::json!({"timestamp":"2026-09-30T10:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":total(1500, 700, 150, 200)}}}),
+    ];
+    let unconfirmed = |path: &PathBuf| {
+        let output = cli(&["receipt", "--input", path.to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(4));
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            v["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l.as_str().unwrap().contains("cache_write_input_tokens")),
+            "{v}"
+        );
+        v
+    };
+    write_lines(&path, &rows);
+    let v = unconfirmed(&path);
+    assert_eq!(v["entries"][0]["input_tokens"], 1500 - 700 - 150);
+    assert_eq!(v["entries"][0]["cache_read_tokens"], 700);
+    assert_eq!(v["entries"][0]["cache_write_tokens"], 150);
+    assert_eq!(v["entries"][0]["output_tokens"], 200);
+
+    // A child session's first counter excludes inherited writes as well.
+    let mut child = rows.to_vec();
+    child[0]["payload"]["source"] = serde_json::json!({"subagent":"review"});
+    child[2]["payload"]["info"]["last_token_usage"] = total(100, 40, 10, 10);
+    child.truncate(3);
+    write_lines(&path, &child);
+    let v = unconfirmed(&path);
+    assert_eq!(v["entries"][0]["input_tokens"], 100 - 40 - 10);
+    assert_eq!(v["entries"][0]["cache_write_tokens"], 10);
+
+    // Zero writes, as every real counter reports so far, are complete.
+    let mut zero = rows.to_vec();
+    zero[2]["payload"]["info"]["total_token_usage"] = total(1000, 400, 0, 100);
+    zero[3]["payload"]["info"]["total_token_usage"] = total(1500, 700, 0, 200);
+    write_lines(&path, &zero);
+    let v = value(cli(&["receipt", "--input", path.to_str().unwrap()]));
+    assert_eq!(v["entries"][0]["input_tokens"], 800);
+    assert_eq!(v["entries"][0]["cache_write_tokens"], 0);
+
+    // Older Codex omits the field; OpenAI caching has no separate write.
+    let v = value(cli(&["receipt", "--input", "examples/codex.jsonl"]));
+    assert_eq!(v["entries"][0]["cache_write_tokens"], 0);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn claude_provider_comes_from_response_ids_not_the_source() {
+    // Claude Code also runs on Bedrock, Vertex and Anthropic-compatible
+    // gateways with the same transcript shape. Only the ids tell them apart.
+    let path = temp("claude-provider.jsonl");
+    for (message_id, request_id, expected) in [
+        (
+            "msg_011CdemoMessage1",
+            Some("req_011CdemoRequest1"),
+            "anthropic",
+        ),
+        ("msg_011CdemoMessage1", None, "anthropic"),
+        ("msg_bdrk_01demoMessage1", None, "bedrock"),
+        ("msg_vrtx_01demoMessage1", None, "vertex"),
+        ("chatcmpl-demo1", None, "unknown"),
+        ("gen-demo1", Some("gateway-request-1"), "unknown"),
+    ] {
+        let mut row = serde_json::json!({"type":"assistant","uuid":"a1","sessionId":"claude-demo","timestamp":"2026-09-30T09:01:00Z","message":{"id":message_id,"role":"assistant","model":"demo-model","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":1200,"output_tokens":300,"cache_read_input_tokens":800,"cache_creation_input_tokens":100}}});
+        if let Some(request_id) = request_id {
+            row["requestId"] = request_id.into();
+        }
+        write_lines(&path, &[row]);
+        let output = cli(&[
+            "receipt",
+            "--input",
+            path.to_str().unwrap(),
+            "--rates",
+            "examples/rates.json",
+        ]);
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(v["entries"][0]["provider"], expected, "{message_id}");
+        // Only Anthropic's own usage meets the anthropic rate card.
+        assert_eq!(
+            v["entries"][0]["estimated_usd_micros"].is_null(),
+            expected != "anthropic",
+            "{message_id}"
+        );
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn non_openai_codex_providers_are_never_priced_as_openai() {
+    // Codex can run against other providers; their usage must not meet an
+    // OpenAI rate card just because Codex is OpenAI's agent.
+    let path = temp("codex-ollama.jsonl");
+    std::fs::write(
+        &path,
+        include_str!("../examples/codex.jsonl").replace(
+            "\"model_provider\":\"openai\"",
+            "\"model_provider\":\"ollama\"",
+        ),
+    )
+    .unwrap();
+    let output = cli(&[
+        "usage",
+        "--input",
+        path.to_str().unwrap(),
+        "--rates",
+        "examples/rates.json",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(0));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let totals = &v["sessions"][0]["totals"][0];
+    assert_eq!(totals["provider"], "ollama");
+    assert_eq!(totals["model"], "demo-codex");
+    assert!(totals["estimated_usd_micros"].is_null());
+    // The OpenAI card matched nothing here, and says so.
+    assert!(v["warnings"].as_array().unwrap().iter().any(|w| w
+        .as_str()
+        .unwrap()
+        .starts_with("rate card openai/demo-codex")));
+    std::fs::remove_file(path).unwrap();
 }
