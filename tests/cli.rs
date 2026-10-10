@@ -893,3 +893,63 @@ fn non_openai_codex_providers_are_never_priced_as_openai() {
         .starts_with("rate card openai/demo-codex")));
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn a_session_says_how_it_was_started_and_is_dated_past_untimed_header_records() {
+    // Current Claude Code transcripts open with records that carry the
+    // session id but no time and no folder; `claude -p` marks its records
+    // `entrypoint: sdk-cli`. `codex exec` names itself as the originator.
+    let claude = temp("headless.jsonl");
+    std::fs::write(
+        &claude,
+        concat!(
+            r#"{"type":"last-prompt","sessionId":"claude-headless","leafUuid":"x"}"#,
+            "\n",
+            r#"{"type":"mode","sessionId":"claude-headless","mode":"normal"}"#,
+            "\n",
+            r#"{"type":"user","uuid":"u1","sessionId":"claude-headless","cwd":"/demo/widget","entrypoint":"sdk-cli","timestamp":"2026-09-30T09:00:00Z","message":{"role":"user","content":"draft"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let codex = temp("exec.jsonl");
+    std::fs::write(
+        &codex,
+        concat!(
+            r#"{"type":"session_meta","payload":{"id":"codex-exec","cwd":"/demo/widget","originator":"codex_exec","source":"exec","timestamp":"2026-09-30T10:00:00Z"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let output = cli(&[
+        "sessions",
+        "--json",
+        "--input",
+        claude.to_str().unwrap(),
+        "--input",
+        codex.to_str().unwrap(),
+    ]);
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let session = |id: &str| {
+        v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    let claude_session = session("claude-headless");
+    assert_eq!(claude_session["started_at"], "2026-09-30T09:00:00Z");
+    assert_eq!(claude_session["cwd"], "/demo/widget");
+    assert_eq!(claude_session["entrypoint"], "sdk-cli");
+    assert!(claude_session["originator"].is_null());
+    let codex_session = session("codex-exec");
+    assert_eq!(codex_session["originator"], "codex_exec");
+    assert!(codex_session["entrypoint"].is_null());
+    // Unknown is said as null, never left out: a reader can tell an older
+    // vessa from a session that did not say.
+    let v = value(cli(&["sessions", "--json", "--input", "examples/pi.jsonl"]));
+    let pi = v["sessions"][0].as_object().unwrap();
+    assert!(pi.contains_key("entrypoint") && pi.contains_key("originator"));
+}

@@ -23,7 +23,7 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
     let mut wrappers = Vec::new();
     for file in files {
         match parse_file(&file) {
-            Ok(Parsed::Session(session)) => report.sessions.push(session),
+            Ok(Parsed::Session(session)) => report.sessions.push(*session),
             Ok(Parsed::Wrappers(records, warnings)) => {
                 wrappers.extend(records);
                 report.warnings.extend(warnings);
@@ -239,7 +239,7 @@ fn discover(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 enum Parsed {
-    Session(Session),
+    Session(Box<Session>),
     Wrappers(Vec<Value>, Vec<String>),
 }
 
@@ -322,12 +322,27 @@ fn parse_file(path: &Path) -> Result<Parsed> {
     if agent == "codex" && !meta["source"]["subagent"].is_null() && parent.is_none() {
         parent = Some("parent identity unavailable (subagent source)".into());
     }
+    // Current Claude Code transcripts open with records (`last-prompt`,
+    // `mode`) that carry the session id but no time and no folder: those come
+    // from the first record that has them.
+    let first = |key: &str| records.iter().find_map(|(_, v)| v[key].as_str());
     let mut session = Session {
         agent: agent.into(),
         id,
         parent,
-        started_at: timestamp(meta).or_else(|| timestamp(&header.1)),
-        cwd: string(meta, "cwd"),
+        started_at: timestamp(meta)
+            .or_else(|| timestamp(&header.1))
+            .or_else(|| records.iter().find_map(|(_, v)| timestamp(v))),
+        cwd: Some(string(meta, "cwd"))
+            .filter(|cwd| !cwd.is_empty())
+            .or_else(|| first("cwd").map(str::to_owned))
+            .unwrap_or_default(),
+        entrypoint: (agent == "claude")
+            .then(|| first("entrypoint").map(str::to_owned))
+            .flatten(),
+        originator: (agent == "codex")
+            .then(|| meta["originator"].as_str().map(str::to_owned))
+            .flatten(),
         source: source.clone(),
         usage: Vec::new(),
         limitations,
@@ -370,7 +385,7 @@ fn parse_file(path: &Path) -> Result<Parsed> {
             session.limitations.push(format!("line {line}: {error:#}"));
         }
     }
-    Ok(Parsed::Session(session))
+    Ok(Parsed::Session(Box::new(session)))
 }
 
 fn string(v: &Value, key: &str) -> String {
