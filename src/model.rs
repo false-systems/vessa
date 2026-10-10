@@ -45,6 +45,14 @@ pub struct Session {
     pub ohjaa: Vec<serde_json::Value>,
     #[serde(default)]
     pub work: Vec<crate::work::Event>,
+    /// How a Claude session was started, as its transcript says: `cli` for
+    /// an interactive session, `sdk-cli` for `claude -p`. Null when unknown.
+    #[serde(default)]
+    pub entrypoint: Option<String>,
+    /// Which Codex front end started a session (`session_meta.originator`):
+    /// `codex-tui`, or `codex_exec` for `codex exec`. Null when unknown.
+    #[serde(default)]
+    pub originator: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
