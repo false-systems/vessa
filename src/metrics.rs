@@ -15,7 +15,11 @@ pub enum Period {
 pub struct Bucket {
     pub period: String,
     pub agent: String,
+    /// Top-level sessions with usage in the period. A Claude subagent's
+    /// usage counts its session, not a session of its own.
     pub sessions: usize,
+    /// Claude subagents with usage in the period, counted apart.
+    pub subagents: usize,
     pub entries: Vec<Entry>,
     pub known_estimated_usd_micros: u64,
     pub unpriced_records: usize,
@@ -23,6 +27,7 @@ pub struct Bucket {
 #[derive(Default)]
 struct Group<'a> {
     sessions: BTreeSet<&'a str>,
+    subagents: BTreeSet<&'a str>,
     usage: Vec<&'a Usage>,
 }
 pub fn history(report: &Report, period: Period) -> Result<Vec<Bucket>> {
@@ -48,13 +53,18 @@ pub fn history(report: &Report, period: Period) -> Result<Vec<Bucket>> {
                 }
             };
             let group = groups.entry((key, s.agent.clone())).or_default();
-            group.sessions.insert(&s.id);
+            let parent = s.subagent_of();
+            group.sessions.insert(parent.unwrap_or(&s.id));
+            if parent.is_some() {
+                group.subagents.insert(&s.id);
+            }
             group.usage.push(u);
         }
     }
     groups
         .into_iter()
-        .map(|((period, agent), Group { sessions, usage })| {
+        .map(|((period, agent), group)| {
+            let usage = group.usage;
             let known = usage.iter().try_fold(0u64, |total, u| {
                 total
                     .checked_add(u.entry.estimated_usd_micros.unwrap_or(0))
@@ -63,7 +73,8 @@ pub fn history(report: &Report, period: Period) -> Result<Vec<Bucket>> {
             Ok(Bucket {
                 period,
                 agent,
-                sessions: sessions.len(),
+                sessions: group.sessions.len(),
+                subagents: group.subagents.len(),
                 entries: model::aggregate_usage(usage.iter().copied())?,
                 known_estimated_usd_micros: known,
                 unpriced_records: usage

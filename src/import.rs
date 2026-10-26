@@ -17,6 +17,19 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
         if let Err(error) = discover(path, &mut files) {
             report.warnings.push(format!("{}: {error}", path.display()));
         }
+        // Claude Code keeps a session's subagent transcripts beside it, in
+        // `<session>/subagents/`. They are that session's usage, so a
+        // transcript selected on its own brings them along.
+        let subagents = path.with_extension("").join("subagents");
+        if path.extension().is_some_and(|s| s == "jsonl")
+            && std::fs::symlink_metadata(&subagents).is_ok()
+        {
+            if let Err(error) = discover(&subagents, &mut files) {
+                report
+                    .warnings
+                    .push(format!("{}: {error}", subagents.display()));
+            }
+        }
     }
     files.sort();
     files.dedup();
@@ -42,6 +55,7 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             old.usage.extend(session.usage);
             old.work.extend(session.work);
             old.limitations.extend(session.limitations);
+            old.launched.extend(session.launched);
         } else {
             merged.insert(key, session);
         }
@@ -76,6 +90,9 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
     // One record per usage identity: (owning session, slot, owner ID).
     let mut seen: HashMap<(String, String), (usize, usize, String)> = HashMap::new();
     let mut kept: Vec<Vec<Usage>> = report.sessions.iter().map(|_| Vec::new()).collect();
+    // Requests a session holds that an earlier session already counted.
+    let mut elsewhere: Vec<std::collections::HashSet<String>> =
+        report.sessions.iter().map(|_| Default::default()).collect();
     for (index, session) in report.sessions.iter_mut().enumerate() {
         for item in session.usage.drain(..) {
             let started = session
@@ -98,6 +115,9 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             };
             let key = (session.agent.clone(), event_id);
             if let Some((owner, slot, owner_id)) = seen.get(&key) {
+                if *owner != index {
+                    elsewhere[index].insert(item.id.clone());
+                }
                 let old = &mut kept[*owner][*slot];
                 if extends(&old.entry, &item.entry) {
                     // A later snapshot of the same request. Within one file it
@@ -121,8 +141,29 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             }
         }
     }
-    for (session, usage) in report.sessions.iter_mut().zip(kept) {
+    // A launched subagent writes its own transcript. One that was not read
+    // leaves the session's usage incomplete, never silently smaller.
+    let read: std::collections::HashSet<_> = report
+        .sessions
+        .iter()
+        .filter(|s| s.agent == "claude")
+        .map(|s| s.id.clone())
+        .collect();
+    for session in report.sessions.iter_mut().filter(|s| s.agent == "claude") {
+        let top = session.subagent_of().unwrap_or(&session.id).to_owned();
+        let mut named = std::collections::HashSet::new();
+        for (agent, line) in std::mem::take(&mut session.launched) {
+            let id = format!("{top}/{agent}");
+            if !read.contains(&id) && named.insert(id.clone()) {
+                session.limitations.push(format!(
+                    "line {line}: subagent {id} was launched, but its transcript was not read; its usage is unknown, not zero"
+                ));
+            }
+        }
+    }
+    for ((session, usage), elsewhere) in report.sessions.iter_mut().zip(kept).zip(elsewhere) {
         session.usage = usage;
+        session.counted_elsewhere = elsewhere.len();
         for wrapper in &wrappers {
             if wrapper["usage"].as_array().is_some_and(|receipts| {
                 receipts
@@ -132,7 +173,10 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
                 session.ohjaa.push(wrapper.clone());
             }
         }
-        if session.usage.is_empty() {
+        // A subagent whose every request its session already holds has had
+        // its usage counted there; it is not unknown.
+        let counted = session.subagent_of().is_some() && session.counted_elsewhere > 0;
+        if session.usage.is_empty() && !counted {
             session
                 .limitations
                 .push("No usage records found; consumption is unknown, not zero".into());
@@ -309,12 +353,15 @@ fn parse_file(path: &Path) -> Result<Parsed> {
         .map(str::to_owned);
     if agent == "claude" && records.iter().any(|(_, v)| v["isSidechain"] == true) {
         parent = Some(id.clone());
+        // Claude Code names the file `agent-<agentId>.jsonl`, so a file
+        // whose records omit the agentId gives the id its launch names.
         let child = records
             .iter()
             .find_map(|(_, v)| v["agentId"].as_str())
             .unwrap_or_else(|| {
                 path.file_stem()
                     .and_then(|s| s.to_str())
+                    .map(|s| s.strip_prefix("agent-").unwrap_or(s))
                     .unwrap_or("unknown")
             });
         id = format!("{id}/{child}");
@@ -348,6 +395,8 @@ fn parse_file(path: &Path) -> Result<Parsed> {
         limitations,
         ohjaa: Vec::new(),
         work: Vec::new(),
+        launched: Vec::new(),
+        counted_elsewhere: 0,
     };
     let mut model = "unknown".to_owned();
     // Codex is OpenAI's agent; its session_meta names the provider when it
@@ -442,6 +491,10 @@ fn claude(v: &Value, line: usize, s: &mut Session) -> Result<()> {
             v["sessionId"] == s.id || s.parent.as_ref().is_some_and(|p| v["sessionId"] == *p),
             "mixed native session IDs"
         );
+    }
+    // Launching a subagent returns a tool result naming its agent id.
+    if let Some(agent) = v["toolUseResult"]["agentId"].as_str() {
+        s.launched.push((agent.to_owned(), line));
     }
     let m = &v["message"];
     if v["type"] == "assistant" && m["usage"].is_object() {

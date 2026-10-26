@@ -127,14 +127,15 @@ pub fn html(report: &Report) -> Result<String> {
         ("Monthly", crate::metrics::Period::Month),
         ("Yearly", crate::metrics::Period::Year),
     ] {
-        let _ = write!(out, "<details><summary>{label} statistics</summary><div class=\"scroll\"><table><thead><tr><th>Period / agent</th><th>Sessions</th><th>Known estimate subtotal</th><th>Unpriced records</th></tr></thead><tbody>");
+        let _ = write!(out, "<details><summary>{label} statistics</summary><div class=\"scroll\"><table><thead><tr><th>Period / agent</th><th>Sessions</th><th>Subagents</th><th>Known estimate subtotal</th><th>Unpriced records</th></tr></thead><tbody>");
         for b in crate::metrics::history(report, period)? {
             let _ = write!(
                 out,
-                "<tr><td>{} / {}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{} / {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 escape(&b.period),
                 escape(&b.agent),
                 b.sessions,
+                b.subagents,
                 dollars(Some(b.known_estimated_usd_micros)),
                 b.unpriced_records
             );

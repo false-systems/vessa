@@ -122,8 +122,22 @@ fn run_once(cli: Cli) -> Result<i32> {
         report.sessions.retain(|s| s.agent == agent);
     }
     if let Some(id) = cli.session {
-        report.sessions.retain(|s| s.id == id);
-        ensure!(!report.sessions.is_empty(), "native session {id} not found");
+        // A Claude session's subagents are part of it: its id selects them too.
+        report
+            .sessions
+            .retain(|s| s.id == id || s.subagent_of() == Some(id.as_str()));
+        // Never answer for a session with its subagents alone: its own usage
+        // would be unknown, and a subagent is not the session.
+        let subagents = report.sessions.iter().filter(|s| s.id != id).count();
+        ensure!(
+            report.sessions.len() > subagents,
+            "native session {id} not found{}",
+            if subagents > 0 {
+                format!("; its main transcript was not read, only {subagents} of its subagents")
+            } else {
+                String::new()
+            }
+        );
     }
     // Partial means the usage evidence itself is incomplete: a source warning
     // or a session limitation. Rate-card notices added below concern pricing
@@ -145,36 +159,76 @@ fn run_once(cli: Cli) -> Result<i32> {
     match cli.command {
         Cmd::ClaudeStatusline => unreachable!(),
         Cmd::Status => {
+            let families = model::families(&report.sessions);
             ensure!(
-                report.sessions.len() == 1,
+                families.len() == 1,
                 "status needs exactly one native session; select --session"
             );
-            let s = &report.sessions[0];
-            let last = s
-                .usage
-                .iter()
-                .filter_map(|u| u.at.as_deref())
-                .filter_map(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
-                .max()
-                .map(|t| t.to_rfc3339());
+            let family = &families[0];
+            let s = family.main;
+            let last_recorded = last_recorded_at(family.usage());
             if cli.json {
+                let subagents = family
+                    .subagents
+                    .iter()
+                    .map(|sub| {
+                        Ok(serde_json::json!({"id":sub.id,"source":sub.source,"last_recorded_at":last_recorded_at(sub.usage.iter()),"entries":model::aggregate(sub)?}))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 json(
-                    &serde_json::json!({"schema":"vessa-status.v1", "agent":s.agent,"session_id":s.id,"last_recorded_at":last,"entries":model::aggregate(s)?,"insights":work::summarize(s)?,"limitations":s.limitations,"warnings":report.warnings}),
+                    &serde_json::json!({"schema":"vessa-status.v1", "agent":s.agent,"session_id":s.id,"last_recorded_at":last_recorded,"entries":family.totals()?,"main_entries":model::aggregate(s)?,"subagents":subagents,"insights":work::summarize(s)?,"limitations":family.limitations(),"warnings":report.warnings}),
                 )?;
             } else {
+                let n = family.subagents.len();
+                let scope = if s.agent != "claude" {
+                    String::new()
+                } else if let Some(parent) = s.subagent_of() {
+                    format!(" · subagent of {parent}")
+                } else {
+                    match n {
+                        0 => " · no subagent transcripts read".into(),
+                        1 => " · totals include 1 subagent".into(),
+                        n => format!(" · totals include {n} subagents"),
+                    }
+                };
                 println!(
-                    "{} {} · last recorded {}",
+                    "{} {} · last recorded {}{scope}",
                     s.agent,
                     s.id,
-                    last.as_deref().unwrap_or("unknown")
+                    last_recorded.as_deref().unwrap_or("unknown"),
                 );
-                for e in model::aggregate(s)? {
-                    println!("  {}", render::usage_line(&e));
+                let print = |indent: &str, entries: Vec<model::Entry>| {
+                    if entries.is_empty() {
+                        println!("{indent}usage unknown");
+                    }
+                    for e in entries {
+                        println!("{indent}{}", render::usage_line(&e));
+                    }
+                };
+                print("  ", family.totals()?);
+                if n > 0 {
+                    println!("  main transcript");
+                    print("    ", model::aggregate(s)?);
+                    for sub in &family.subagents {
+                        println!(
+                            "  subagent {} · last recorded {}",
+                            sub.id,
+                            last_recorded_at(sub.usage.iter())
+                                .as_deref()
+                                .unwrap_or("unknown")
+                        );
+                        if sub.usage.is_empty() && sub.counted_elsewhere > 0 {
+                            println!(
+                                "    no requests of its own; {} counted in another transcript",
+                                sub.counted_elsewhere
+                            );
+                        } else {
+                            print("    ", model::aggregate(sub)?);
+                        }
+                    }
+                    println!("Commands below are the main transcript's; subagent usage is in the totals above.");
                 }
                 println!("{}", work::text(&work::summarize(s)?));
-                if s.usage.is_empty() {
-                    println!("  usage unknown");
-                }
             }
         }
         Cmd::Stats { period } => {
@@ -187,10 +241,15 @@ fn run_once(cli: Cli) -> Result<i32> {
                 println!("Calendar usage · UTC · selected local records · estimates are not bills");
                 for b in buckets {
                     println!(
-                        "{} {} · {} sessions · known estimate subtotal={} · {} unpriced records",
+                        "{} {} · {} sessions{} · known estimate subtotal={} · {} unpriced records",
                         b.period,
                         b.agent,
                         b.sessions,
+                        if b.subagents > 0 {
+                            format!(" · {} subagents", b.subagents)
+                        } else {
+                            String::new()
+                        },
                         render::dollars(Some(b.known_estimated_usd_micros)),
                         b.unpriced_records
                     );
@@ -223,11 +282,12 @@ fn run_once(cli: Cli) -> Result<i32> {
             );
         }
         Cmd::Receipt => {
+            let families = model::families(&report.sessions);
             ensure!(
-                report.sessions.len() == 1,
+                families.len() == 1,
                 "receipt needs exactly one session; select with --session"
             );
-            json(&model::receipt(&report.sessions[0])?)?;
+            json(&model::receipt(&families[0])?)?;
         }
         Cmd::Usage { by_agent: true } => {
             let mut groups = std::collections::BTreeMap::<&str, Vec<&model::Usage>>::new();
@@ -258,13 +318,31 @@ fn run_once(cli: Cli) -> Result<i32> {
         }
         Cmd::Sessions | Cmd::Usage { .. } if cli.json => {
             let mut export = serde_json::to_value(&report)?;
+            // `totals` stays each transcript's own; a session's subagents are
+            // named and summed with it in additive fields.
+            let families: std::collections::HashMap<_, _> = model::families(&report.sessions)
+                .into_iter()
+                .filter(|f| !f.subagents.is_empty())
+                .map(|f| ((f.main.agent.as_str(), f.main.id.as_str()), f))
+                .collect();
             for (value, session) in export["sessions"]
                 .as_array_mut()
                 .unwrap()
                 .iter_mut()
                 .zip(&report.sessions)
             {
-                value["totals"] = serde_json::to_value(model::aggregate(session)?)?;
+                let totals = model::aggregate(session)?;
+                let family = families.get(&(session.agent.as_str(), session.id.as_str()));
+                let (subagents, with_subagents) = match family {
+                    Some(f) => (
+                        f.subagents.iter().map(|s| s.id.as_str()).collect(),
+                        f.totals()?,
+                    ),
+                    None => (Vec::new(), totals.clone()),
+                };
+                value["totals"] = serde_json::to_value(totals)?;
+                value["subagents"] = serde_json::to_value(subagents)?;
+                value["totals_with_subagents"] = serde_json::to_value(with_subagents)?;
                 value["insights"] = serde_json::to_value(work::summarize(session)?)?;
             }
             json(&export)?;
@@ -309,6 +387,16 @@ fn run_once(cli: Cli) -> Result<i32> {
         return Ok(4);
     }
     Ok(0)
+}
+
+/// The time of the latest usage record, so an old transcript is not taken
+/// for a live balance.
+fn last_recorded_at<'a>(usage: impl Iterator<Item = &'a model::Usage>) -> Option<String> {
+    usage
+        .filter_map(|u| u.at.as_deref())
+        .filter_map(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .max()
+        .map(|t| t.to_rfc3339())
 }
 
 fn json(value: &impl serde::Serialize) -> Result<()> {
