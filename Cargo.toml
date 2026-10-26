@@ -1,5 +1,6 @@
 [package]
 name = "vessa"
+version = "0.1.0"
 edition = "2021"
 publish = false
 description = "Local agent usage and spending evidence"
