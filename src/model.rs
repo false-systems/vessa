@@ -60,6 +60,11 @@ pub struct Session {
     /// Requests this transcript holds that an earlier session counted.
     #[serde(skip)]
     pub counted_elsewhere: usize,
+    /// Another agent started it: a Claude sidechain, or a Codex session
+    /// whose `source` names a subagent. Its user turns are that agent's
+    /// prompts, not a person's.
+    #[serde(skip)]
+    pub subagent: bool,
 }
 
 /// What a session's transcript says about itself, without its usage: one

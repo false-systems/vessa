@@ -33,27 +33,7 @@ fn sessions(paths: &[PathBuf], parse: fn(&Path) -> Result<Parsed>) -> (Report, V
         schema: "vessa-usage.v1".into(),
         ..Default::default()
     };
-    let mut files = Vec::new();
-    for path in paths {
-        if let Err(error) = discover(path, &mut files) {
-            report.warnings.push(format!("{}: {error}", path.display()));
-        }
-        // Claude Code keeps a session's subagent transcripts beside it, in
-        // `<session>/subagents/`. They are that session's usage, so a
-        // transcript selected on its own brings them along.
-        let subagents = path.with_extension("").join("subagents");
-        if path.extension().is_some_and(|s| s == "jsonl")
-            && std::fs::symlink_metadata(&subagents).is_ok()
-        {
-            if let Err(error) = discover(&subagents, &mut files) {
-                report
-                    .warnings
-                    .push(format!("{}: {error}", subagents.display()));
-            }
-        }
-    }
-    files.sort();
-    files.dedup();
+    let files = transcripts(paths, &mut report.warnings);
     let mut wrappers = Vec::new();
     for file in files {
         match parse(&file) {
@@ -86,6 +66,31 @@ fn sessions(paths: &[PathBuf], parse: fn(&Path) -> Result<Parsed>) -> (Report, V
     // original session when both sources are available.
     report.sessions.sort_by_key(|s| s.parent.is_some());
     (report, wrappers)
+}
+
+/// Every file under `paths` that may be a transcript or an ohjaa export, in
+/// path order, once each; what could not be listed is a warning.
+fn transcripts(paths: &[PathBuf], warnings: &mut Vec<String>) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for path in paths {
+        if let Err(error) = discover(path, &mut files) {
+            warnings.push(format!("{}: {error}", path.display()));
+        }
+        // Claude Code keeps a session's subagent transcripts beside it, in
+        // `<session>/subagents/`. They are that session's usage, so a
+        // transcript selected on its own brings them along.
+        let subagents = path.with_extension("").join("subagents");
+        if path.extension().is_some_and(|s| s == "jsonl")
+            && std::fs::symlink_metadata(&subagents).is_ok()
+        {
+            if let Err(error) = discover(&subagents, &mut files) {
+                warnings.push(format!("{}: {error}", subagents.display()));
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
 }
 
 /// Counts each request once across the sessions, and says what the usage
@@ -348,6 +353,11 @@ fn header_file(path: &Path) -> Result<Parsed> {
     if path.extension().is_some_and(|s| s == "json") {
         return parse_export(path);
     }
+    Ok(Parsed::Session(Box::new(header(path)?)))
+}
+
+/// A native transcript's header alone; see [`header_file`].
+fn header(path: &Path) -> Result<Session> {
     let file = BufReader::new(std::fs::File::open(path)?);
     let mut scan = Scan::default();
     for line in file.lines() {
@@ -364,7 +374,7 @@ fn header_file(path: &Path) -> Result<Parsed> {
             }
         }
     }
-    Ok(Parsed::Session(Box::new(scan.session(path, Vec::new())?)))
+    scan.session(path, Vec::new())
 }
 
 /// What a transcript says about itself, gathered record by record in file
@@ -535,6 +545,8 @@ impl Scan {
             work: Vec::new(),
             launched: Vec::new(),
             counted_elsewhere: 0,
+            subagent: (agent == "claude" && self.sidechain)
+                || (agent == "codex" && opening.subagent_source),
         })
     }
 }
