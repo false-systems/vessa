@@ -1,4 +1,4 @@
-use crate::model::{Entry, Report, Session, Usage};
+use crate::model::{Conversation, Coverage, Entry, Message, Reply, Report, Session, Usage};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -33,27 +33,7 @@ fn sessions(paths: &[PathBuf], parse: fn(&Path) -> Result<Parsed>) -> (Report, V
         schema: "vessa-usage.v1".into(),
         ..Default::default()
     };
-    let mut files = Vec::new();
-    for path in paths {
-        if let Err(error) = discover(path, &mut files) {
-            report.warnings.push(format!("{}: {error}", path.display()));
-        }
-        // Claude Code keeps a session's subagent transcripts beside it, in
-        // `<session>/subagents/`. They are that session's usage, so a
-        // transcript selected on its own brings them along.
-        let subagents = path.with_extension("").join("subagents");
-        if path.extension().is_some_and(|s| s == "jsonl")
-            && std::fs::symlink_metadata(&subagents).is_ok()
-        {
-            if let Err(error) = discover(&subagents, &mut files) {
-                report
-                    .warnings
-                    .push(format!("{}: {error}", subagents.display()));
-            }
-        }
-    }
-    files.sort();
-    files.dedup();
+    let files = transcripts(paths, &mut report.warnings);
     let mut wrappers = Vec::new();
     for file in files {
         match parse(&file) {
@@ -86,6 +66,31 @@ fn sessions(paths: &[PathBuf], parse: fn(&Path) -> Result<Parsed>) -> (Report, V
     // original session when both sources are available.
     report.sessions.sort_by_key(|s| s.parent.is_some());
     (report, wrappers)
+}
+
+/// Every file under `paths` that may be a transcript or an ohjaa export, in
+/// path order, once each; what could not be listed is a warning.
+fn transcripts(paths: &[PathBuf], warnings: &mut Vec<String>) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for path in paths {
+        if let Err(error) = discover(path, &mut files) {
+            warnings.push(format!("{}: {error}", path.display()));
+        }
+        // Claude Code keeps a session's subagent transcripts beside it, in
+        // `<session>/subagents/`. They are that session's usage, so a
+        // transcript selected on its own brings them along.
+        let subagents = path.with_extension("").join("subagents");
+        if path.extension().is_some_and(|s| s == "jsonl")
+            && std::fs::symlink_metadata(&subagents).is_ok()
+        {
+            if let Err(error) = discover(&subagents, &mut files) {
+                warnings.push(format!("{}: {error}", subagents.display()));
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
 }
 
 /// Counts each request once across the sessions, and says what the usage
@@ -348,6 +353,11 @@ fn header_file(path: &Path) -> Result<Parsed> {
     if path.extension().is_some_and(|s| s == "json") {
         return parse_export(path);
     }
+    Ok(Parsed::Session(Box::new(header(path)?)))
+}
+
+/// A native transcript's header alone; see [`header_file`].
+fn header(path: &Path) -> Result<Session> {
     let file = BufReader::new(std::fs::File::open(path)?);
     let mut scan = Scan::default();
     for line in file.lines() {
@@ -364,7 +374,7 @@ fn header_file(path: &Path) -> Result<Parsed> {
             }
         }
     }
-    Ok(Parsed::Session(Box::new(scan.session(path, Vec::new())?)))
+    scan.session(path, Vec::new())
 }
 
 /// What a transcript says about itself, gathered record by record in file
@@ -535,6 +545,8 @@ impl Scan {
             work: Vec::new(),
             launched: Vec::new(),
             counted_elsewhere: 0,
+            subagent: (agent == "claude" && self.sidechain)
+                || (agent == "codex" && opening.subagent_source),
         })
     }
 }
@@ -865,4 +877,976 @@ fn pi(
         add(s, v, line, id, entry);
     }
     Ok(())
+}
+
+// ---- messages ----------------------------------------------------------------
+
+/// How much of the agent's preceding reply travels with a message: its last
+/// characters, as ohjaa intake has taken them.
+const REPLY_TAIL: usize = 600;
+
+/// What `vessa messages` selects, besides its inputs.
+pub struct Selection {
+    pub agent: Option<String>,
+    pub session: Option<String>,
+    pub since: Option<chrono::DateTime<chrono::FixedOffset>>,
+}
+
+/// What `vessa messages` read, beside the messages it handed on.
+pub struct Listing {
+    pub sessions: Vec<Conversation>,
+    pub coverage: Coverage,
+    pub warnings: Vec<String>,
+}
+
+/// The human messages of the transcripts under `paths`, each handed to
+/// `emit` as soon as its transcript is read, so memory holds one
+/// transcript's turns at a time. Transcripts are read in path order, a Codex
+/// fork after the session it was forked from.
+pub fn messages(
+    paths: &[PathBuf],
+    select: &Selection,
+    emit: &mut dyn FnMut(&Message) -> Result<()>,
+) -> Result<Listing> {
+    let mut warnings = Vec::new();
+    let mut coverage = Coverage {
+        since: select.since.map(|t| t.to_rfc3339()),
+        ..Default::default()
+    };
+    // Each transcript's header, read as `sessions --headers` reads it.
+    let mut headers = Vec::new();
+    for file in transcripts(paths, &mut warnings) {
+        if file.extension().is_some_and(|s| s == "json") {
+            warnings.push(format!(
+                "{}: an ohjaa export holds no messages; not read",
+                file.display()
+            ));
+            continue;
+        }
+        match header(&file) {
+            Ok(session) => headers.push((file, session)),
+            Err(error) => warnings.push(format!("{}: {error:#}", file.display())),
+        }
+    }
+    let chosen = |s: &Session| {
+        select.agent.as_ref().is_none_or(|a| *a == s.agent)
+            && select
+                .session
+                .as_ref()
+                .is_none_or(|id| *id == s.id || s.subagent_of() == Some(id.as_str()))
+    };
+    if let Some(id) = &select.session {
+        // A subagent's own id selects it; a session's selects it with its
+        // subagents, and only when its main transcript was read.
+        let (subagents, sessions): (Vec<_>, Vec<_>) = headers
+            .iter()
+            .filter(|(_, s)| chosen(s))
+            .partition(|(_, s)| s.subagent && s.id != *id);
+        ensure!(
+            !sessions.is_empty(),
+            "native session {id} not found{}",
+            if subagents.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; its main transcript was not read, only {} of its subagents",
+                    subagents.len()
+                )
+            }
+        );
+    }
+    let mut work = Vec::new();
+    // Codex sessions a selected fork was forked from: their transcripts tell
+    // the fork's copied history from its own turns.
+    let mut wanted = std::collections::HashSet::new();
+    for (path, s) in &headers {
+        if !chosen(s) {
+            continue;
+        }
+        // A person can write to a Claude subagent, so its transcript is
+        // read for that. Nothing in a Codex subagent's says a person wrote.
+        if s.subagent && s.agent != "claude" {
+            coverage.subagent_transcripts += 1;
+            continue;
+        }
+        // A transcript last written before `since` holds no message from
+        // after it.
+        if let Some(since) = select.since {
+            let modified = std::fs::metadata(path).and_then(|m| m.modified());
+            if modified.is_ok_and(|m| chrono::DateTime::<chrono::Utc>::from(m) < since) {
+                coverage.unmodified_transcripts += 1;
+                continue;
+            }
+        }
+        if s.agent == "codex" {
+            if let Some(parent) = &s.parent {
+                wanted.insert(parent.clone());
+            }
+        }
+        work.push((path, s));
+    }
+    // A fork of a fork comes after its parent fork.
+    let codex: HashMap<&str, &Session> = headers
+        .iter()
+        .filter(|(_, s)| s.agent == "codex")
+        .map(|(_, s)| (s.id.as_str(), s))
+        .collect();
+    let depth = |s: &Session| {
+        let mut seen = std::collections::HashSet::new();
+        let (mut depth, mut current) = (0, s);
+        while let Some(parent) = current.parent.as_deref().filter(|_| s.agent == "codex") {
+            match codex.get(parent) {
+                Some(next) if seen.insert(parent) => (depth, current) = (depth + 1, *next),
+                _ => break,
+            }
+        }
+        depth
+    };
+    work.sort_by_key(|(_, s)| depth(s));
+    let mut parents: HashMap<String, Vec<Vec<u64>>> = HashMap::new();
+    for (path, s) in &headers {
+        if s.agent == "codex" && wanted.contains(&s.id) && !work.iter().any(|(p, _)| p == &path) {
+            match turns(path, s) {
+                Ok(read) => parents
+                    .entry(s.id.clone())
+                    .or_default()
+                    .push(read.transcript()),
+                Err(error) => warnings.push(format!("{}: {error:#}", path.display())),
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut sessions: BTreeMap<(String, String), Conversation> = BTreeMap::new();
+    for (path, s) in work {
+        let read = match turns(path, s) {
+            Ok(read) => read,
+            Err(error) => {
+                warnings.push(format!("{}: {error:#}", path.display()));
+                continue;
+            }
+        };
+        coverage.transcripts += 1;
+        if wanted.contains(&s.id) {
+            parents
+                .entry(s.id.clone())
+                .or_default()
+                .push(read.transcript());
+        }
+        let listed = list(
+            s,
+            read,
+            &parents,
+            select.since,
+            &mut seen,
+            &mut coverage,
+            emit,
+        )?;
+        match sessions.entry((s.agent.clone(), s.id.clone())) {
+            std::collections::btree_map::Entry::Occupied(mut old) => {
+                let old = old.get_mut();
+                old.messages += listed.messages;
+                old.headless &= listed.headless;
+            }
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(listed);
+            }
+        }
+    }
+    Ok(Listing {
+        sessions: sessions.into_values().collect(),
+        coverage,
+        warnings,
+    })
+}
+
+/// One turn of a transcript: a user turn with its text, or an agent turn
+/// reduced to the tail a message carries as its reply.
+struct Turn {
+    line: usize,
+    user: bool,
+    /// An agent turn that failed: a Claude API error, a Codex error event, a
+    /// pi error stop.
+    failed: bool,
+    /// Of the turn's whole text, to recognise a Codex fork's copy of its
+    /// parent's transcript; none for a turn without text.
+    digest: Option<u64>,
+    /// A user turn's whole text; an agent turn's last characters.
+    text: String,
+    truncated: bool,
+    at: Option<String>,
+    id: Option<String>,
+    cwd: Option<String>,
+    /// Why a user turn is no person's message, where its record says so.
+    rule: Option<&'static str>,
+    /// Sent by a program: Claude's `sdk-*` entrypoints and `sdk` prompts.
+    headless: bool,
+    /// After a Codex fork's copy of its parent's header.
+    copied: bool,
+    /// What a person's words are, as `Message::kind` says.
+    kind: &'static str,
+    /// The question an `answer` answers.
+    question: Option<String>,
+    /// Which of one record's answers this is.
+    part: usize,
+}
+
+impl Turn {
+    fn user(text: String, rule: Option<&'static str>) -> Self {
+        Turn {
+            line: 0,
+            user: true,
+            failed: false,
+            digest: (!text.trim().is_empty()).then(|| digest("user", &text)),
+            text,
+            truncated: false,
+            at: None,
+            id: None,
+            cwd: None,
+            rule,
+            headless: false,
+            copied: false,
+            kind: "message",
+            question: None,
+            part: 0,
+        }
+    }
+
+    /// A person's words found inside a record: an answer or a rejection.
+    fn words(kind: &'static str, text: &str, part: usize) -> Self {
+        Turn {
+            kind,
+            part,
+            ..Turn::user(text.to_owned(), None)
+        }
+    }
+
+    /// An agent turn, or none for one without prose, such as a tool call.
+    fn agent(text: String, failed: bool) -> Option<Self> {
+        if text.trim().is_empty() {
+            return None;
+        }
+        let count = text.chars().count();
+        Some(Turn {
+            user: false,
+            failed,
+            digest: Some(digest("assistant", &text)),
+            truncated: count > REPLY_TAIL,
+            text: text
+                .chars()
+                .skip(count.saturating_sub(REPLY_TAIL))
+                .collect(),
+            ..Turn::user(String::new(), None)
+        })
+    }
+}
+
+/// A transcript's turns, as [`turns`] reads them.
+#[derive(Default)]
+struct Turns {
+    turns: Vec<Turn>,
+    limitations: Vec<String>,
+    /// A `codex exec` run with no turn submitted interactively.
+    exec: bool,
+}
+
+impl Turns {
+    /// The digests of its turns with text, in file order.
+    fn transcript(&self) -> Vec<u64> {
+        self.turns.iter().filter_map(|t| t.digest).collect()
+    }
+}
+
+/// Reads a transcript's turns, one record at a time, keeping no record.
+fn turns(path: &Path, s: &Session) -> Result<Turns> {
+    let file = BufReader::new(std::fs::File::open(path)?);
+    let mut read = Turns::default();
+    let (mut copying, mut exec, mut interactive) = (false, false, false);
+    let mut cwd: Option<String> = None;
+    // The questions Codex's question tool asked, by item id.
+    let mut questions: HashMap<String, Value> = HashMap::new();
+    let mut found = Vec::new();
+    for (index, line) in file.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let number = index + 1;
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(error) => {
+                read.limitations
+                    .push(format!("line {number}: malformed JSON: {error}"));
+                continue;
+            }
+        };
+        match s.agent.as_str() {
+            "claude" => claude_turns(&v, s, &mut found),
+            "codex" => {
+                let p = &v["payload"];
+                match (v["type"].as_str(), p["type"].as_str()) {
+                    (Some("session_meta"), _) => {
+                        if p["id"] == s.id.as_str() {
+                            exec |= p["originator"] == "codex_exec" || p["source"] == "exec";
+                        } else if s.parent.is_some() {
+                            // A fork copies its parent's transcript, headers
+                            // included, behind its own header.
+                            copying = true;
+                        } else {
+                            bail!("mixed native session headers");
+                        }
+                    }
+                    (Some("turn_context"), _) => {
+                        if let Some(dir) = p["cwd"].as_str() {
+                            cwd = Some(dir.to_owned());
+                        }
+                    }
+                    (Some("event_msg"), Some("user_message")) => interactive = true,
+                    (Some("event_msg"), Some("item_completed")) => {
+                        let item = &p["item"];
+                        if let (Some(id), true) =
+                            (item["id"].as_str(), item["questions"].is_array())
+                        {
+                            questions.insert(id.to_owned(), item["questions"].clone());
+                        }
+                    }
+                    (Some("event_msg"), Some("error")) => found.extend(
+                        Turn::agent(string(p, "message"), true)
+                            .or_else(|| Turn::agent("error reply without text".into(), true)),
+                    ),
+                    (Some("response_item"), Some("message")) => match p["role"].as_str() {
+                        Some("user") => {
+                            let text = content(&p["content"]);
+                            let own = |turn: Turn| Turn {
+                                id: p["id"].as_str().map(str::to_owned),
+                                cwd: cwd.clone(),
+                                ..turn
+                            };
+                            match codex_answers(&text, &questions) {
+                                Some(words) if words.is_empty() => {
+                                    found.push(own(Turn::user(text, Some("question_reply"))))
+                                }
+                                Some(words) => found.extend(words.into_iter().map(own)),
+                                None => found.push(own(Turn::user(text, None))),
+                            }
+                        }
+                        Some("assistant") => {
+                            found.extend(Turn::agent(content(&p["content"]), false))
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            _ => found.extend(pi_turn(&v)),
+        }
+        for mut turn in found.drain(..) {
+            turn.line = number;
+            turn.at = timestamp(&v);
+            turn.copied = copying;
+            read.turns.push(turn);
+        }
+    }
+    // Codex records how a run was started once per file; `codex exec` is
+    // headless unless a turn in it was submitted interactively.
+    read.exec = exec && !interactive;
+    Ok(read)
+}
+
+/// Claude Code's fixed words before the reason a person gives for
+/// rejecting a tool call.
+const REJECTED: &str = "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said:\n";
+
+fn claude_turns(v: &Value, s: &Session, out: &mut Vec<Turn>) {
+    let m = &v["message"];
+    if v["type"] == "assistant" {
+        let failed = v["isApiErrorMessage"] == true;
+        let text = content(&m["content"]);
+        out.extend(if failed && text.trim().is_empty() {
+            Turn::agent("error reply without text".into(), true)
+        } else {
+            Turn::agent(text, failed)
+        });
+        return;
+    }
+    let own = |turn: Turn| Turn {
+        id: v["uuid"].as_str().map(str::to_owned),
+        cwd: v["cwd"].as_str().map(str::to_owned),
+        headless: v["entrypoint"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("sdk-"))
+            || v["promptSource"] == "sdk",
+        ..turn
+    };
+    // A message typed while the agent works: Claude Code queues it and
+    // hands it to the agent mid-turn, recorded as an attachment.
+    if v["type"] == "attachment" {
+        let a = &v["attachment"];
+        if a["type"] == "queued_command" {
+            let rule = (a["origin"]["kind"] != "human").then_some("harness_origin");
+            out.push(Turn {
+                kind: "queued",
+                ..own(Turn::user(content(&a["prompt"]), rule))
+            });
+        }
+        return;
+    }
+    if m["role"] != "user" {
+        return;
+    }
+    // A subagent's records name its session's id.
+    let session = s.subagent_of().unwrap_or(&s.id);
+    let results: Vec<&Value> = m["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|b| b["type"] == "tool_result")
+        .collect();
+    let rule = if v["type"] != "user" {
+        // `api-request-blob` records copy a request's content; not a turn.
+        Some("request_record")
+    } else if v["sessionId"].as_str().is_some_and(|id| id != session) {
+        Some("other_session")
+    } else if v["origin"]["kind"] == "human" {
+        // The record says a person wrote it. In a subagent's transcript that
+        // is a message a person sent the subagent, which Claude Code also
+        // marks as meta.
+        None
+    } else if !results.is_empty() {
+        let words = claude_words(v, &results);
+        if !words.is_empty() {
+            out.extend(words.into_iter().map(own));
+            return;
+        }
+        Some("tool_result")
+    } else if v["isSidechain"] == true {
+        // In a subagent's transcript, the prompts its parent agent wrote.
+        Some("subagent")
+    } else if v["isMeta"] == true {
+        Some("meta")
+    } else if v["isCompactSummary"] == true {
+        Some("compaction")
+    } else if v["origin"]["kind"].is_string() || v["promptSource"] == "system" {
+        Some("harness_origin")
+    } else {
+        None
+    };
+    out.push(own(Turn::user(content(&m["content"]), rule)));
+}
+
+/// What a person wrote inside a Claude tool result: an answer to Claude
+/// Code's question tool that is not one of the options it offered, and the
+/// reason given for rejecting a tool call.
+fn claude_words(v: &Value, results: &[&Value]) -> Vec<Turn> {
+    let mut words = Vec::new();
+    let tool = &v["toolUseResult"];
+    for (question, answer) in tool["answers"].as_object().into_iter().flatten() {
+        let Some(answer) = answer.as_str() else {
+            continue;
+        };
+        let labels: Vec<&str> = tool["questions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|q| q["question"] == question.as_str())
+            .flat_map(|q| q["options"].as_array().into_iter().flatten())
+            .filter_map(|o| o["label"].as_str())
+            .collect();
+        if !picked(answer, &labels) {
+            words.push(Turn {
+                question: Some(question.clone()),
+                ..Turn::words("answer", answer, words.len())
+            });
+        }
+    }
+    for result in results {
+        if let Some(reason) = content(&result["content"]).strip_prefix(REJECTED) {
+            words.push(Turn::words("rejection", reason, words.len()));
+        }
+    }
+    words
+}
+
+/// An answer that only picks offered options: one label, or labels joined
+/// by ", " as Claude Code joins the picks of a question that allows several.
+fn picked(answer: &str, labels: &[&str]) -> bool {
+    !labels.is_empty()
+        && (labels.contains(&answer) || answer.split(", ").all(|part| labels.contains(&part)))
+}
+
+/// What a person wrote in Codex's reply to its question tool: each answer
+/// that is not one of the options its question offered. The options come
+/// from the `item_completed` that asked; an answer to a question not seen is
+/// kept, since it may be a person's own words. None when the text is not a
+/// question reply.
+fn codex_answers(text: &str, questions: &HashMap<String, Value>) -> Option<Vec<Turn>> {
+    let inner = text
+        .trim()
+        .strip_prefix("<send_user_message_question_reply>")?
+        .strip_suffix("</send_user_message_question_reply>")?;
+    let Ok(replies) = serde_json::from_str::<Vec<Value>>(inner.trim()) else {
+        return Some(Vec::new());
+    };
+    let mut words = Vec::new();
+    for reply in &replies {
+        let Some(answer) = reply["answer"].as_str() else {
+            continue;
+        };
+        // `questionItemId` is the tool, the item that asked, and the index
+        // of the question in it: an array, which Codex writes as a JSON
+        // string.
+        let item = match &reply["questionItemId"] {
+            Value::String(text) => serde_json::from_str(text).unwrap_or_default(),
+            other => other.clone(),
+        };
+        let asked = item[1]
+            .as_str()
+            .and_then(|id| questions.get(id))
+            .and_then(|qs| qs.get(usize::try_from(item[2].as_u64()?).ok()?));
+        let offered = asked.is_some_and(|q| {
+            q["options"]
+                .as_array()
+                .is_some_and(|options| options.iter().any(|o| o == answer))
+        });
+        if !offered {
+            words.push(Turn {
+                question: reply["question"].as_str().map(str::to_owned),
+                ..Turn::words("answer", answer, words.len())
+            });
+        }
+    }
+    Some(words)
+}
+
+fn pi_turn(v: &Value) -> Option<Turn> {
+    if v["type"] != "message" {
+        return None;
+    }
+    let m = &v["message"];
+    match m["role"].as_str() {
+        Some("user") => Some(Turn {
+            id: v["id"].as_str().map(str::to_owned),
+            ..Turn::user(content(&m["content"]), None)
+        }),
+        Some("assistant") => {
+            let failed = m["stopReason"] == "error";
+            let mut text = content(&m["content"]);
+            if failed && text.trim().is_empty() {
+                text = m["errorMessage"]
+                    .as_str()
+                    .unwrap_or("error reply without text")
+                    .to_owned();
+            }
+            Turn::agent(text, failed)
+        }
+        _ => None,
+    }
+}
+
+/// Decides which of a transcript's user turns are a person's messages,
+/// hands those inside the window to `emit`, and counts the rest by rule.
+fn list(
+    s: &Session,
+    read: Turns,
+    parents: &HashMap<String, Vec<Vec<u64>>>,
+    since: Option<chrono::DateTime<chrono::FixedOffset>>,
+    seen: &mut std::collections::HashSet<(String, String, String)>,
+    coverage: &mut Coverage,
+    emit: &mut dyn FnMut(&Message) -> Result<()>,
+) -> Result<Conversation> {
+    let mut limitations = read.limitations;
+    // A Codex fork's copy is the longest run of its turns that matches its
+    // parent's transcript turn for turn; what follows is the fork's own.
+    // Without the parent there is nothing to match, so nothing is listed.
+    let copy: Vec<u64> = read
+        .turns
+        .iter()
+        .filter(|t| t.copied)
+        .filter_map(|t| t.digest)
+        .collect();
+    let inherited = if copy.is_empty() {
+        0
+    } else {
+        let parent = s.parent.clone().unwrap_or_default();
+        let matched = parents
+            .get(&parent)
+            .into_iter()
+            .flatten()
+            .map(|transcript| {
+                copy.iter()
+                    .zip(transcript)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        if matched == 0 {
+            limitations.push(format!(
+                "Codex fork of {parent}: parent transcript not read or not matching, so its copied history cannot be told from the fork's own turns; {} turns after the copied header excluded",
+                copy.len()
+            ));
+            copy.len()
+        } else {
+            matched
+        }
+    };
+    // A fork's history before it was forked is its parent's. A subagent
+    // copies nothing.
+    let fork = s.parent.is_some() && !s.subagent;
+    let start = s
+        .started_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+    // Where each text a person typed last appears as an ordinary message, so
+    // a queued copy of a message that later arrives as one counts once.
+    let typed: HashMap<String, usize> = read
+        .turns
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.user && t.kind == "message" && t.rule.is_none())
+        .map(|(i, t)| (without_reminders(&t.text).into_owned(), i))
+        .collect();
+    let mut copied = 0;
+    let mut reply: Option<Reply> = None;
+    // The person's last message, and whether the agent answered it since.
+    let mut last: Option<String> = None;
+    let mut answered = false;
+    let (mut humans, mut prompts, mut listed) = (0, 0, 0);
+    for (index, turn) in read.turns.into_iter().enumerate() {
+        let in_copy = turn.copied && turn.digest.is_some() && {
+            copied += 1;
+            copied <= inherited
+        };
+        if !turn.user {
+            answered |= !turn.failed;
+            reply = Some(Reply {
+                text: turn.text,
+                truncated: turn.truncated,
+                failed: turn.failed,
+                line: turn.line,
+            });
+            continue;
+        }
+        coverage.user_turns += 1;
+        let mut text = without_reminders(&turn.text).into_owned();
+        let mut kind = turn.kind;
+        // Words a person typed into a conversation, as opposed to words
+        // found inside a tool's record (an answer, a rejection).
+        let said = matches!(kind, "message" | "queued");
+        let at = turn
+            .at
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+        let rule = turn.rule.or_else(|| {
+            if text.is_empty() {
+                Some("empty")
+            } else if said && text.starts_with(CONTINUATION) {
+                Some("compaction")
+            } else if said && envelope(&s.agent, &text) {
+                Some("envelope")
+            } else if said && text.starts_with(INIT) {
+                Some("harness_prompt")
+            } else if said && launched(&text) {
+                match launch_task(&text) {
+                    Some(task) => {
+                        text = task;
+                        kind = "task";
+                        None
+                    }
+                    None => Some("harness_prompt"),
+                }
+            } else {
+                None
+            }
+        });
+        // A message is one identity however many copies hold it: its native
+        // id, else its time and text.
+        let key = match (&turn.id, &turn.at) {
+            (Some(id), _) => Some(format!("id {id} {kind} {}", turn.part)),
+            (None, Some(at)) => Some(format!("at {at} {kind} {:x}", digest("user", &text))),
+            (None, None) => None,
+        };
+        let rule = rule.or_else(|| {
+            if in_copy {
+                Some("fork_copy")
+            } else if fork && !turn.copied && !start.zip(at).is_some_and(|(start, at)| at >= start)
+            {
+                if start.is_none() || at.is_none() {
+                    limitations.push(format!(
+                        "line {}: fork timestamp boundary unknown; message excluded",
+                        turn.line
+                    ));
+                }
+                Some("inherited")
+            } else if turn.headless || read.exec {
+                prompts += 1;
+                Some("headless")
+            } else if key.is_some_and(|k| !seen.insert((s.agent.clone(), s.id.clone(), k)))
+                || (kind == "queued" && typed.get(&text).is_some_and(|&i| i > index))
+            {
+                Some("duplicate")
+            } else if said && !answered && last.as_deref() == Some(text.as_str()) {
+                Some("retry")
+            } else {
+                None
+            }
+        });
+        if let Some(rule) = rule {
+            if rule == "other_session" {
+                limitations.push(format!(
+                    "line {}: a record of another session; not listed",
+                    turn.line
+                ));
+            }
+            *coverage.excluded.entry(rule).or_default() += 1;
+            continue;
+        }
+        humans += 1;
+        if said {
+            last = Some(text.clone());
+            answered = false;
+        }
+        // `since` is exclusive, as ohjaa intake windows: a reader can pass
+        // the time of the last message it handled.
+        match (since, at) {
+            (Some(_), None) => coverage.undated += 1,
+            (Some(since), Some(at)) if at <= since => coverage.earlier += 1,
+            _ => {
+                coverage.human += 1;
+                listed += 1;
+                emit(&Message {
+                    agent: s.agent.clone(),
+                    session: s.id.clone(),
+                    parent: s.parent.clone(),
+                    kind,
+                    id: turn.id,
+                    at: turn.at,
+                    cwd: turn.cwd.unwrap_or_else(|| s.cwd.clone()),
+                    text,
+                    question: turn.question,
+                    reply: reply.clone(),
+                    source: s.source.clone(),
+                    line: turn.line,
+                })?;
+            }
+        }
+    }
+    coverage.limitations.extend(
+        limitations
+            .into_iter()
+            .map(|l| format!("{}/{}: {l}", s.agent, s.id)),
+    );
+    Ok(Conversation {
+        agent: s.agent.clone(),
+        id: s.id.clone(),
+        parent: s.parent.clone(),
+        subagent: s.subagent,
+        started_at: s.started_at.clone(),
+        cwd: s.cwd.clone(),
+        source: s.source.clone(),
+        headless: prompts > 0 && humans == 0,
+        messages: listed,
+    })
+}
+
+/// A message's text: its text blocks, joined.
+fn content(v: &Value) -> String {
+    v.as_str().map(str::to_owned).unwrap_or_else(|| {
+        v.as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| {
+                        matches!(
+                            b["type"].as_str(),
+                            Some("text" | "input_text" | "output_text")
+                        )
+                    })
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// A stable digest of one turn, for matching a fork's copy to its parent.
+fn digest(role: &str, text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (role, text).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The text without the `<system-reminder>` blocks a harness writes into a
+/// person's turn, trimmed; as ohjaa intake reads it.
+fn without_reminders(text: &str) -> std::borrow::Cow<'_, str> {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    if !text.contains(OPEN) {
+        return text.trim().into();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        rest = match rest[start..].find(CLOSE) {
+            Some(end) => &rest[start + end + CLOSE.len()..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out.trim().to_owned().into()
+}
+
+/// Elements a harness writes into a user turn: startup context,
+/// notifications, slash-command records, interruptions, and Codex's review,
+/// skill, recovery and plugin envelopes. Seula's set, which followed ohjaa
+/// intake's.
+const ENVELOPE_TAGS: [&str; 17] = [
+    "environment_context",
+    "user_instructions",
+    "INSTRUCTIONS",
+    "task-notification",
+    "turn_aborted",
+    "command-name",
+    "command-message",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "local-command-caveat",
+    "system-reminder",
+    "user_shell_command",
+    "user_action",
+    "skill",
+    "codex_internal_context",
+    "recommended_plugins",
+];
+/// Whole messages a harness writes verbatim.
+const ENVELOPE_TEXTS: [&str; 3] = [
+    "[Request interrupted by user]",
+    "[Request interrupted by user for tool use]",
+    "Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.",
+];
+/// The fixed first sentence of Claude Code's continuation summary.
+const CONTINUATION: &str =
+    "This session is being continued from a previous conversation that ran out of context.";
+/// The fixed first sentence of the prompt Codex sends for `/init`.
+const INIT: &str =
+    "Generate a file named AGENTS.md that serves as a contributor guide for this repository.";
+/// The fixed openings of toimija's launch prompts, inside and outside a
+/// repository, which `ohjaa run` gives an agent as its first message. A
+/// person's task, when there is one, follows the harness text.
+const LAUNCH: [&str; 2] = [
+    "Your toimija session packet is below. It is your workset contract:",
+    "You are in a toimija session outside any Git repository (",
+];
+/// The heading of the alerts toimija puts in front of a launch prompt.
+const ALERTS: &str = "## Before anything else (from the launcher)\n";
+/// How each part of ohjaa's briefing opens, as ohjaa writes it: the unproven
+/// branch flag, validation, still-running, orphaned and warned sessions,
+/// Knowledge (whose preamble also opens scoped knowledge), the last session
+/// here, how the session works, sibling worktrees, and the system perimeter.
+/// toimija appends the briefing after the task, so the first of these after
+/// a blank line ends the task.
+const BRIEFING: [&str; 10] = [
+    "FLAG: ",
+    "Validation here (sykli's word, asked at launch;",
+    "STILL RUNNING: session ",
+    "ORPHANED: session ",
+    "WARNING from ",
+    "Knowledge (ohjaa, knowledge-node.v1):",
+    "Last session here (",
+    "How this session works (ohjaa):",
+    "Sessions in the other worktrees of this clone at launch",
+    "System perimeter (derived by ohjaa at launch;",
+];
+
+/// Whether `text` is a toimija launch prompt: its fixed opening, after the
+/// launcher's alerts when there are any.
+fn launched(text: &str) -> bool {
+    let body = match text.strip_prefix(ALERTS) {
+        // The alerts end where the launch prompt's opening begins a line.
+        Some(alerts) => LAUNCH
+            .iter()
+            .filter_map(|p| alerts.find(&format!("\n{p}")).map(|at| &alerts[at + 1..]))
+            .next()
+            .unwrap_or(alerts),
+        None => text,
+    };
+    LAUNCH.iter().any(|p| body.starts_with(p))
+}
+
+/// The task a person typed into a launch prompt. toimija writes the packet,
+/// then `\nTask: <task>\n`, then `\n<briefing>\n`; before ohjaa 7ba9a68 the
+/// task line held `<task>\n\n<briefing>`, or the briefing alone. The task is
+/// what lies between the last `Task:` line and the first part of ohjaa's
+/// briefing. None when nothing typed is left.
+fn launch_task(text: &str) -> Option<String> {
+    let end = BRIEFING
+        .iter()
+        .filter_map(|opening| text.find(&format!("\n\n{opening}")))
+        .min()
+        .unwrap_or(text.len());
+    let (_, task) = text[..end].rsplit_once("\n\nTask: ")?;
+    // Before ohjaa passed its briefing apart (7ba9a68), the briefing was the
+    // task itself when no task was typed: `Task: <briefing>`.
+    if BRIEFING.iter().any(|opening| task.starts_with(opening)) {
+        return None;
+    }
+    let task = task.trim();
+    (!task.is_empty()).then(|| task.to_owned())
+}
+
+/// Text a harness wrote into a user turn, matched in its exact form: a whole
+/// sequence of known elements, a verbatim notice, Codex's AGENTS.md heading
+/// over such elements, or pi's bare `/command`. A person who starts a message
+/// with a path, "Caveat:", a tag name or a heading is still a person.
+fn envelope(agent: &str, text: &str) -> bool {
+    if ENVELOPE_TEXTS.contains(&text) {
+        return true;
+    }
+    // Claude Code records slash commands as tags; pi writes the command alone.
+    if agent == "pi" {
+        if let Some(name) = text.strip_prefix('/') {
+            return !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'));
+        }
+    }
+    let body = match text.split_once('\n') {
+        Some((heading, rest))
+            if heading.trim_end() == "# AGENTS.md instructions"
+                || heading.starts_with("# AGENTS.md instructions for ") =>
+        {
+            rest
+        }
+        _ => text,
+    };
+    elements_only(body, &ENVELOPE_TAGS)
+}
+
+/// True when `text` is one or more of the elements named and nothing else.
+fn elements_only(text: &str, names: &[&str]) -> bool {
+    let mut text = text.trim_start();
+    if text.is_empty() {
+        return false;
+    }
+    while !text.is_empty() {
+        let Some(rest) = text.strip_prefix('<') else {
+            return false;
+        };
+        let Some(name) = names.iter().find(|name| {
+            rest.strip_prefix(**name)
+                .is_some_and(|after| after.starts_with(['>', ' ', '\n']))
+        }) else {
+            return false;
+        };
+        let close = format!("</{name}>");
+        let Some(end) = text.find(&close) else {
+            return false;
+        };
+        text = text[end + close.len()..].trim_start();
+    }
+    true
 }

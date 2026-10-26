@@ -68,6 +68,15 @@ enum Cmd {
     },
     /// Render Claude Code's native status-line JSON from stdin.
     ClaudeStatusline,
+    /// The messages people typed into agent sessions, each with the agent
+    /// reply it follows; harness, tool, subagent and headless turns are
+    /// counted by rule, not listed. With --json: vessa-messages.v1.
+    Messages {
+        /// Only messages from this time on: RFC 3339, a UTC date
+        /// (YYYY-MM-DD), or an age such as 7d or 12h.
+        #[arg(long)]
+        since: Option<String>,
+    },
 }
 
 fn run(cli: Cli) -> Result<i32> {
@@ -102,6 +111,13 @@ fn run_once(cli: Cli) -> Result<i32> {
         println!("{}", metrics::claude_statusline(&input)?);
         return Ok(0);
     }
+    if let Cmd::Messages { since } = &cli.command {
+        ensure!(
+            cli.rates.is_none(),
+            "--rates cannot be used with messages, which reads no usage to price"
+        );
+        return messages(&cli, since.as_deref());
+    }
     if matches!(cli.command, Cmd::Status) {
         ensure!(
             !cli.input.is_empty() || cli.session.is_some(),
@@ -116,27 +132,14 @@ fn run_once(cli: Cli) -> Result<i32> {
         !headers || cli.rates.is_none(),
         "--rates cannot be used with sessions --headers, which reads no usage to price"
     );
-    let paths = if cli.input.is_empty() {
-        let home =
-            PathBuf::from(std::env::var_os("HOME").context("HOME unavailable; pass --input")?);
-        vec![
-            home.join(".claude/projects"),
-            home.join(".codex/sessions"),
-            home.join(".pi/agent/sessions"),
-        ]
-    } else {
-        cli.input
-    };
+    let paths = inputs(&cli)?;
     let mut report = if headers {
         import::headers(&paths)?
     } else {
         import::read(&paths)?
     };
     if let Some(agent) = cli.agent {
-        ensure!(
-            ["claude", "codex", "pi"].contains(&agent.as_str()),
-            "unsupported agent {agent}"
-        );
+        supported(&agent)?;
         report.sessions.retain(|s| s.agent == agent);
     }
     if let Some(id) = cli.session {
@@ -175,7 +178,7 @@ fn run_once(cli: Cli) -> Result<i32> {
         eprintln!("vessa: {warning}");
     }
     match cli.command {
-        Cmd::ClaudeStatusline => unreachable!(),
+        Cmd::ClaudeStatusline | Cmd::Messages { .. } => unreachable!(),
         Cmd::Status => {
             let families = model::families(&report.sessions);
             ensure!(
@@ -439,6 +442,263 @@ fn run_once(cli: Cli) -> Result<i32> {
     Ok(0)
 }
 
+/// The paths given with `--input`, else the agents' own session folders.
+fn inputs(cli: &Cli) -> Result<Vec<PathBuf>> {
+    if !cli.input.is_empty() {
+        return Ok(cli.input.clone());
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable; pass --input")?);
+    Ok(vec![
+        home.join(".claude/projects"),
+        home.join(".codex/sessions"),
+        home.join(".pi/agent/sessions"),
+    ])
+}
+
+fn supported(agent: &str) -> Result<()> {
+    ensure!(
+        agent != "opencode",
+        "unsupported agent opencode: it keeps its sessions in SQLite, which Vessa does not read"
+    );
+    ensure!(
+        ["claude", "codex", "pi"].contains(&agent),
+        "unsupported agent {agent}"
+    );
+    Ok(())
+}
+
+/// opencode's session store, when it was written in the window: a known
+/// source Vessa does not read. SQLite writes through its `-wal` file, so
+/// either may be the newer; a time that cannot be read counts as written.
+fn opencode(since: Option<chrono::DateTime<chrono::FixedOffset>>) -> Option<PathBuf> {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    let db = data.join("opencode/opencode.db");
+    if !db.exists() {
+        return None;
+    }
+    let Some(since) = since else {
+        return Some(db);
+    };
+    let wal = db.with_file_name("opencode.db-wal");
+    let written = |path: &std::path::Path| {
+        path.exists()
+            && std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .map_or(true, |t| chrono::DateTime::<chrono::Utc>::from(t) > since)
+    };
+    (written(&db) || written(&wal)).then_some(db)
+}
+
+/// `--since`: RFC 3339, a UTC date, or an age in days or hours.
+fn since(text: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
+    if let Ok(time) = chrono::DateTime::parse_from_rfc3339(text) {
+        return Ok(time);
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        return Ok(date
+            .and_time(chrono::NaiveTime::MIN)
+            .and_utc()
+            .fixed_offset());
+    }
+    let unit = |suffix: char, seconds: i64| {
+        text.strip_suffix(suffix)
+            .and_then(|n| n.parse::<i64>().ok())
+            .filter(|n| *n >= 0)
+            .and_then(|n| n.checked_mul(seconds))
+    };
+    let age = unit('d', 86_400)
+        .or_else(|| unit('h', 3_600))
+        .with_context(|| {
+            format!("--since {text}: expected RFC 3339, YYYY-MM-DD, or an age such as 7d or 12h")
+        })?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+    let at = i64::try_from(now.as_secs())?.saturating_sub(age);
+    Ok(chrono::DateTime::from_timestamp(at, 0)
+        .context("--since is out of range")?
+        .fixed_offset())
+}
+
+/// `vessa-messages.v1`, written as messages arrive, one a line. The document
+/// opens with its first message, so a run that fails before one leaves
+/// nothing on stdout, and one that fails after ends it with its `error`.
+struct Document<W: Write> {
+    out: W,
+    written: usize,
+}
+
+impl<W: Write> Document<W> {
+    fn new(out: W) -> Self {
+        Document { out, written: 0 }
+    }
+
+    fn message(&mut self, m: &model::Message) -> Result<()> {
+        if self.written == 0 {
+            write!(
+                self.out,
+                "{{\"schema\":\"vessa-messages.v1\",\"messages\":["
+            )?;
+        } else {
+            write!(self.out, ",")?;
+        }
+        writeln!(self.out)?;
+        serde_json::to_writer(&mut self.out, m)?;
+        self.written += 1;
+        Ok(())
+    }
+
+    fn finish(&mut self, listing: &import::Listing) -> Result<()> {
+        if self.written == 0 {
+            write!(
+                self.out,
+                "{{\"schema\":\"vessa-messages.v1\",\"messages\":["
+            )?;
+        }
+        write!(self.out, "\n],\n\"sessions\":")?;
+        serde_json::to_writer(&mut self.out, &listing.sessions)?;
+        write!(self.out, ",\n\"coverage\":")?;
+        serde_json::to_writer(&mut self.out, &listing.coverage)?;
+        write!(self.out, ",\n\"warnings\":")?;
+        serde_json::to_writer(&mut self.out, &listing.warnings)?;
+        writeln!(self.out, "}}")?;
+        self.out.flush()?;
+        Ok(())
+    }
+
+    /// Ends a document the failure left open. Its messages are those read
+    /// before it; without coverage, it says nothing of the rest.
+    fn fail(&mut self, error: &anyhow::Error) {
+        if self.written > 0 {
+            let _ = write!(self.out, "\n],\n\"error\":");
+            let _ = serde_json::to_writer(&mut self.out, &format!("{error:#}"));
+            let _ = writeln!(self.out, "}}");
+        }
+        let _ = self.out.flush();
+    }
+}
+
+/// One message in the plain form: where it was said, then its text.
+fn plain(out: &mut impl Write, m: &model::Message) -> Result<()> {
+    let mut notes = String::new();
+    if m.kind != "message" {
+        notes.push_str(" · ");
+        notes.push_str(m.kind);
+    }
+    if m.reply.as_ref().is_some_and(|r| r.failed) {
+        notes.push_str(" · after a failed reply");
+    }
+    writeln!(
+        out,
+        "{} {} · {} · {} · {}:{}{notes}",
+        m.agent,
+        m.session,
+        m.at.as_deref().unwrap_or("undated"),
+        m.cwd,
+        m.source,
+        m.line,
+    )?;
+    for line in m.text.lines() {
+        // Imported text is untrusted terminal content.
+        let line: String = line.chars().filter(|c| !c.is_control()).collect();
+        writeln!(out, "  {line}")?;
+    }
+    Ok(())
+}
+
+/// `vessa messages`: each message is written as its transcript is read.
+fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
+    if let Some(agent) = &cli.agent {
+        supported(agent)?;
+    }
+    let select = import::Selection {
+        agent: cli.agent.clone(),
+        session: cli.session.clone(),
+        since: from.map(since).transpose()?,
+    };
+    let paths = inputs(cli)?;
+    // The default sources hold every agent Vessa reads; one it knows of and
+    // does not read, written in the window, leaves the list partial.
+    let gap = if cli.input.is_empty() && cli.agent.is_none() {
+        opencode(select.since)
+    } else {
+        None
+    };
+    let gaps = gap.into_iter().map(|db| {
+        format!(
+            "opencode: {} not read; opencode keeps its sessions in SQLite, which Vessa does not read",
+            db.display()
+        )
+    });
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    let listing = if cli.json {
+        let mut doc = Document::new(&mut out);
+        match import::messages(&paths, &select, &mut |m| doc.message(m)) {
+            Ok(mut listing) => {
+                listing.coverage.gaps.extend(gaps);
+                doc.finish(&listing)?;
+                listing
+            }
+            Err(error) => {
+                doc.fail(&error);
+                return Err(error);
+            }
+        }
+    } else {
+        let mut listing = import::messages(&paths, &select, &mut |m| plain(&mut out, m))?;
+        listing.coverage.gaps.extend(gaps);
+        let c = &listing.coverage;
+        let rules = c
+            .excluded
+            .iter()
+            .map(|(rule, n)| format!("{rule} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        writeln!(
+            out,
+            "{} messages from {} sessions ({} headless) · {} other user turns not listed{} · {} Codex subagent transcripts not read",
+            c.human,
+            listing.sessions.iter().filter(|s| s.messages > 0).count(),
+            listing.sessions.iter().filter(|s| s.headless).count(),
+            c.excluded.values().sum::<usize>(),
+            if rules.is_empty() { String::new() } else { format!(": {rules}") },
+            c.subagent_transcripts,
+        )?;
+        if let Some(since) = &c.since {
+            writeln!(
+                out,
+                "after {since}: {} earlier and {} undated messages not listed; {} transcripts unmodified since, not read",
+                c.earlier, c.undated, c.unmodified_transcripts
+            )?;
+        }
+        out.flush()?;
+        listing
+    };
+    drop(out);
+    let c = &listing.coverage;
+    for warning in listing.warnings.iter().chain(&c.gaps) {
+        eprintln!("vessa: {warning}");
+    }
+    for limitation in &c.limitations {
+        eprintln!("vessa: {limitation}");
+    }
+    let gaps = listing.warnings.len() + c.gaps.len();
+    if gaps + c.limitations.len() > 0 {
+        eprintln!(
+            "vessa: partial message list (exit 4): {gaps} source {}, {} {}",
+            if gaps == 1 { "warning" } else { "warnings" },
+            c.limitations.len(),
+            if c.limitations.len() == 1 {
+                "limitation"
+            } else {
+                "limitations"
+            },
+        );
+        return Ok(4);
+    }
+    Ok(0)
+}
+
 /// The time of the latest usage record, so an old transcript is not taken
 /// for a live balance.
 fn last_recorded_at<'a>(usage: impl Iterator<Item = &'a model::Usage>) -> Option<String> {
@@ -462,5 +722,48 @@ fn main() {
             eprintln!("vessa: {e:#}");
             std::process::exit(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(text: &str) -> model::Message {
+        model::Message {
+            agent: "claude".into(),
+            session: "claude-demo".into(),
+            parent: None,
+            kind: "message",
+            id: Some("u1".into()),
+            at: Some("2026-09-30T09:00:00Z".into()),
+            cwd: "/demo/widget".into(),
+            text: text.into(),
+            question: None,
+            reply: None,
+            source: "/demo/claude-demo.jsonl".into(),
+            line: 1,
+        }
+    }
+
+    #[test]
+    fn a_failure_mid_stream_still_leaves_one_json_document() {
+        let mut out = Vec::new();
+        let mut doc = Document::new(&mut out);
+        doc.message(&message("Run the checks.")).unwrap();
+        doc.message(&message("Then commit.")).unwrap();
+        doc.fail(&anyhow::anyhow!("transcript vanished"));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["schema"], "vessa-messages.v1");
+        assert_eq!(v["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(v["error"], "transcript vanished");
+        assert!(v.get("coverage").is_none());
+    }
+
+    #[test]
+    fn a_failure_before_any_message_leaves_nothing() {
+        let mut out = Vec::new();
+        Document::new(&mut out).fail(&anyhow::anyhow!("no such session"));
+        assert!(out.is_empty());
     }
 }

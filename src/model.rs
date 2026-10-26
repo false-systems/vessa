@@ -60,6 +60,11 @@ pub struct Session {
     /// Requests this transcript holds that an earlier session counted.
     #[serde(skip)]
     pub counted_elsewhere: usize,
+    /// Another agent started it: a Claude sidechain, or a Codex session
+    /// whose `source` names a subagent. Its user turns are that agent's
+    /// prompts, not a person's.
+    #[serde(skip)]
+    pub subagent: bool,
 }
 
 /// What a session's transcript says about itself, without its usage: one
@@ -262,4 +267,92 @@ pub fn receipt(family: &Family) -> Result<serde_json::Value> {
         "limitations": limitations,
         "entries": family.totals()?
     }))
+}
+
+/// One message a person typed into an agent session: a record of
+/// `vessa-messages.v1`.
+#[derive(Debug, Serialize)]
+pub struct Message {
+    pub agent: String,
+    /// The native session id; a Claude subagent's is `<session>/<agentId>`.
+    pub session: String,
+    /// The session it descends from: a Claude subagent's session, a Codex
+    /// fork's `forked_from_id`, a pi `parentSession`. Null for none.
+    pub parent: Option<String>,
+    /// What the words are: `message`, typed into the conversation; `queued`,
+    /// typed while the agent worked and handed to it mid-turn; `answer`, a
+    /// person's own answer to the agent's question tool; `rejection`, the
+    /// reason given for rejecting a tool call; `task`, the task typed into a
+    /// launch prompt.
+    pub kind: &'static str,
+    /// The native id of the record it was read from, where the agent writes
+    /// one (Claude `uuid`, pi `id`, Codex `payload.id` in newer versions).
+    pub id: Option<String>,
+    pub at: Option<String>,
+    pub cwd: String,
+    pub text: String,
+    /// The question an `answer` answers.
+    pub question: Option<String>,
+    /// The agent turn this message follows in its transcript, bounded.
+    pub reply: Option<Reply>,
+    pub source: String,
+    pub line: usize,
+}
+
+/// The agent turn a message follows: its last characters only.
+#[derive(Debug, Clone, Serialize)]
+pub struct Reply {
+    pub text: String,
+    /// The reply was longer than `text`.
+    pub truncated: bool,
+    /// The turn failed (a Claude API error, a Codex error event, a pi error
+    /// stop): the message answers a failure, not a reply.
+    pub failed: bool,
+    pub line: usize,
+}
+
+/// A session whose transcript `vessa messages` read.
+#[derive(Debug, Serialize)]
+pub struct Conversation {
+    pub agent: String,
+    pub id: String,
+    pub parent: Option<String>,
+    /// A Claude subagent, read only for what a person sent it.
+    pub subagent: bool,
+    pub started_at: Option<String>,
+    pub cwd: String,
+    pub source: String,
+    /// Every prompt in it came from a program (`claude -p`, an Agent SDK,
+    /// `codex exec`), so no person is in it.
+    pub headless: bool,
+    /// Its messages listed.
+    pub messages: usize,
+}
+
+/// What `vessa messages` read, and why each user turn it did not list is
+/// not a person's message.
+#[derive(Debug, Default, Serialize)]
+pub struct Coverage {
+    /// Transcripts read for messages, Claude subagents' among them.
+    pub transcripts: usize,
+    /// Codex subagent transcripts, not read: their user turns are the parent
+    /// agent's prompts.
+    pub subagent_transcripts: usize,
+    /// Transcripts last modified before `since`, not read.
+    pub unmodified_transcripts: usize,
+    /// User turns read: `human`, `excluded`, `earlier` and `undated` sum to it.
+    pub user_turns: usize,
+    /// Messages listed.
+    pub human: usize,
+    /// User turns that are no person's message, by rule.
+    pub excluded: BTreeMap<&'static str, usize>,
+    pub since: Option<String>,
+    /// Messages from `since` or before.
+    pub earlier: usize,
+    /// Messages with no time, which `since` cannot place.
+    pub undated: usize,
+    /// Sources Vessa knows of and does not read.
+    pub gaps: Vec<String>,
+    /// What a transcript leaves unknown, by session.
+    pub limitations: Vec<String>,
 }
