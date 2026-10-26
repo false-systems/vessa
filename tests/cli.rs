@@ -164,13 +164,47 @@ fn report_explains_partial_spending_and_command_evidence() {
     .iter()
     .map(|args| String::from_utf8(cli(args).stdout).unwrap())
     .collect::<String>();
-    for (what, text) in [("report", &html), ("help", &help)] {
+    // Given a wrapper's export, with a linked, an unmatched and an unreadable
+    // session, the report and what is said on stderr still name no tool.
+    let receipt = value(cli(&["receipt", "--input", "examples/pi.jsonl"]));
+    let export = temp("wrapper-export.json");
+    let wrappers = serde_json::json!({"schema":"ohjaa-sessions.v1","sessions":[{"id":"oh-fixture","agent":"pi","usage":[receipt]},{"id":"oh-unmatched","agent":"pi","usage":[]}],"unreadable":["oh-gone"]});
+    std::fs::write(&export, serde_json::to_vec(&wrappers).unwrap()).unwrap();
+    let linked = temp("linked.html");
+    let out = cli(&[
+        "report",
+        "--input",
+        "examples/pi.jsonl",
+        "--input",
+        export.to_str().unwrap(),
+        "--output",
+        linked.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    let linked_html = std::fs::read_to_string(&linked).unwrap();
+    assert!(linked_html
+        .contains("wrapper session oh-unmatched has no explicit matching native transcript"));
+    assert!(linked_html.contains("the wrapper export could not read session"));
+    assert!(linked_html.contains("Explicitly linked wrapper session records"));
+    let said = String::from_utf8(out.stderr).unwrap();
+    let messages = cli(&["messages", "--input", export.to_str().unwrap()]);
+    let said_messages = String::from_utf8(messages.stderr).unwrap();
+    assert!(said_messages.contains("a wrapper export holds no messages"));
+    for (what, text) in [
+        ("report", &html),
+        ("help", &help),
+        ("linked report", &linked_html),
+        ("stderr", &said),
+        ("messages stderr", &said_messages),
+    ] {
         let text = text.to_lowercase().replace("ohjaa-sessions.v1", "");
         for name in ["ohjaa", "toimija", "seula"] {
-            assert!(!text.contains(name), "{what} names {name}");
+            assert!(!text.contains(name), "{what} names {name}: {text}");
         }
     }
     std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(linked).unwrap();
+    std::fs::remove_file(export).unwrap();
 }
 
 #[test]

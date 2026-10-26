@@ -273,7 +273,7 @@ fn link(report: &mut Report, wrappers: Vec<Value>) {
             .any(|s| s.ohjaa.iter().any(|w| w["id"] == wrapper["id"]))
         {
             report.warnings.push(format!(
-                "ohjaa session {} has no explicit matching native transcript",
+                "wrapper session {} has no explicit matching native transcript",
                 wrapper["id"].as_str().unwrap_or("unknown")
             ));
         }
@@ -384,7 +384,7 @@ fn parse_export(path: &Path) -> Result<Parsed> {
         .as_array()
         .context("missing unreadable coverage")?
         .iter()
-        .map(|id| format!("ohjaa could not read session {id}"))
+        .map(|id| format!("the wrapper export could not read session {id}"))
         .collect();
     Ok(Parsed::Wrappers(records, warnings))
 }
@@ -993,7 +993,7 @@ pub fn messages(
     for file in transcripts(paths, &mut warnings) {
         if file.extension().is_some_and(|s| s == "json") {
             warnings.push(format!(
-                "{}: an ohjaa export holds no messages; not read",
+                "{}: a wrapper export holds no messages; not read",
                 file.display()
             ));
             continue;
