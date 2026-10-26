@@ -268,3 +268,80 @@ pub fn receipt(family: &Family) -> Result<serde_json::Value> {
         "entries": family.totals()?
     }))
 }
+
+/// One message a person typed into an agent session: a record of
+/// `vessa-messages.v1`.
+#[derive(Debug, Serialize)]
+pub struct Message {
+    pub agent: String,
+    /// The native session id.
+    pub session: String,
+    /// The session it descends from: a Codex fork's `forked_from_id`, a pi
+    /// `parentSession`. Null for none.
+    pub parent: Option<String>,
+    /// The native message id, where the agent writes one (Claude `uuid`,
+    /// pi `id`); Codex writes none for user turns.
+    pub id: Option<String>,
+    pub at: Option<String>,
+    pub cwd: String,
+    pub text: String,
+    /// The agent turn this message follows in its transcript, bounded.
+    pub reply: Option<Reply>,
+    pub source: String,
+    pub line: usize,
+}
+
+/// The agent turn a message follows: its last characters only.
+#[derive(Debug, Clone, Serialize)]
+pub struct Reply {
+    pub text: String,
+    /// The reply was longer than `text`.
+    pub truncated: bool,
+    /// The turn failed (a Claude API error, a Codex error event, a pi error
+    /// stop): the message answers a failure, not a reply.
+    pub failed: bool,
+    pub line: usize,
+}
+
+/// A session whose transcript `vessa messages` read.
+#[derive(Debug, Serialize)]
+pub struct Conversation {
+    pub agent: String,
+    pub id: String,
+    pub parent: Option<String>,
+    pub started_at: Option<String>,
+    pub cwd: String,
+    pub source: String,
+    /// Every prompt in it came from a program (`claude -p`, an Agent SDK,
+    /// `codex exec`), so no person is in it.
+    pub headless: bool,
+    /// Its messages listed.
+    pub messages: usize,
+}
+
+/// What `vessa messages` read, and why each user turn it did not list is
+/// not a person's message.
+#[derive(Debug, Default, Serialize)]
+pub struct Coverage {
+    /// Transcripts read for messages.
+    pub transcripts: usize,
+    /// Subagent transcripts, not read: their user turns are an agent's prompts.
+    pub subagent_transcripts: usize,
+    /// Transcripts last modified before `since`, not read.
+    pub unmodified_transcripts: usize,
+    /// User turns read: `human`, `excluded`, `earlier` and `undated` sum to it.
+    pub user_turns: usize,
+    /// Messages listed.
+    pub human: usize,
+    /// User turns that are no person's message, by rule.
+    pub excluded: BTreeMap<&'static str, usize>,
+    pub since: Option<String>,
+    /// Messages from before `since`.
+    pub earlier: usize,
+    /// Messages with no time, which `since` cannot place.
+    pub undated: usize,
+    /// Sources Vessa knows of and does not read.
+    pub gaps: Vec<String>,
+    /// What a transcript leaves unknown, by session.
+    pub limitations: Vec<String>,
+}

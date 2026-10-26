@@ -1,4 +1,4 @@
-use crate::model::{Entry, Report, Session, Usage};
+use crate::model::{Conversation, Coverage, Entry, Message, Reply, Report, Session, Usage};
 use anyhow::{bail, ensure, Context, Result};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -877,4 +877,721 @@ fn pi(
         add(s, v, line, id, entry);
     }
     Ok(())
+}
+
+// ---- messages ----------------------------------------------------------------
+
+/// How much of the agent's preceding reply travels with a message: its last
+/// characters, as ohjaa intake has taken them.
+const REPLY_TAIL: usize = 600;
+
+/// What `vessa messages` selects, besides its inputs.
+pub struct Selection {
+    pub agent: Option<String>,
+    pub session: Option<String>,
+    pub since: Option<chrono::DateTime<chrono::FixedOffset>>,
+}
+
+/// What `vessa messages` read, beside the messages it handed on.
+pub struct Listing {
+    pub sessions: Vec<Conversation>,
+    pub coverage: Coverage,
+    pub warnings: Vec<String>,
+}
+
+/// The human messages of the transcripts under `paths`, each handed to
+/// `emit` as soon as its transcript is read, so memory holds one
+/// transcript's turns at a time. Transcripts are read in path order, a Codex
+/// fork after the session it was forked from.
+pub fn messages(
+    paths: &[PathBuf],
+    select: &Selection,
+    emit: &mut dyn FnMut(&Message) -> Result<()>,
+) -> Result<Listing> {
+    let mut warnings = Vec::new();
+    let mut coverage = Coverage {
+        since: select.since.map(|t| t.to_rfc3339()),
+        ..Default::default()
+    };
+    // Each transcript's header, read as `sessions --headers` reads it.
+    let mut headers = Vec::new();
+    for file in transcripts(paths, &mut warnings) {
+        if file.extension().is_some_and(|s| s == "json") {
+            warnings.push(format!(
+                "{}: an ohjaa export holds no messages; not read",
+                file.display()
+            ));
+            continue;
+        }
+        match header(&file) {
+            Ok(session) => headers.push((file, session)),
+            Err(error) => warnings.push(format!("{}: {error:#}", file.display())),
+        }
+    }
+    let chosen = |s: &Session| {
+        select.agent.as_ref().is_none_or(|a| *a == s.agent)
+            && select
+                .session
+                .as_ref()
+                .is_none_or(|id| *id == s.id || s.subagent_of() == Some(id.as_str()))
+    };
+    if let Some(id) = &select.session {
+        let (subagents, sessions): (Vec<_>, Vec<_>) = headers
+            .iter()
+            .filter(|(_, s)| chosen(s))
+            .partition(|(_, s)| s.subagent);
+        ensure!(
+            !sessions.is_empty(),
+            "native session {id} not found{}",
+            if subagents.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; only {} subagent transcripts, whose user turns are an agent's prompts",
+                    subagents.len()
+                )
+            }
+        );
+    }
+    let mut work = Vec::new();
+    // Codex sessions a selected fork was forked from: their transcripts tell
+    // the fork's copied history from its own turns.
+    let mut wanted = std::collections::HashSet::new();
+    for (path, s) in &headers {
+        if !chosen(s) {
+            continue;
+        }
+        if s.subagent {
+            coverage.subagent_transcripts += 1;
+            continue;
+        }
+        // A transcript last written before `since` holds no message from
+        // after it.
+        if let Some(since) = select.since {
+            let modified = std::fs::metadata(path).and_then(|m| m.modified());
+            if modified.is_ok_and(|m| chrono::DateTime::<chrono::Utc>::from(m) < since) {
+                coverage.unmodified_transcripts += 1;
+                continue;
+            }
+        }
+        if s.agent == "codex" {
+            if let Some(parent) = &s.parent {
+                wanted.insert(parent.clone());
+            }
+        }
+        work.push((path, s));
+    }
+    // A fork of a fork comes after its parent fork.
+    let codex: HashMap<&str, &Session> = headers
+        .iter()
+        .filter(|(_, s)| s.agent == "codex")
+        .map(|(_, s)| (s.id.as_str(), s))
+        .collect();
+    let depth = |s: &Session| {
+        let mut seen = std::collections::HashSet::new();
+        let (mut depth, mut current) = (0, s);
+        while let Some(parent) = current.parent.as_deref().filter(|_| s.agent == "codex") {
+            match codex.get(parent) {
+                Some(next) if seen.insert(parent) => (depth, current) = (depth + 1, *next),
+                _ => break,
+            }
+        }
+        depth
+    };
+    work.sort_by_key(|(_, s)| depth(s));
+    let mut parents: HashMap<String, Vec<Vec<u64>>> = HashMap::new();
+    for (path, s) in &headers {
+        if s.agent == "codex" && wanted.contains(&s.id) && !work.iter().any(|(p, _)| p == &path) {
+            match turns(path, s) {
+                Ok(read) => parents
+                    .entry(s.id.clone())
+                    .or_default()
+                    .push(read.transcript()),
+                Err(error) => warnings.push(format!("{}: {error:#}", path.display())),
+            }
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut sessions: BTreeMap<(String, String), Conversation> = BTreeMap::new();
+    for (path, s) in work {
+        let read = match turns(path, s) {
+            Ok(read) => read,
+            Err(error) => {
+                warnings.push(format!("{}: {error:#}", path.display()));
+                continue;
+            }
+        };
+        coverage.transcripts += 1;
+        if wanted.contains(&s.id) {
+            parents
+                .entry(s.id.clone())
+                .or_default()
+                .push(read.transcript());
+        }
+        let listed = list(
+            s,
+            read,
+            &parents,
+            select.since,
+            &mut seen,
+            &mut coverage,
+            emit,
+        )?;
+        match sessions.entry((s.agent.clone(), s.id.clone())) {
+            std::collections::btree_map::Entry::Occupied(mut old) => {
+                let old = old.get_mut();
+                old.messages += listed.messages;
+                old.headless &= listed.headless;
+            }
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(listed);
+            }
+        }
+    }
+    Ok(Listing {
+        sessions: sessions.into_values().collect(),
+        coverage,
+        warnings,
+    })
+}
+
+/// One turn of a transcript: a user turn with its text, or an agent turn
+/// reduced to the tail a message carries as its reply.
+struct Turn {
+    line: usize,
+    user: bool,
+    /// An agent turn that failed: a Claude API error, a Codex error event, a
+    /// pi error stop.
+    failed: bool,
+    /// Of the turn's whole text, to recognise a Codex fork's copy of its
+    /// parent's transcript; none for a turn without text.
+    digest: Option<u64>,
+    /// A user turn's whole text; an agent turn's last characters.
+    text: String,
+    truncated: bool,
+    at: Option<String>,
+    id: Option<String>,
+    cwd: Option<String>,
+    /// Why a user turn is no person's message, where its record says so.
+    rule: Option<&'static str>,
+    /// Sent by a program: Claude's `sdk-*` entrypoints and `sdk` prompts.
+    headless: bool,
+    /// After a Codex fork's copy of its parent's header.
+    copied: bool,
+}
+
+impl Turn {
+    fn user(text: String, rule: Option<&'static str>) -> Self {
+        Turn {
+            line: 0,
+            user: true,
+            failed: false,
+            digest: (!text.trim().is_empty()).then(|| digest("user", &text)),
+            text,
+            truncated: false,
+            at: None,
+            id: None,
+            cwd: None,
+            rule,
+            headless: false,
+            copied: false,
+        }
+    }
+
+    /// An agent turn, or none for one without prose, such as a tool call.
+    fn agent(text: String, failed: bool) -> Option<Self> {
+        if text.trim().is_empty() {
+            return None;
+        }
+        let count = text.chars().count();
+        Some(Turn {
+            user: false,
+            failed,
+            digest: Some(digest("assistant", &text)),
+            truncated: count > REPLY_TAIL,
+            text: text
+                .chars()
+                .skip(count.saturating_sub(REPLY_TAIL))
+                .collect(),
+            ..Turn::user(String::new(), None)
+        })
+    }
+}
+
+/// A transcript's turns, as [`turns`] reads them.
+#[derive(Default)]
+struct Turns {
+    turns: Vec<Turn>,
+    limitations: Vec<String>,
+    /// A `codex exec` run with no turn submitted interactively.
+    exec: bool,
+}
+
+impl Turns {
+    /// The digests of its turns with text, in file order.
+    fn transcript(&self) -> Vec<u64> {
+        self.turns.iter().filter_map(|t| t.digest).collect()
+    }
+}
+
+/// Reads a transcript's turns, one record at a time, keeping no record.
+fn turns(path: &Path, s: &Session) -> Result<Turns> {
+    let file = BufReader::new(std::fs::File::open(path)?);
+    let mut read = Turns::default();
+    let (mut copying, mut exec, mut interactive) = (false, false, false);
+    let mut cwd: Option<String> = None;
+    for (index, line) in file.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let number = index + 1;
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(error) => {
+                read.limitations
+                    .push(format!("line {number}: malformed JSON: {error}"));
+                continue;
+            }
+        };
+        let turn = match s.agent.as_str() {
+            "claude" => claude_turn(&v, s),
+            "codex" => {
+                let p = &v["payload"];
+                match (v["type"].as_str(), p["type"].as_str()) {
+                    (Some("session_meta"), _) => {
+                        if p["id"] == s.id.as_str() {
+                            exec |= p["originator"] == "codex_exec" || p["source"] == "exec";
+                        } else if s.parent.is_some() {
+                            // A fork copies its parent's transcript, headers
+                            // included, behind its own header.
+                            copying = true;
+                        } else {
+                            bail!("mixed native session headers");
+                        }
+                        None
+                    }
+                    (Some("turn_context"), _) => {
+                        if let Some(dir) = p["cwd"].as_str() {
+                            cwd = Some(dir.to_owned());
+                        }
+                        None
+                    }
+                    (Some("event_msg"), Some("user_message")) => {
+                        interactive = true;
+                        None
+                    }
+                    (Some("event_msg"), Some("error")) => Turn::agent(string(p, "message"), true)
+                        .or_else(|| Turn::agent("error reply without text".into(), true)),
+                    (Some("response_item"), Some("message")) => match p["role"].as_str() {
+                        Some("user") => Some(Turn {
+                            id: p["id"].as_str().map(str::to_owned),
+                            cwd: cwd.clone(),
+                            ..Turn::user(content(&p["content"]), None)
+                        }),
+                        Some("assistant") => Turn::agent(content(&p["content"]), false),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+            _ => pi_turn(&v),
+        };
+        if let Some(mut turn) = turn {
+            turn.line = number;
+            turn.at = timestamp(&v);
+            turn.copied = copying;
+            read.turns.push(turn);
+        }
+    }
+    // Codex records how a run was started once per file; `codex exec` is
+    // headless unless a turn in it was submitted interactively.
+    read.exec = exec && !interactive;
+    Ok(read)
+}
+
+fn claude_turn(v: &Value, s: &Session) -> Option<Turn> {
+    let m = &v["message"];
+    if v["type"] == "assistant" {
+        let failed = v["isApiErrorMessage"] == true;
+        let text = content(&m["content"]);
+        return if failed && text.trim().is_empty() {
+            Turn::agent("error reply without text".into(), true)
+        } else {
+            Turn::agent(text, failed)
+        };
+    }
+    if m["role"] != "user" {
+        return None;
+    }
+    let rule = if v["type"] != "user" {
+        // `api-request-blob` records copy a request's content; not a turn.
+        Some("request_record")
+    } else if v["isSidechain"] == true {
+        Some("subagent")
+    } else if v["sessionId"].as_str().is_some_and(|id| id != s.id) {
+        Some("other_session")
+    } else if m["content"]
+        .as_array()
+        .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_result"))
+    {
+        Some("tool_result")
+    } else if v["isMeta"] == true {
+        Some("meta")
+    } else if v["isCompactSummary"] == true {
+        Some("compaction")
+    } else if v["origin"]["kind"].as_str().is_some_and(|k| k != "human")
+        || v["promptSource"] == "system"
+    {
+        Some("harness_origin")
+    } else {
+        None
+    };
+    Some(Turn {
+        id: v["uuid"].as_str().map(str::to_owned),
+        cwd: v["cwd"].as_str().map(str::to_owned),
+        headless: v["entrypoint"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("sdk-"))
+            || v["promptSource"] == "sdk",
+        ..Turn::user(content(&m["content"]), rule)
+    })
+}
+
+fn pi_turn(v: &Value) -> Option<Turn> {
+    if v["type"] != "message" {
+        return None;
+    }
+    let m = &v["message"];
+    match m["role"].as_str() {
+        Some("user") => Some(Turn {
+            id: v["id"].as_str().map(str::to_owned),
+            ..Turn::user(content(&m["content"]), None)
+        }),
+        Some("assistant") => {
+            let failed = m["stopReason"] == "error";
+            let mut text = content(&m["content"]);
+            if failed && text.trim().is_empty() {
+                text = m["errorMessage"]
+                    .as_str()
+                    .unwrap_or("error reply without text")
+                    .to_owned();
+            }
+            Turn::agent(text, failed)
+        }
+        _ => None,
+    }
+}
+
+/// Decides which of a transcript's user turns are a person's messages,
+/// hands those inside the window to `emit`, and counts the rest by rule.
+fn list(
+    s: &Session,
+    read: Turns,
+    parents: &HashMap<String, Vec<Vec<u64>>>,
+    since: Option<chrono::DateTime<chrono::FixedOffset>>,
+    seen: &mut std::collections::HashSet<(String, String, String)>,
+    coverage: &mut Coverage,
+    emit: &mut dyn FnMut(&Message) -> Result<()>,
+) -> Result<Conversation> {
+    let mut limitations = read.limitations;
+    // A Codex fork's copy is the longest run of its turns that matches its
+    // parent's transcript turn for turn; what follows is the fork's own.
+    // Without the parent there is nothing to match, so nothing is listed.
+    let copy: Vec<u64> = read
+        .turns
+        .iter()
+        .filter(|t| t.copied)
+        .filter_map(|t| t.digest)
+        .collect();
+    let inherited = if copy.is_empty() {
+        0
+    } else {
+        let parent = s.parent.clone().unwrap_or_default();
+        let matched = parents
+            .get(&parent)
+            .into_iter()
+            .flatten()
+            .map(|transcript| {
+                copy.iter()
+                    .zip(transcript)
+                    .take_while(|(a, b)| a == b)
+                    .count()
+            })
+            .max()
+            .unwrap_or(0);
+        if matched == 0 {
+            limitations.push(format!(
+                "Codex fork of {parent}: parent transcript not read or not matching, so its copied history cannot be told from the fork's own turns; {} turns after the copied header excluded",
+                copy.len()
+            ));
+            copy.len()
+        } else {
+            matched
+        }
+    };
+    let start = s
+        .started_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+    let mut copied = 0;
+    let mut reply: Option<Reply> = None;
+    // The person's last message, and whether the agent answered it since.
+    let mut last: Option<String> = None;
+    let mut answered = false;
+    let (mut humans, mut prompts, mut listed) = (0, 0, 0);
+    for turn in read.turns {
+        let in_copy = turn.copied && turn.digest.is_some() && {
+            copied += 1;
+            copied <= inherited
+        };
+        if !turn.user {
+            answered |= !turn.failed;
+            reply = Some(Reply {
+                text: turn.text,
+                truncated: turn.truncated,
+                failed: turn.failed,
+                line: turn.line,
+            });
+            continue;
+        }
+        coverage.user_turns += 1;
+        let text = without_reminders(&turn.text);
+        let text = text.as_ref();
+        let at = turn
+            .at
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+        let key = match (&turn.id, &turn.at) {
+            (Some(id), _) => Some(format!("id {id}")),
+            (None, Some(at)) => Some(format!("at {at} {:x}", digest("user", &text))),
+            (None, None) => None,
+        };
+        let rule = turn.rule.or_else(|| {
+            if text.is_empty() {
+                Some("empty")
+            } else if text.starts_with(CONTINUATION) {
+                Some("compaction")
+            } else if envelope(&s.agent, text) {
+                Some("envelope")
+            } else if HARNESS_PROMPTS.iter().any(|p| text.starts_with(p)) {
+                Some("harness_prompt")
+            } else if elements_only(text, &["send_user_message_question_reply"]) {
+                Some("question_reply")
+            } else if in_copy {
+                Some("fork_copy")
+            } else if s.parent.is_some()
+                && !turn.copied
+                && !start.zip(at).is_some_and(|(start, at)| at >= start)
+            {
+                // A fork's history before it was forked is its parent's.
+                if start.is_none() || at.is_none() {
+                    limitations.push(format!(
+                        "line {}: fork timestamp boundary unknown; message excluded",
+                        turn.line
+                    ));
+                }
+                Some("inherited")
+            } else if turn.headless || read.exec {
+                prompts += 1;
+                Some("headless")
+            } else if key
+                .clone()
+                .is_some_and(|k| !seen.insert((s.agent.clone(), s.id.clone(), k)))
+            {
+                Some("duplicate")
+            } else if !answered && last.as_deref() == Some(text) {
+                Some("retry")
+            } else {
+                None
+            }
+        });
+        if let Some(rule) = rule {
+            *coverage.excluded.entry(rule).or_default() += 1;
+            continue;
+        }
+        humans += 1;
+        last = Some(text.to_owned());
+        answered = false;
+        match (since, at) {
+            (Some(_), None) => coverage.undated += 1,
+            (Some(since), Some(at)) if at < since => coverage.earlier += 1,
+            _ => {
+                coverage.human += 1;
+                listed += 1;
+                emit(&Message {
+                    agent: s.agent.clone(),
+                    session: s.id.clone(),
+                    parent: s.parent.clone(),
+                    id: turn.id,
+                    at: turn.at,
+                    cwd: turn.cwd.unwrap_or_else(|| s.cwd.clone()),
+                    text: text.to_owned(),
+                    reply: reply.clone(),
+                    source: s.source.clone(),
+                    line: turn.line,
+                })?;
+            }
+        }
+    }
+    coverage.limitations.extend(
+        limitations
+            .into_iter()
+            .map(|l| format!("{}/{}: {l}", s.agent, s.id)),
+    );
+    Ok(Conversation {
+        agent: s.agent.clone(),
+        id: s.id.clone(),
+        parent: s.parent.clone(),
+        started_at: s.started_at.clone(),
+        cwd: s.cwd.clone(),
+        source: s.source.clone(),
+        headless: prompts > 0 && humans == 0,
+        messages: listed,
+    })
+}
+
+/// A message's text: its text blocks, joined.
+fn content(v: &Value) -> String {
+    v.as_str().map(str::to_owned).unwrap_or_else(|| {
+        v.as_array()
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| {
+                        matches!(
+                            b["type"].as_str(),
+                            Some("text" | "input_text" | "output_text")
+                        )
+                    })
+                    .filter_map(|b| b["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    })
+}
+
+/// A stable digest of one turn, for matching a fork's copy to its parent.
+fn digest(role: &str, text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (role, text).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The text without the `<system-reminder>` blocks a harness writes into a
+/// person's turn, trimmed; as ohjaa intake reads it.
+fn without_reminders(text: &str) -> std::borrow::Cow<'_, str> {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    if !text.contains(OPEN) {
+        return text.trim().into();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        rest = match rest[start..].find(CLOSE) {
+            Some(end) => &rest[start + end + CLOSE.len()..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out.trim().to_owned().into()
+}
+
+/// Elements a harness writes into a user turn: startup context,
+/// notifications, slash-command records, interruptions, and Codex's review,
+/// skill, recovery and plugin envelopes. Seula's set, which followed ohjaa
+/// intake's.
+const ENVELOPE_TAGS: [&str; 17] = [
+    "environment_context",
+    "user_instructions",
+    "INSTRUCTIONS",
+    "task-notification",
+    "turn_aborted",
+    "command-name",
+    "command-message",
+    "command-args",
+    "local-command-stdout",
+    "local-command-stderr",
+    "local-command-caveat",
+    "system-reminder",
+    "user_shell_command",
+    "user_action",
+    "skill",
+    "codex_internal_context",
+    "recommended_plugins",
+];
+/// Whole messages a harness writes verbatim.
+const ENVELOPE_TEXTS: [&str; 3] = [
+    "[Request interrupted by user]",
+    "[Request interrupted by user for tool use]",
+    "Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.",
+];
+/// The fixed first sentence of Claude Code's continuation summary.
+const CONTINUATION: &str =
+    "This session is being continued from a previous conversation that ran out of context.";
+/// Prompts a program sends in a person's place, by their fixed opening:
+/// Codex's `/init`, and toimija's launch prompts, inside and outside a
+/// repository, which `ohjaa run` gives an agent as its first message.
+const HARNESS_PROMPTS: [&str; 3] = [
+    "Generate a file named AGENTS.md that serves as a contributor guide for this repository.",
+    "Your toimija session packet is below. It is your workset contract:",
+    "You are in a toimija session outside any Git repository (",
+];
+
+/// Text a harness wrote into a user turn, matched in its exact form: a whole
+/// sequence of known elements, a verbatim notice, Codex's AGENTS.md heading
+/// over such elements, or pi's bare `/command`. A person who starts a message
+/// with a path, "Caveat:", a tag name or a heading is still a person.
+fn envelope(agent: &str, text: &str) -> bool {
+    if ENVELOPE_TEXTS.contains(&text) {
+        return true;
+    }
+    // Claude Code records slash commands as tags; pi writes the command alone.
+    if agent == "pi" {
+        if let Some(name) = text.strip_prefix('/') {
+            return !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':'));
+        }
+    }
+    let body = match text.split_once('\n') {
+        Some((heading, rest))
+            if heading.trim_end() == "# AGENTS.md instructions"
+                || heading.starts_with("# AGENTS.md instructions for ") =>
+        {
+            rest
+        }
+        _ => text,
+    };
+    elements_only(body, &ENVELOPE_TAGS)
+}
+
+/// True when `text` is one or more of the elements named and nothing else.
+fn elements_only(text: &str, names: &[&str]) -> bool {
+    let mut text = text.trim_start();
+    if text.is_empty() {
+        return false;
+    }
+    while !text.is_empty() {
+        let Some(rest) = text.strip_prefix('<') else {
+            return false;
+        };
+        let Some(name) = names.iter().find(|name| {
+            rest.strip_prefix(**name)
+                .is_some_and(|after| after.starts_with(['>', ' ', '\n']))
+        }) else {
+            return false;
+        };
+        let close = format!("</{name}>");
+        let Some(end) = text.find(&close) else {
+            return false;
+        };
+        text = text[end + close.len()..].trim_start();
+    }
+    true
 }
