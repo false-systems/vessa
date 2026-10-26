@@ -115,12 +115,25 @@ with its header and none holds another agent's records, and Claude Code marks
 every record of a transcript alike as a sidechain or not. On 928 local
 transcripts (3.2 GB, 2026-10-26) the two listings were identical; headers took
 under 0.5 s and 8 MB of memory, the full listing over 20 s and 1.2 GB on a
-loaded machine. Damage further into
-a transcript, which the full listing reports instead of the session, does not
-reach the header reader.
+loaded machine.
+
+Where a file breaks those habits, or is damaged past its header, the two
+listings differ, and tests pin how:
+
+* A Claude transcript that says it is no sidechain, then that it is one: the
+  full listing makes it a subagent of itself (`<id>/<agentId>`, with `<id>`
+  as `parent`); headers list the session itself, with no parent.
+* A file that holds records of two agents: the full listing takes the higher
+  ranked header (Codex, then pi, then Claude), headers the first in the file.
+* Damage after the header, such as invalid UTF-8: the full listing drops the
+  transcript with a warning; headers list it, warning of nothing, since they
+  never read that far. So of two copies of one session, when the first by
+  path is damaged, headers give that copy's `started_at`, `cwd` and `source`,
+  and the full listing the second copy's.
 
 No usage is read, so headers carry no limitations, and exit 4 means only a
-source warning: a transcript that could not be read. `--rates` is refused.
+source warning: a transcript that could not be read. `--rates` is refused,
+before or after `sessions`.
 
 Status, HTML reports and usage JSON also show **command and change insights**.
 A command is a recorded user message and the usage up to the next user message;
