@@ -1760,10 +1760,12 @@ const BRIEFING: [&str; 10] = [
     "Sessions in the other worktrees of this clone at launch",
     "System perimeter (derived by ohjaa at launch;",
 ];
-/// The line ohjaa's briefing opens with since ohjaa#56 (its
-/// `BRIEFING_SENTINEL`): where ohjaa's words begin. It is matched byte for
-/// byte as a whole line; another version is another line.
-const SENTINEL: &str = "<!-- ohjaa-briefing v1 -->";
+/// How the line ohjaa's briefing opens with since ohjaa#56 begins and ends.
+/// ohjaa writes `<!-- ohjaa-briefing v1 -->` (its `BRIEFING_SENTINEL`) to say
+/// where its words begin. A line of this form, after trimming, ends the task
+/// in any version: the version tells what follows, not where it starts.
+const SENTINEL_OPENS: &str = "<!-- ohjaa-briefing ";
+const SENTINEL_CLOSES: &str = "-->";
 
 /// Whether `text` is a toimija launch prompt: its fixed opening, after the
 /// launcher's alerts when there are any.
@@ -1808,14 +1810,18 @@ fn launch_task(text: &str) -> Option<String> {
     (!task.is_empty()).then(|| task.to_owned())
 }
 
-/// Where the first line that is ohjaa's sentinel, and nothing else, begins
-/// in `text` (at the newline before it).
+/// Where the first line of `text` that is a sentinel of ohjaa's briefing, and
+/// nothing else but whitespace, begins.
 fn sentinel_line(text: &str) -> Option<usize> {
-    let line = format!("\n{SENTINEL}");
-    text.match_indices(&line).map(|(at, _)| at).find(|at| {
-        let after = &text[at + line.len()..];
-        after.is_empty() || after.starts_with('\n')
-    })
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with(SENTINEL_OPENS) && trimmed.ends_with(SENTINEL_CLOSES) {
+            return Some(at);
+        }
+        at += line.len();
+    }
+    None
 }
 
 /// Text a harness wrote into a user turn, matched in its exact form: a whole

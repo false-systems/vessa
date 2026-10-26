@@ -2833,9 +2833,9 @@ fn a_launch_task_is_what_the_person_typed_without_the_briefing() {
 
 /// ohjaa's `BRIEFING_SENTINEL` (false-systems/ohjaa, src/main.rs, since
 /// ohjaa#56): the first line of the briefing ohjaa gives every launch. ohjaa
-/// pins it in its own tests/cli.rs and vessa pins it here, so a change on
-/// either side fails a test. Both match it byte for byte: a change is a new
-/// version, never an edit.
+/// pins it in its own tests/cli.rs and vessa pins it here, where ohjaa's
+/// briefing is built with it, so a change on either side fails a test.
+/// vessa ends a task at a line of any version of it.
 const OHJAA_BRIEFING_SENTINEL: &str = "<!-- ohjaa-briefing v1 -->";
 
 /// ohjaa's briefing as ohjaa writes it since #56: the sentinel line, the
@@ -2914,23 +2914,56 @@ fn a_launch_task_ends_at_ohjaas_briefing_sentinel() {
 }
 
 #[test]
-fn ohjaas_briefing_sentinel_is_matched_byte_for_byte() {
-    // A task with a paragraph of its own that opens as a part of ohjaa's
-    // briefing does: with the sentinel, all of it is the person's.
-    let task = "Quote the launch's warning in the notes:\n\nFLAG: main is unproven.";
-    let v = launches(
-        "sentinel-pinned.jsonl",
-        &[launch_prompt(false, Some(task), Some(&ohjaa_briefing_v1()))],
+fn any_ohjaa_briefing_sentinel_line_ends_the_task() {
+    // ohjaa's own line, then lines another version or another writer could
+    // give: each ends the task, and none of the briefing is the person's.
+    let lines = [
+        OHJAA_BRIEFING_SENTINEL,
+        "<!-- ohjaa-briefing v2 -->",
+        "  <!-- ohjaa-briefing v1 -->",
+        "<!-- ohjaa-briefing v1 --> ",
+        "<!-- ohjaa-briefing v1 -->\r",
+    ];
+    // A plain task, and one with a paragraph of its own that opens as a part
+    // of ohjaa's briefing does, which the sentences alone would cut short.
+    let tasks = [
+        "tidy the docs",
+        "Quote the launch's warning in the notes:\n\nFLAG: main is unproven.",
+    ];
+    let prompts: Vec<String> = lines
+        .iter()
+        .flat_map(|line| {
+            let briefing = ohjaa_briefing_v1().replacen(OHJAA_BRIEFING_SENTINEL, line, 1);
+            tasks.map(|task| launch_prompt(false, Some(task), Some(&briefing)))
+        })
+        .collect();
+    let v = launches("sentinel-lines.jsonl", &prompts);
+    assert_eq!(texts(&v), tasks.repeat(lines.len()));
+    assert!(v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["kind"] == "task"));
+}
+
+#[test]
+fn only_the_first_whole_sentinel_line_ends_the_task() {
+    // A sentinel quoted again later in the briefing does not move the end.
+    let quoted = format!(
+        "{}\nThe briefing opens with:\n{OHJAA_BRIEFING_SENTINEL}\n",
+        ohjaa_briefing_v1()
     );
-    assert_eq!(texts(&v), [task]);
-    // A line that differs from ohjaa's is not its sentinel (another version
-    // is a new line to learn), so the task is cut as an older ohjaa's is: at
-    // the first part of a briefing after a blank line.
-    let other =
-        ohjaa_briefing_v1().replacen(OHJAA_BRIEFING_SENTINEL, "<!-- ohjaa-briefing v2 -->", 1);
+    // A sentinel inside a line of the task, at its start or at its end, is
+    // the person's words, not the briefing.
+    let task = "Explain the launch's first line:\n\
+                ohjaa writes <!-- ohjaa-briefing v1 -->\n\
+                <!-- ohjaa-briefing v1 --> is where its words begin.";
     let v = launches(
-        "sentinel-other.jsonl",
-        &[launch_prompt(false, Some(task), Some(&other))],
+        "sentinel-first.jsonl",
+        &[
+            launch_prompt(false, Some("tidy the docs"), Some(&quoted)),
+            launch_prompt(false, Some(task), Some(&ohjaa_briefing_v1())),
+        ],
     );
-    assert_eq!(texts(&v), ["Quote the launch's warning in the notes:"]);
+    assert_eq!(texts(&v), ["tidy the docs", task]);
 }

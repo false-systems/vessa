@@ -377,15 +377,18 @@ harness's words:
   launcher's alerts, if any (`## Before anything else (from the launcher)`),
   the fixed framing and the session packet, then `\nTask: <task>\n`, then
   ohjaa's briefing as `\n<briefing>\n`. Since ohjaa#56 the briefing's first
-  line is `<!-- ohjaa-briefing v1 -->`, matched byte for byte as a whole
-  line, and the task is the text between the last `Task:` line and that
-  line. A briefing from an older ohjaa has no such line. It is parts joined
-  by a newline, each opening with a sentence ohjaa always writes: `FLAG: `,
-  `Validation here (sykli's word, …`, `STILL RUNNING: session `, `ORPHANED:
-  session `, `WARNING from `, `Knowledge (ohjaa, knowledge-node.v1):`, `Last
-  session here (`, `How this session works (ohjaa):`, `Sessions in the other
-  worktrees of this clone at launch`, `System perimeter (derived by ohjaa at
-  launch; …`. There the task ends at the first of these after a blank line,
+  line is `<!-- ohjaa-briefing v1 -->`, and the task is the text between the
+  last `Task:` line and the first line that, trimmed of whitespace, opens
+  with `<!-- ohjaa-briefing ` and closes with `-->`, in any version: the
+  version tells what follows, not where the briefing starts. A sentinel
+  inside a line is not one. A briefing from an older ohjaa has no such
+  line. It is parts joined by a newline, each opening with a sentence ohjaa
+  always writes: `FLAG: `, `Validation here (sykli's word, …`, `STILL
+  RUNNING: session `, `ORPHANED: session `, `WARNING from `, `Knowledge
+  (ohjaa, knowledge-node.v1):`, `Last session here (`, `How this session
+  works (ohjaa):`, `Sessions in the other worktrees of this clone at
+  launch`, `System perimeter (derived by ohjaa at launch; …`. There the
+  task ends at the first of these after a blank line,
   so a task containing a blank line followed by one of those sentences ends
   early. The task is listed as `task`; a launch prompt with no typed words
   left is a `harness_prompt`. The transcript does not say who wrote the
