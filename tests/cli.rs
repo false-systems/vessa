@@ -1324,3 +1324,274 @@ fn a_subagent_whose_requests_are_all_counted_with_its_session_is_not_unknown() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// A session header's fields: `vessa-session-headers.v1` has these and no
+/// others, each as `vessa-usage.v1` has it.
+const HEADER: [&str; 8] = [
+    "agent",
+    "id",
+    "parent",
+    "started_at",
+    "cwd",
+    "source",
+    "entrypoint",
+    "originator",
+];
+
+/// Asserts that `sessions --headers --json` lists, for `args`, the sessions
+/// and warnings `sessions --json` lists, in its order, each with the full
+/// listing's header fields and only those. Returns how many it compared.
+fn assert_headers_match(args: &[&str]) -> usize {
+    let mut full = vec!["sessions", "--json"];
+    full.extend(args);
+    let mut light = full.clone();
+    light.push("--headers");
+    let (full, light) = (cli(&full), cli(&light));
+    let stderr = String::from_utf8_lossy(&light.stderr).into_owned();
+    let f: Value = serde_json::from_slice(&full.stdout).unwrap();
+    let h: Value = serde_json::from_slice(&light.stdout).unwrap();
+    assert_eq!(h["schema"], "vessa-session-headers.v1");
+    assert_eq!(h["warnings"], f["warnings"], "{args:?}");
+    // Headers read no usage: only a source warning makes them partial.
+    let partial = !f["warnings"].as_array().unwrap().is_empty();
+    assert_eq!(
+        light.status.code(),
+        Some(if partial { 4 } else { 0 }),
+        "{args:?}: {stderr}"
+    );
+    let (fs, hs) = (
+        f["sessions"].as_array().unwrap(),
+        h["sessions"].as_array().unwrap(),
+    );
+    assert_eq!(fs.len(), hs.len(), "{args:?}");
+    for (a, b) in fs.iter().zip(hs) {
+        let fields = b.as_object().unwrap();
+        assert_eq!(fields.len(), HEADER.len(), "{args:?}: {b}");
+        for key in HEADER {
+            assert!(fields.contains_key(key), "{args:?}: {key} missing: {b}");
+            assert_eq!(a[key], b[key], "{args:?}: {key} of {}", a["id"]);
+        }
+    }
+    fs.len()
+}
+
+/// Synthetic transcripts covering each rule a header is read by.
+fn header_cases() -> PathBuf {
+    let dir = claude_family("header-cases", true);
+    let write = |name: &str, rows: &[&str]| {
+        std::fs::write(dir.join(name), rows.join("\n") + "\n").unwrap();
+    };
+    // Claude: untimed, unplaced opening records; time, folder and origin come
+    // from later records, and not all from the same one.
+    write(
+        "headless.jsonl",
+        &[
+            r#"{"type":"last-prompt","sessionId":"claude-headless","leafUuid":"x"}"#,
+            r#"{"type":"mode","sessionId":"claude-headless","mode":"normal"}"#,
+            r#"{"type":"user","uuid":"u1","isSidechain":false,"sessionId":"claude-headless","timestamp":"2026-09-30T09:00:00Z","message":{"role":"user","content":"draft"}}"#,
+            r#"{"type":"user","uuid":"u2","isSidechain":false,"sessionId":"claude-headless","cwd":"/demo/widget","timestamp":"2026-09-30T09:00:05Z","message":{"role":"user","content":"more"}}"#,
+            r#"{"type":"user","uuid":"u3","isSidechain":false,"sessionId":"claude-headless","cwd":"/demo/other","entrypoint":"sdk-cli","timestamp":"2026-09-30T09:00:09Z","message":{"role":"user","content":"last"}}"#,
+        ],
+    );
+    // Claude, placed only by a record after every other fact.
+    write(
+        "unplaced.jsonl",
+        &[
+            r#"{"type":"user","uuid":"p1","isSidechain":false,"sessionId":"claude-unplaced","entrypoint":"cli","timestamp":"2026-09-30T08:30:00Z","message":{"role":"user","content":"a"}}"#,
+            r#"{"type":"user","uuid":"p2","isSidechain":false,"sessionId":"claude-unplaced","cwd":"/demo/late","message":{"role":"user","content":"b"}}"#,
+        ],
+    );
+    // Claude, saying neither its origin nor whether it is a sidechain: read
+    // to its end, unknown.
+    write(
+        "silent.jsonl",
+        &[
+            r#"{"type":"user","uuid":"u1","sessionId":"claude-silent","cwd":"/demo/widget","timestamp":"2026-09-30T08:00:00Z","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"user","uuid":"u2","sessionId":"claude-silent","message":{"role":"user","content":"again"}}"#,
+        ],
+    );
+    // A Claude subagent whose records omit its agentId: named from its file.
+    write(
+        "claude-demo/subagents/agent-unnamed.jsonl",
+        &[
+            r#"{"type":"user","uuid":"n1","isSidechain":true,"sessionId":"claude-demo","cwd":"/demo/widget","entrypoint":"cli","timestamp":"2026-09-30T09:20:00Z","message":{"role":"user","content":"look"}}"#,
+        ],
+    );
+    // A Claude subagent that says it is one, and its agentId, only after an
+    // opening record that has every other fact.
+    write(
+        "claude-demo/subagents/agent-late.jsonl",
+        &[
+            r#"{"type":"user","uuid":"l0","sessionId":"claude-demo","cwd":"/demo/widget","entrypoint":"cli","timestamp":"2026-09-30T09:30:00Z","message":{"role":"user","content":"start"}}"#,
+            r#"{"type":"user","uuid":"l1","isSidechain":true,"sessionId":"claude-demo","timestamp":"2026-09-30T09:30:01Z","message":{"role":"user","content":"look"}}"#,
+            r#"{"type":"user","uuid":"l2","isSidechain":true,"agentId":"late-agent","sessionId":"claude-demo","timestamp":"2026-09-30T09:30:02Z","message":{"role":"user","content":"more"}}"#,
+        ],
+    );
+    // Two copies of one session: the first path's header is kept.
+    for (name, cwd) in [("copy-a.jsonl", "/demo/a"), ("copy-b.jsonl", "/demo/b")] {
+        write(
+            name,
+            &[&format!(
+                r#"{{"type":"user","uuid":"c1","isSidechain":false,"sessionId":"claude-copy","cwd":"{cwd}","entrypoint":"cli","timestamp":"2026-09-30T07:00:00Z","message":{{"role":"user","content":"copy"}}}}"#
+            )],
+        );
+    }
+    // A malformed opening line is skipped, as the full reader skips it.
+    write(
+        "malformed.jsonl",
+        &[
+            "{broken",
+            r#"{"type":"user","uuid":"m1","isSidechain":false,"sessionId":"claude-malformed","cwd":"/demo/widget","entrypoint":"cli","timestamp":"2026-09-30T06:00:00Z","message":{"role":"user","content":"x"}}"#,
+        ],
+    );
+    // Codex: a fork, a subagent with no parent named, `codex exec`, and a
+    // session_meta with no time and no folder of its own.
+    write(
+        "fork.jsonl",
+        &[
+            r#"{"timestamp":"2026-09-30T10:05:00Z","type":"session_meta","payload":{"id":"codex-fork","forked_from_id":"codex-demo","cwd":"/demo/widget","originator":"codex-tui","source":"cli","timestamp":"2026-09-30T10:05:00Z"}}"#,
+        ],
+    );
+    write(
+        "codex-sub.jsonl",
+        &[
+            r#"{"timestamp":"2026-09-30T10:06:00Z","type":"session_meta","payload":{"id":"codex-sub","cwd":"/demo/widget","originator":"codex-tui","source":{"subagent":{"other":"review"}},"timestamp":"2026-09-30T10:06:00Z"}}"#,
+        ],
+    );
+    write(
+        "exec.jsonl",
+        &[
+            r#"{"type":"session_meta","payload":{"id":"codex-exec","cwd":"/demo/widget","originator":"codex_exec","source":"exec","timestamp":"2026-09-30T10:00:00Z"}}"#,
+        ],
+    );
+    write(
+        "untimed.jsonl",
+        &[
+            r#"{"type":"session_meta","payload":{"id":"codex-untimed","source":"cli"}}"#,
+            r#"{"type":"turn_context","payload":{"model":"demo-codex"}}"#,
+            r#"{"timestamp":"2026-09-30T10:07:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[]}}"#,
+        ],
+    );
+    // Pi: a child session naming its parent.
+    write(
+        "pi-child.jsonl",
+        &[
+            r#"{"type":"session","version":3,"id":"pi-child","parentSession":"pi-demo","timestamp":"2026-09-30T11:30:00Z","cwd":"/demo/widget"}"#,
+        ],
+    );
+    // What is not a session is a warning in both listings.
+    write("note.jsonl", &[r#"{"type":"note"}"#]);
+    write(
+        "no-id.jsonl",
+        &[r#"{"type":"session_meta","payload":{"id":"","cwd":"/demo/widget"}}"#],
+    );
+    write("blank.jsonl", &[""]);
+    dir
+}
+
+#[test]
+fn session_headers_are_the_full_listings_headers() {
+    let cases = header_cases();
+    let dir = cases.to_str().unwrap();
+    let main = cases.join("claude-demo.jsonl");
+    let receipt = value(cli(&["receipt", "--input", "examples/pi.jsonl"]));
+    let export = temp("headers-ohjaa.json");
+    let wrappers = serde_json::json!({"schema":"ohjaa-sessions.v1","sessions":[{"id":"oh-fixture","agent":"pi","usage":[receipt]},{"id":"oh-unmatched","agent":"pi","usage":[]}],"unreadable":["oh-gone"]});
+    std::fs::write(&export, serde_json::to_vec(&wrappers).unwrap()).unwrap();
+    let mut compared = 0;
+    for args in [
+        vec!["--input", "examples"],
+        vec!["--input", "examples/claude.jsonl"],
+        vec!["--input", "examples/claude-subagent.jsonl"],
+        vec!["--input", "examples/codex.jsonl"],
+        vec!["--input", "examples/pi.jsonl"],
+        vec!["--input", "examples/work.jsonl"],
+        vec!["--input", dir],
+        vec!["--input", dir, "--agent", "codex"],
+        vec!["--input", dir, "--session", "claude-demo"],
+        // A transcript given alone brings its subagents along.
+        vec!["--input", main.to_str().unwrap()],
+        vec![
+            "--input",
+            "examples/pi.jsonl",
+            "--input",
+            export.to_str().unwrap(),
+        ],
+        vec!["--input", "/nonexistent/vessa-headers"],
+    ] {
+        compared += assert_headers_match(&args);
+    }
+    // Every case above was listed, and the rules each one tests applied.
+    assert!(compared >= 30, "{compared}");
+    // Partial (exit 4): its three files that are not sessions are warnings.
+    let output = cli(&["sessions", "--json", "--headers", "--input", dir]);
+    assert_eq!(output.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(v["warnings"].as_array().unwrap().len(), 3, "{v}");
+    let header = |id: &str| {
+        v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap_or_else(|| panic!("{id} not listed: {v}"))
+            .clone()
+    };
+    let headless = header("claude-headless");
+    assert_eq!(headless["started_at"], "2026-09-30T09:00:00Z");
+    assert_eq!(headless["cwd"], "/demo/widget");
+    assert_eq!(headless["entrypoint"], "sdk-cli");
+    assert!(header("claude-silent")["entrypoint"].is_null());
+    assert_eq!(header("claude-unplaced")["cwd"], "/demo/late");
+    assert_eq!(header("claude-demo/subagent-demo")["parent"], "claude-demo");
+    assert_eq!(header("claude-demo/unnamed")["parent"], "claude-demo");
+    assert_eq!(header("claude-demo/late-agent")["parent"], "claude-demo");
+    assert_eq!(header("claude-copy")["cwd"], "/demo/a");
+    assert_eq!(header("codex-fork")["parent"], "codex-demo");
+    assert_eq!(
+        header("codex-sub")["parent"],
+        "parent identity unavailable (subagent source)"
+    );
+    assert_eq!(header("codex-exec")["originator"], "codex_exec");
+    assert_eq!(
+        header("codex-untimed")["started_at"],
+        "2026-09-30T10:07:00Z"
+    );
+    assert_eq!(header("pi-child")["parent"], "pi-demo");
+    std::fs::remove_dir_all(cases).unwrap();
+    std::fs::remove_file(export).unwrap();
+}
+
+#[test]
+fn session_headers_read_only_a_transcripts_opening_records() {
+    // Past its header, a transcript is not read: a damaged tail, which the
+    // full listing reports instead of the session, does not reach it.
+    let path = temp("damaged-tail.jsonl");
+    let mut bytes = include_bytes!("../examples/codex.jsonl").to_vec();
+    bytes.extend(b"{\"type\":\"event_msg\",\"payload\":\"\xff\xfe\"}\n");
+    std::fs::write(&path, bytes).unwrap();
+    let input = path.to_str().unwrap();
+    let full = cli(&["sessions", "--json", "--input", input]);
+    assert_eq!(full.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&full.stdout).unwrap();
+    assert!(v["sessions"].as_array().unwrap().is_empty(), "{v}");
+    let v = value(cli(&["sessions", "--json", "--headers", "--input", input]));
+    assert_eq!(v["sessions"][0]["id"], "codex-demo");
+    assert_eq!(v["warnings"], serde_json::json!([]));
+    // Usage is not read, so neither is anything usage would need.
+    let text = cli(&["sessions", "--headers", "--input", "examples/pi.jsonl"]);
+    assert_eq!(
+        String::from_utf8(text.stdout).unwrap(),
+        "pi pi-demo · started 2026-09-30T11:00:00Z · /demo/widget\n"
+    );
+    let rates = cli(&[
+        "sessions",
+        "--headers",
+        "--rates",
+        "examples/rates.json",
+        "--input",
+        "examples/pi.jsonl",
+    ]);
+    assert!(!rates.status.success());
+    std::fs::remove_file(path).unwrap();
+}
