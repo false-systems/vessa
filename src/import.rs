@@ -8,6 +8,27 @@ use std::path::{Path, PathBuf};
 pub fn read(paths: &[PathBuf]) -> Result<Report> {
     // ponytail: selected transcripts are held in memory; stream compact
     // summaries if archive size makes this one-shot reader too expensive.
+    let (mut report, wrappers) = sessions(paths, parse_file);
+    deduplicate(&mut report);
+    link(&mut report, wrappers);
+    Ok(report)
+}
+
+/// The sessions under `paths` with their headers alone: what each transcript
+/// says about itself, read by the same rules as [`read`], from only as many
+/// of its records as settle them (see [`Scan::settled`]). No usage is read,
+/// so the sessions carry no usage and no limitations.
+pub fn headers(paths: &[PathBuf]) -> Result<Report> {
+    let (mut report, wrappers) = sessions(paths, header_file);
+    report.schema = "vessa-session-headers.v1".into();
+    link(&mut report, wrappers);
+    Ok(report)
+}
+
+/// Every transcript under `paths`, read with `parse`, one session per native
+/// identity, parents first; with the ohjaa wrapper records selected. Both
+/// readers start here, so they list the same sessions in the same order.
+fn sessions(paths: &[PathBuf], parse: fn(&Path) -> Result<Parsed>) -> (Report, Vec<Value>) {
     let mut report = Report {
         schema: "vessa-usage.v1".into(),
         ..Default::default()
@@ -35,7 +56,7 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
     files.dedup();
     let mut wrappers = Vec::new();
     for file in files {
-        match parse_file(&file) {
+        match parse(&file) {
             Ok(Parsed::Session(session)) => report.sessions.push(*session),
             Ok(Parsed::Wrappers(records, warnings)) => {
                 wrappers.extend(records);
@@ -64,6 +85,12 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
     // Process parents before descendants, so copied history stays with its
     // original session when both sources are available.
     report.sessions.sort_by_key(|s| s.parent.is_some());
+    (report, wrappers)
+}
+
+/// Counts each request once across the sessions, and says what the usage
+/// evidence leaves unknown.
+fn deduplicate(report: &mut Report) {
     // ponytail: lineage lookup scans the selected sessions; index IDs and
     // source paths if large archives make that scan measurable.
     let pi_lineages: HashMap<_, _> = report
@@ -164,15 +191,6 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
     for ((session, usage), elsewhere) in report.sessions.iter_mut().zip(kept).zip(elsewhere) {
         session.usage = usage;
         session.counted_elsewhere = elsewhere.len();
-        for wrapper in &wrappers {
-            if wrapper["usage"].as_array().is_some_and(|receipts| {
-                receipts
-                    .iter()
-                    .any(|r| r["agent"] == session.agent && r["session_id"] == session.id)
-            }) {
-                session.ohjaa.push(wrapper.clone());
-            }
-        }
         // A subagent whose every request its session already holds has had
         // its usage counted there; it is not unknown.
         let counted = session.subagent_of().is_some() && session.counted_elsewhere > 0;
@@ -183,6 +201,22 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
         }
         session.limitations.sort();
         session.limitations.dedup();
+    }
+}
+
+/// Attaches each ohjaa wrapper record to the sessions it explicitly names,
+/// and says which name none, or that no session was found at all.
+fn link(report: &mut Report, wrappers: Vec<Value>) {
+    for session in &mut report.sessions {
+        for wrapper in &wrappers {
+            if wrapper["usage"].as_array().is_some_and(|receipts| {
+                receipts
+                    .iter()
+                    .any(|r| r["agent"] == session.agent && r["session_id"] == session.id)
+            }) {
+                session.ohjaa.push(wrapper.clone());
+            }
+        }
     }
     for wrapper in wrappers {
         if !report
@@ -201,7 +235,6 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             .warnings
             .push("No supported native sessions found; usage is unknown".into());
     }
-    Ok(report)
 }
 
 /// True when `new` is a strictly later snapshot of the same request as `old`:
@@ -287,25 +320,227 @@ enum Parsed {
     Wrappers(Vec<Value>, Vec<String>),
 }
 
-fn parse_file(path: &Path) -> Result<Parsed> {
-    let source = path.display().to_string();
+/// An ohjaa `.json` export: its wrapper session records, and what it could
+/// not read.
+fn parse_export(path: &Path) -> Result<Parsed> {
+    let value: Value = serde_json::from_reader(std::fs::File::open(path)?)?;
+    ensure!(
+        value["schema"] == "ohjaa-sessions.v1",
+        "unsupported JSON export (expected ohjaa-sessions.v1)"
+    );
+    let records = value["sessions"]
+        .as_array()
+        .context("missing sessions")?
+        .clone();
+    let warnings = value["unreadable"]
+        .as_array()
+        .context("missing unreadable coverage")?
+        .iter()
+        .map(|id| format!("ohjaa could not read session {id}"))
+        .collect();
+    Ok(Parsed::Wrappers(records, warnings))
+}
+
+/// A transcript's header alone: the [`Scan`] that [`parse_file`] makes of
+/// every record, made of the records up to the one that settles it. The rest
+/// of the file is not read, and no record is kept.
+fn header_file(path: &Path) -> Result<Parsed> {
     if path.extension().is_some_and(|s| s == "json") {
-        let value: Value = serde_json::from_reader(std::fs::File::open(path)?)?;
-        ensure!(
-            value["schema"] == "ohjaa-sessions.v1",
-            "unsupported JSON export (expected ohjaa-sessions.v1)"
-        );
-        let records = value["sessions"]
-            .as_array()
-            .context("missing sessions")?
-            .clone();
-        let warnings = value["unreadable"]
-            .as_array()
-            .context("missing unreadable coverage")?
-            .iter()
-            .map(|id| format!("ohjaa could not read session {id}"))
-            .collect();
-        return Ok(Parsed::Wrappers(records, warnings));
+        return parse_export(path);
+    }
+    let file = BufReader::new(std::fs::File::open(path)?);
+    let mut scan = Scan::default();
+    for line in file.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // A malformed record is skipped, as `parse_file` skips it; saying so
+        // is a usage limitation, which this reader does not report.
+        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+            scan.observe(&value);
+            if scan.settled() {
+                break;
+            }
+        }
+    }
+    Ok(Parsed::Session(Box::new(scan.session(path, Vec::new())?)))
+}
+
+/// What a transcript says about itself, gathered record by record in file
+/// order: which agent wrote it, its native identity, lineage, start, folder
+/// and how it was started. [`parse_file`] shows it every record, and
+/// [`header_file`] only the records until [`Scan::settled`].
+#[derive(Default)]
+struct Scan {
+    /// The first Codex `session_meta` record.
+    codex: Option<Opening>,
+    /// The first pi `session` record, and whether any names its session.
+    pi: Option<Opening>,
+    pi_named: bool,
+    /// The first record that carries a Claude `sessionId`.
+    claude: Option<Opening>,
+    /// The first record's value of each, where the opening record lacks it.
+    started_at: Option<String>,
+    cwd: Option<String>,
+    entrypoint: Option<String>,
+    agent_id: Option<String>,
+    /// Whether any record is a Claude sidechain, and whether any says.
+    sidechain: bool,
+    sidechain_said: bool,
+}
+
+/// The header facts of one record that opens a session.
+struct Opening {
+    id: String,
+    parent: Option<String>,
+    started_at: Option<String>,
+    cwd: String,
+    originator: Option<String>,
+    subagent_source: bool,
+}
+
+impl Opening {
+    /// `meta` is the record itself, or Codex's `payload`; `id` its id field.
+    fn new(record: &Value, meta: &Value, id: &str) -> Self {
+        Opening {
+            id: string(meta, id),
+            parent: meta["parentSession"]
+                .as_str()
+                .or_else(|| meta["forked_from_id"].as_str())
+                .map(str::to_owned),
+            started_at: timestamp(meta).or_else(|| timestamp(record)),
+            cwd: string(meta, "cwd"),
+            originator: meta["originator"].as_str().map(str::to_owned),
+            subagent_source: !meta["source"]["subagent"].is_null(),
+        }
+    }
+}
+
+impl Scan {
+    fn observe(&mut self, v: &Value) {
+        if self.codex.is_none() && v["type"] == "session_meta" {
+            self.codex = Some(Opening::new(v, &v["payload"], "id"));
+        }
+        if self.pi.is_none() && v["type"] == "session" {
+            self.pi = Some(Opening::new(v, v, "id"));
+        }
+        self.pi_named |= v["type"] == "session" && v["id"].is_string();
+        if self.claude.is_none() && v["sessionId"].is_string() {
+            self.claude = Some(Opening::new(v, v, "sessionId"));
+        }
+        if self.started_at.is_none() {
+            self.started_at = timestamp(v);
+        }
+        for (slot, key) in [
+            (&mut self.cwd, "cwd"),
+            (&mut self.entrypoint, "entrypoint"),
+            (&mut self.agent_id, "agentId"),
+        ] {
+            if slot.is_none() {
+                *slot = v[key].as_str().map(str::to_owned);
+            }
+        }
+        self.sidechain |= v["isSidechain"] == true;
+        self.sidechain_said |= v["isSidechain"].is_boolean();
+    }
+
+    /// The agent the records so far say wrote the file, with the record that
+    /// opens its session: Codex when any is its `session_meta`, else pi when
+    /// any is a pi session header with an id, else Claude when any carries a
+    /// `sessionId`.
+    fn opening(&self) -> Option<(&'static str, &Opening)> {
+        match (&self.codex, &self.pi, &self.claude) {
+            (Some(codex), _, _) => Some(("codex", codex)),
+            (None, Some(pi), _) if self.pi_named => Some(("pi", pi)),
+            (None, _, Some(claude)) => Some(("claude", claude)),
+            _ => None,
+        }
+    }
+
+    /// Whether the records not yet read can no longer change the header.
+    ///
+    /// Each fact is "the first record that has it", final once found, so a
+    /// transcript that never states one is read to its end. Two rules look
+    /// at every record, and here the formats decide:
+    ///
+    /// * The agent: a later Codex or pi header would outrank a pi or Claude
+    ///   one. Each agent opens its own transcripts with its header and no
+    ///   transcript holds another agent's records, so the first decides.
+    /// * A Claude sidechain: Claude Code marks every record of a transcript
+    ///   alike, so the first that says decides.
+    fn settled(&self) -> bool {
+        let Some((agent, opening)) = self.opening() else {
+            return false;
+        };
+        let dated = opening.started_at.is_some() || self.started_at.is_some();
+        let placed = !opening.cwd.is_empty() || self.cwd.is_some();
+        let claude = || {
+            self.entrypoint.is_some()
+                && self.sidechain_said
+                && (!self.sidechain || self.agent_id.is_some())
+        };
+        dated && placed && (agent != "claude" || claude())
+    }
+
+    /// The session the records seen say this is, with no usage read yet.
+    fn session(self, path: &Path, limitations: Vec<String>) -> Result<Session> {
+        let Some((agent, _)) = self.opening() else {
+            bail!("unsupported or missing native session header");
+        };
+        let opening = match agent {
+            "codex" => self.codex,
+            "pi" => self.pi,
+            _ => self.claude,
+        }
+        .unwrap();
+        let mut id = opening.id;
+        ensure!(!id.is_empty(), "missing session identity");
+        let mut parent = opening.parent;
+        if agent == "claude" && self.sidechain {
+            parent = Some(id.clone());
+            // Claude Code names the file `agent-<agentId>.jsonl`, so a file
+            // whose records omit the agentId gives the id its launch names.
+            let child = self.agent_id.unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.strip_prefix("agent-").unwrap_or(s))
+                    .unwrap_or("unknown")
+                    .to_owned()
+            });
+            id = format!("{id}/{child}");
+        }
+        if agent == "codex" && opening.subagent_source && parent.is_none() {
+            parent = Some("parent identity unavailable (subagent source)".into());
+        }
+        // Current Claude Code transcripts open with records (`last-prompt`,
+        // `mode`) that carry the session id but no time and no folder: those
+        // come from the first record that has them.
+        Ok(Session {
+            agent: agent.into(),
+            id,
+            parent,
+            started_at: opening.started_at.or(self.started_at),
+            cwd: Some(opening.cwd)
+                .filter(|cwd| !cwd.is_empty())
+                .or(self.cwd)
+                .unwrap_or_default(),
+            entrypoint: (agent == "claude").then_some(self.entrypoint).flatten(),
+            originator: (agent == "codex").then_some(opening.originator).flatten(),
+            source: path.display().to_string(),
+            usage: Vec::new(),
+            limitations,
+            ohjaa: Vec::new(),
+            work: Vec::new(),
+            launched: Vec::new(),
+            counted_elsewhere: 0,
+        })
+    }
+}
+
+fn parse_file(path: &Path) -> Result<Parsed> {
+    if path.extension().is_some_and(|s| s == "json") {
+        return parse_export(path);
     }
     let file = BufReader::new(std::fs::File::open(path)?);
     let mut records = Vec::new();
@@ -320,84 +555,12 @@ fn parse_file(path: &Path) -> Result<Parsed> {
             Err(error) => limitations.push(format!("line {}: malformed JSON: {error}", index + 1)),
         }
     }
-    let agent = if records.iter().any(|(_, v)| v["type"] == "session_meta") {
-        "codex"
-    } else if records
-        .iter()
-        .any(|(_, v)| v["type"] == "session" && v["id"].is_string())
-    {
-        "pi"
-    } else if records.iter().any(|(_, v)| v["sessionId"].is_string()) {
-        "claude"
-    } else {
-        bail!("unsupported or missing native session header");
-    };
-    let header = records
-        .iter()
-        .find(|(_, v)| match agent {
-            "codex" => v["type"] == "session_meta",
-            "pi" => v["type"] == "session",
-            _ => v["sessionId"].is_string(),
-        })
-        .unwrap();
-    let meta = if agent == "codex" {
-        &header.1["payload"]
-    } else {
-        &header.1
-    };
-    let mut id = string(meta, if agent == "claude" { "sessionId" } else { "id" });
-    ensure!(!id.is_empty(), "missing session identity");
-    let mut parent = meta["parentSession"]
-        .as_str()
-        .or_else(|| meta["forked_from_id"].as_str())
-        .map(str::to_owned);
-    if agent == "claude" && records.iter().any(|(_, v)| v["isSidechain"] == true) {
-        parent = Some(id.clone());
-        // Claude Code names the file `agent-<agentId>.jsonl`, so a file
-        // whose records omit the agentId gives the id its launch names.
-        let child = records
-            .iter()
-            .find_map(|(_, v)| v["agentId"].as_str())
-            .unwrap_or_else(|| {
-                path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.strip_prefix("agent-").unwrap_or(s))
-                    .unwrap_or("unknown")
-            });
-        id = format!("{id}/{child}");
+    let mut scan = Scan::default();
+    for (_, value) in &records {
+        scan.observe(value);
     }
-    if agent == "codex" && !meta["source"]["subagent"].is_null() && parent.is_none() {
-        parent = Some("parent identity unavailable (subagent source)".into());
-    }
-    // Current Claude Code transcripts open with records (`last-prompt`,
-    // `mode`) that carry the session id but no time and no folder: those come
-    // from the first record that has them.
-    let first = |key: &str| records.iter().find_map(|(_, v)| v[key].as_str());
-    let mut session = Session {
-        agent: agent.into(),
-        id,
-        parent,
-        started_at: timestamp(meta)
-            .or_else(|| timestamp(&header.1))
-            .or_else(|| records.iter().find_map(|(_, v)| timestamp(v))),
-        cwd: Some(string(meta, "cwd"))
-            .filter(|cwd| !cwd.is_empty())
-            .or_else(|| first("cwd").map(str::to_owned))
-            .unwrap_or_default(),
-        entrypoint: (agent == "claude")
-            .then(|| first("entrypoint").map(str::to_owned))
-            .flatten(),
-        originator: (agent == "codex")
-            .then(|| meta["originator"].as_str().map(str::to_owned))
-            .flatten(),
-        source: source.clone(),
-        usage: Vec::new(),
-        limitations,
-        ohjaa: Vec::new(),
-        work: Vec::new(),
-        launched: Vec::new(),
-        counted_elsewhere: 0,
-    };
+    let mut session = scan.session(path, limitations)?;
+    let agent = session.agent.clone();
     let mut model = "unknown".to_owned();
     // Codex is OpenAI's agent; its session_meta names the provider when it
     // is another one. Pi is multi-provider and gets no default.
@@ -411,7 +574,7 @@ fn parse_file(path: &Path) -> Result<Parsed> {
     let mut pi_model_changed = false;
     for (line, value) in records {
         crate::work::observe(&value, line, &mut session);
-        let result = match agent {
+        let result = match agent.as_str() {
             "claude" => claude(&value, line, &mut session),
             "codex" => codex(
                 &value,
