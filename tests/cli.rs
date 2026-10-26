@@ -953,3 +953,233 @@ fn a_session_says_how_it_was_started_and_is_dated_past_untimed_header_records() 
     let pi = v["sessions"][0].as_object().unwrap();
     assert!(pi.contains_key("entrypoint") && pi.contains_key("originator"));
 }
+
+/// The record Claude Code writes in the main transcript when it launches a
+/// subagent: a tool result whose `toolUseResult` names the subagent's id.
+const LAUNCH: &str = r#"{"type":"user","uuid":"u4","sessionId":"claude-demo","timestamp":"2026-09-30T09:10:30Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"task1","content":"Agent launched."}]},"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"subagent-demo"}}"#;
+
+/// A Claude session laid out as Claude Code writes it: the main transcript at
+/// `<dir>/claude-demo.jsonl`, and each subagent's transcript beside it in
+/// `<dir>/claude-demo/subagents/agent-<id>.jsonl`.
+fn claude_family(name: &str, with_subagent: bool) -> PathBuf {
+    let dir = temp(name);
+    std::fs::create_dir_all(dir.join("claude-demo/subagents")).unwrap();
+    std::fs::write(
+        dir.join("claude-demo.jsonl"),
+        format!("{}{LAUNCH}\n", include_str!("../examples/claude.jsonl")),
+    )
+    .unwrap();
+    if with_subagent {
+        std::fs::write(
+            dir.join("claude-demo/subagents/agent-subagent-demo.jsonl"),
+            include_str!("../examples/claude-subagent.jsonl"),
+        )
+        .unwrap();
+    }
+    dir
+}
+
+#[test]
+fn a_claude_receipt_includes_the_sessions_subagents_and_says_so() {
+    // Main transcript: in 1200, out 300, cache read 800, cache write 100.
+    // Its subagent: in 6, out 1375, cache read 2500, cache write 80.
+    let dir = claude_family("family-receipt", true);
+    let main = dir.join("claude-demo.jsonl");
+    for args in [
+        // Looked up by the parent id, as consumers join on it.
+        vec!["--input", dir.to_str().unwrap(), "--session", "claude-demo"],
+        // The main transcript alone: its subagents live beside it.
+        vec!["--input", main.to_str().unwrap()],
+    ] {
+        let mut argv = vec!["receipt", "--rates", "examples/rates.json"];
+        argv.extend(&args);
+        let output = cli(&argv);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(v["session_id"], "claude-demo", "{args:?}");
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{args:?}");
+        assert_eq!(entries[0]["input_tokens"], 1200 + 6);
+        assert_eq!(entries[0]["output_tokens"], 300 + 1375);
+        assert_eq!(entries[0]["cache_read_tokens"], 800 + 2500);
+        assert_eq!(entries[0]["cache_write_tokens"], 100 + 80);
+        // 8715 for the main transcript, 10130 + 11564 for the subagent.
+        assert_eq!(entries[0]["estimated_usd_micros"], 8715 + 10130 + 11564);
+        assert!(
+            v["limitations"].as_array().unwrap().iter().any(|l| {
+                let l = l.as_str().unwrap();
+                l.contains("1 Claude subagent") && l.contains("claude-demo/subagent-demo")
+            }),
+            "{args:?}: {v}"
+        );
+        // ohjaa refuses a receipt with a field it does not know.
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "agent",
+                "complete",
+                "entries",
+                "limitations",
+                "observed_at_ms",
+                "schema",
+                "session_id",
+                "source"
+            ]
+        );
+    }
+    // A subagent can still be asked for on its own.
+    let v = value(cli(&[
+        "receipt",
+        "--input",
+        dir.to_str().unwrap(),
+        "--session",
+        "claude-demo/subagent-demo",
+    ]));
+    assert_eq!(v["session_id"], "claude-demo/subagent-demo");
+    assert_eq!(v["entries"][0]["output_tokens"], 1375);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn claude_status_totals_include_subagents_with_a_breakdown() {
+    let dir = claude_family("family-status", true);
+    let args = [
+        "status",
+        "--input",
+        dir.to_str().unwrap(),
+        "--session",
+        "claude-demo",
+    ];
+    let mut json_args = args.to_vec();
+    json_args.push("--json");
+    let v = value(cli(&json_args));
+    assert_eq!(v["session_id"], "claude-demo");
+    assert_eq!(v["entries"][0]["input_tokens"], 1206);
+    assert_eq!(v["entries"][0]["output_tokens"], 1675);
+    assert_eq!(v["main_entries"][0]["output_tokens"], 300);
+    let subagents = v["subagents"].as_array().unwrap();
+    assert_eq!(subagents.len(), 1);
+    assert_eq!(subagents[0]["id"], "claude-demo/subagent-demo");
+    assert_eq!(subagents[0]["entries"][0]["output_tokens"], 1375);
+    assert_eq!(
+        subagents[0]["last_recorded_at"],
+        "2026-09-30T09:10:20+00:00"
+    );
+    // The last record of the session is the subagent's, after the main one's.
+    assert_eq!(v["last_recorded_at"], "2026-09-30T09:10:20+00:00");
+
+    let out = cli(&args);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("totals include 1 subagent"), "{text}");
+    assert!(text.contains("in=1206 out=1675"), "{text}");
+    assert!(text.contains("main transcript"), "{text}");
+    assert!(
+        text.contains("subagent claude-demo/subagent-demo"),
+        "{text}"
+    );
+    assert!(text.contains("in=6 out=1375"), "{text}");
+
+    // A Claude session without subagents says how many it counted.
+    let out = cli(&["status", "--input", "examples/claude.jsonl"]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no subagent transcripts read"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_launched_subagent_whose_transcript_was_not_read_is_partial() {
+    let dir = claude_family("family-missing", false);
+    let output = cli(&["receipt", "--input", dir.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(v["entries"][0]["output_tokens"], 300);
+    assert!(
+        v["limitations"].as_array().unwrap().iter().any(|l| {
+            let l = l.as_str().unwrap();
+            l.contains("subagent claude-demo/subagent-demo") && l.contains("not read")
+        }),
+        "{v}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn usage_export_links_subagents_to_their_session_additively() {
+    let dir = claude_family("family-usage", true);
+    let v = value(cli(&["usage", "--input", dir.to_str().unwrap(), "--json"]));
+    let sessions = v["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    let main = sessions.iter().find(|s| s["id"] == "claude-demo").unwrap();
+    // `totals` is still this transcript's own records.
+    assert_eq!(main["totals"][0]["input_tokens"], 1200);
+    assert_eq!(
+        main["subagents"],
+        serde_json::json!(["claude-demo/subagent-demo"])
+    );
+    assert_eq!(main["totals_with_subagents"][0]["input_tokens"], 1206);
+    assert_eq!(main["totals_with_subagents"][0]["output_tokens"], 1675);
+    let sub = sessions
+        .iter()
+        .find(|s| s["id"] == "claude-demo/subagent-demo")
+        .unwrap();
+    assert_eq!(sub["parent"], "claude-demo");
+    assert_eq!(sub["subagents"], serde_json::json!([]));
+    assert_eq!(sub["totals_with_subagents"], sub["totals"]);
+    // Every session says it, so an older vessa is told apart from none.
+    let v = value(cli(&["usage", "--input", "examples/pi.jsonl", "--json"]));
+    assert_eq!(v["sessions"][0]["subagents"], serde_json::json!([]));
+    assert_eq!(
+        v["sessions"][0]["totals_with_subagents"],
+        v["sessions"][0]["totals"]
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn stats_count_top_level_sessions_and_subagents_separately() {
+    let dir = claude_family("family-stats", true);
+    for input in [dir.to_str().unwrap(), "examples"] {
+        let v = value(cli(&[
+            "stats", "--period", "month", "--agent", "claude", "--input", input, "--json",
+        ]));
+        let bucket = &v["buckets"][0];
+        assert_eq!(bucket["period"], "2026-09", "{input}");
+        assert_eq!(bucket["sessions"], 1, "{input}");
+        assert_eq!(bucket["subagents"], 1, "{input}");
+        // The subagent's usage is still counted in the period's totals.
+        assert_eq!(bucket["entries"][0]["output_tokens"], 1675, "{input}");
+    }
+    let out = cli(&[
+        "stats",
+        "--period",
+        "month",
+        "--input",
+        dir.to_str().unwrap(),
+    ]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("claude · 1 sessions · 1 subagents ·"),
+        "{text}"
+    );
+    // A subagent read without its main transcript still counts one session.
+    let v = value(cli(&[
+        "stats",
+        "--input",
+        "examples/claude-subagent.jsonl",
+        "--json",
+    ]));
+    assert_eq!(v["buckets"][0]["sessions"], 1);
+    assert_eq!(v["buckets"][0]["subagents"], 1);
+    let v = value(cli(&["stats", "--input", "examples/pi.jsonl", "--json"]));
+    assert_eq!(v["buckets"][0]["subagents"], 0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
