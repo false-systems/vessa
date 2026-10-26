@@ -287,14 +287,15 @@ pub fn text(insights: &Insights) -> String {
     for (i, c) in insights.commands.iter().enumerate() {
         let _ = writeln!(
             out,
-            "Command {} · line {} · usage records={} tools={} recorded changes={} · observed elapsed {}s",
+            "Command {} · line {} · usage records={} tools={} recorded changes={} · elapsed {}",
             i + 1,
             c.line,
             c.records,
             c.tools,
             c.changes.len(),
-            c.elapsed_seconds
-                .map_or("unknown".into(), |s| s.to_string())
+            c.elapsed_seconds.map_or("unknown".into(), |s| format!(
+                "{s}s (to its last usage record)"
+            ))
         );
         entries(&mut out, &c.entries);
         for (j, change) in c.changes.iter().enumerate() {

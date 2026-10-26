@@ -21,15 +21,19 @@ cargo run -- messages --since 7d --json
 
 `--input` is repeatable and accepts a file or directory. Without it, Vessa
 reads `~/.claude/projects`, `~/.codex/sessions`, and `~/.pi/agent/sessions`.
-Directories discover native `.jsonl` transcripts; select ohjaa `.json` exports
-as explicit files so agent metadata JSON is not mistaken for a usage source.
+One of these that does not exist is an agent not installed here, and no gap,
+unless `--agent` asks for that agent: then it is a warning (`codex: not
+installed here`), since what was asked for cannot be read.
+Directories discover native `.jsonl` transcripts; select a wrapper's
+`ohjaa-sessions.v1` `.json` export as an explicit file, so agent metadata JSON
+is not mistaken for a usage source.
 Pass explicit paths for relocated agent directories or a bounded selection.
 Use `--agent claude|codex|pi` or `--session NATIVE-ID` to filter results.
-Missing paths, malformed records and unsupported formats are reported, not
-silently treated as zero. Exit 4 means the usage evidence is partial: a source
-warning or a session limitation, each printed to stderr, and a last line that
-counts them. Rate-card notices do not set it. Exit 1 means the requested
-operation failed. Use the emitted limitations to judge coverage.
+Missing `--input` paths, malformed records and unsupported formats are
+reported, not silently treated as zero. Exit 4 means the usage evidence is
+partial: a source warning or a session limitation, each printed to stderr, and
+a last line that counts them. Rate-card notices do not set it. Exit 1 means
+the requested operation failed. Use the emitted limitations to judge coverage.
 
 ## Session display and statistics
 
@@ -66,12 +70,27 @@ usage is its session's usage:
 
 A request is still counted once, however many transcripts hold it.
 
+### Codex subagents
+
+Codex writes each subagent, and each other thread a session spawns (such as a
+review), to a transcript of its own, under its own thread id. Its
+`session_meta` says it is a subagent (`source.subagent`) and names the session
+at its root (`session_id`; older Codex writes only the thread it came from,
+`parent_thread_id` or `forked_from_id`, which Vessa follows through the threads
+read to the root). A lineage that loops has no root: each thread in it stands
+alone, with a limitation. Vessa keeps the thread id and its
+`parent`, and counts it to that root session by the rules above: `--session`
+selects the session with its subagents, `status` and `receipt` total them
+(the receipt names them in `limitations`), `stats` counts the session once and
+its subagents apart, and the usage export names them in `subagents`. A thread
+whose `session_meta` names no other session stands alone.
+
 ### Session headers
 
 `sessions --headers` lists each session's header alone: what its transcript
-says about itself, without its usage. A caller that needs only these, such as
-`ohjaa report`, need not wait for every usage record to be read. With `--json`
-it emits `vessa-session-headers.v1`:
+says about itself, without its usage. A caller that needs only these need not
+wait for every usage record to be read. With `--json` it emits
+`vessa-session-headers.v1`:
 
 ```json
 {
@@ -180,9 +199,12 @@ This reads Claude's native session identity and running estimate on stdin and
 prints the session estimate first, separately from unknown actual billing.
 A second line shows the last API call's input, output, cache-read and
 cache-write tokens. These are not cumulative session counts; absent categories
-remain unknown, including before the first response or after compaction. It makes
-no model calls and displays no budgets, quotas or limits. Preserve any existing
-status-line customization when installing. See the official
+remain unknown, including before the first response or after compaction. A
+field it cannot read, such as a negative or impossibly large cost or a count
+sent as text, shows as unknown, and input that is not JSON shows every field
+unknown: the status line always prints and exits 0, so it never goes blank.
+It makes no model calls and displays no budgets, quotas or limits. Preserve
+any existing status-line customization when installing. See the official
 [Claude status-line contract](https://code.claude.com/docs/en/statusline).
 
 Codex's native `tui.status_line` supports input/output token counters and,
@@ -191,8 +213,8 @@ missing account cost is not fabricated from tokens. Use `vessa status` with
 an explicit transcript and dated `--rates` for an external priced view. Pi
 already shows accumulated usage/cost in its footer and `/session`; its cost is
 still an estimate. Native display support differs by agent/account; this is
-not a universal live billing API. Correction patterns belong to ohjaa intake,
-which reads `messages`; Vessa does not call a whole session's spending waste.
+not a universal live billing API. Vessa detects no correction patterns; a
+reader of `messages` does. Vessa does not call a whole session's spending waste.
 
 In Codex, use `/statusline` to move spending/token fields before long model and
 session labels; `/status` opens the native usage details. The footer supports
@@ -218,6 +240,12 @@ never adds a reasoning subcategory a second time.
   the response ids: `msg_01…` or a `req_…` request id is `anthropic`,
   `msg_bdrk_…` is `bedrock`, `msg_vrtx_…` is `vertex`, and anything else is
   `unknown`. A model name proves nothing about who served the request.
+  Claude Code also writes `<synthetic>` assistant messages of its own, with
+  zero usage, where a request failed or was refused, some under that
+  request's id. They are no request: each session counts them once in
+  `synthetic_records`, and they are neither usage nor a conflict. A session
+  whose only answers were synthetic recorded no usage, so it is not unknown.
+  One that reports usage is read as usage.
 * Codex: differences cumulative input/output/cache counters, ignores repeated
   totals, and associates deltas with the current model context. Counter resets
   are flagged, with a new baseline, rather than inventing negative usage. The
@@ -250,11 +278,11 @@ estimate unless the supplied rate actually represents them.
 ## Messages
 
 `messages` lists what people wrote in their agent sessions, each message with
-the agent reply it follows: the evidence a lesson drafter such as `ohjaa
-intake` reads corrections from. Vessa is the one reader of agent
-conversations. It reads Claude Code, Codex and pi transcripts with the same
-discovery and headers as its other commands, and keeps nothing: no cache, no
-database. Text goes only to stdout, which inherits the permissions you give it.
+the agent reply it follows: the evidence a lesson drafter reads corrections
+from. Vessa is the one reader of agent conversations. It reads Claude Code,
+Codex and pi transcripts with the same discovery and headers as its other
+commands, and keeps nothing: no cache, no database. Text goes only to stdout,
+which inherits the permissions you give it.
 
 ```sh
 cargo run -- messages --since 7d
@@ -263,13 +291,12 @@ cargo run -- messages --session NATIVE-ID --json
 ```
 
 `--since` takes RFC 3339, a UTC date (`YYYY-MM-DD`) or an age (`7d`, `12h`),
-and lists the messages after it: exclusive, as ohjaa intake windows
-(`at_ms > since`), so a reader can pass the time of the last message it
-handled and not get that message again. `--agent` and `--session` select as
-they do elsewhere; a Claude subagent's own id selects it alone. With `--json`
-it emits `vessa-messages.v1`, one message a line inside one JSON document,
-each written as soon as its transcript is read, so memory holds one transcript
-at a time:
+and lists the messages after it: exclusive (`at_ms > since`), so a reader can
+pass the time of the last message it handled and not get that message again.
+`--agent` and `--session` select as they do elsewhere; a Claude subagent's own
+id selects it alone. With `--json` it emits `vessa-messages.v1`, one message a
+line inside one JSON document, each written as soon as its transcript is read,
+so memory holds one transcript at a time:
 
 ```json
 {"schema":"vessa-messages.v1","messages":[
@@ -294,10 +321,10 @@ at a time:
   `question` it answers. `rejection`: the reason a person gave for rejecting
   a tool call. `task`: the task a person typed into a launch prompt.
 * `reply` is the agent turn it follows in its transcript: the last 600
-  characters of its text, as ohjaa intake has taken them, with `truncated`
-  and `line`. `failed` says the turn was a Claude API error, a Codex error
-  event or a pi error stop: the message answers a failure, so "try again"
-  there is a retry, not a correction. Null when no agent turn came before.
+  characters of its text, with `truncated` and `line`. `failed` says the turn
+  was a Claude API error, a Codex error event or a pi error stop: the message
+  answers a failure, so "try again" there is a retry, not a correction. Null
+  when no agent turn came before.
 * `sessions` lists each transcript read, its copies as one session, with how
   many messages it gave. `headless` marks one whose every prompt a program
   sent; `subagent` a Claude subagent.
@@ -327,28 +354,28 @@ counted under the first that applies. The rules are structural: what the
 record says about itself, or a harness text in an exact form, either a whole
 text or the fixed sentence a harness always opens it with. They never match a
 mere prefix of a person's words, so a person who starts a message with
-"Caveat:", a path or a tag name is still a person. They come from Seula's
-reader, which was the most careful, with ohjaa intake's where they are
-stricter, and a few the archive called for:
+"Caveat:", a path or a tag name is still a person. They come from the
+earlier readers of these transcripts, the stricter where they differ, and a
+few the local archive called for:
 
-| Rule | Excludes | Why | From |
-| --- | --- | --- | --- |
-| `request_record` | A Claude record of another type that carries a user message (`api-request-blob`) | It copies a request's content, without uuid or time | the archive |
-| `other_session` | A Claude record naming another session; also a limitation | Not this session's | Seula |
-| `tool_result` | A Claude user turn holding a tool result, even with text beside it, unless a person wrote inside it (below) | Claude Code returns tool output as user turns | intake; Seula took the text beside a result |
-| `subagent` | In a Claude subagent's transcript, or as a sidechain record inside a main one, a turn whose origin is not a person | The prompts the parent agent wrote | intake |
-| `meta` | Claude `isMeta`, unless its origin is a person | Skill expansions, peer messages, safety and system notices | Seula |
-| `compaction` | Claude `isCompactSummary`, or a text opening with the fixed first sentence of its continuation summary | A summary of earlier turns | Seula, intake |
-| `harness_origin` | Claude `origin.kind` other than `human`, or `promptSource: system`; a queued command whose origin is not a person | Claude Code says the harness wrote it: task notifications, peers, coordinators | the archive; Seula's envelopes caught the same turns by their text |
-| `empty` | No text, as an image alone | Nothing to read | Seula |
-| `envelope` | A message that is wholly known harness elements (startup context, notifications, slash-command records, interruptions, Codex's review, skill and plugin elements), Codex's `# AGENTS.md instructions` heading over them, the verbatim interruption notices and local-command caveat, pi's bare `/command` | The harness wrote it into a user turn | Seula, whose element set followed intake's |
-| `harness_prompt` | A text opening with the fixed first sentence of Codex's `/init`, or of a toimija launch prompt that carries no task | A program wrote it in a person's place | the archive |
-| `question_reply` | A Codex reply to its question tool whose every answer is one of the options the question offered | Picking an offered option says nothing in the person's own words; Claude's picks are in its `tool_result` | the archive |
-| `fork_copy` | In a Codex fork, the longest run of turns after the copied parent header that matches the parent's transcript turn for turn; all of them, with a limitation, when the parent was not read | A fork copies its parent's transcript stamped with the fork time, so time cannot separate them | Seula |
-| `inherited` | In a fork (Codex, pi), a turn from before the fork started; one with no time, with a limitation | Its parent's history | Seula |
-| `headless` | Claude `sdk-*` entrypoints and `promptSource: sdk`, decided per turn; a `codex exec` file in which no turn was submitted interactively (a `user_message` event) | A program sent it: `claude -p`, an Agent SDK, `codex exec`. A session resumed by a script keeps its interactive turns | Seula |
-| `duplicate` | A message another copy of the session already gave (the same native id, else the same time and text), and a queued message that later arrives as an ordinary one of the same text | Read twice, said once | Seula, by id |
-| `retry` | The person's previous message sent again before the agent answered it, because the agent failed or never replied | Re-sent, not said anew | the archive |
+| Rule | Excludes | Why |
+| --- | --- | --- |
+| `request_record` | A Claude record of another type that carries a user message (`api-request-blob`) | It copies a request's content, without uuid or time |
+| `other_session` | A Claude record naming another session; also a limitation | Not this session's |
+| `tool_result` | A Claude user turn holding a tool result, even with text beside it, unless a person wrote inside it (below) | Claude Code returns tool output as user turns |
+| `subagent` | In a Claude subagent's transcript, or as a sidechain record inside a main one, a turn whose origin is not a person | The prompts the parent agent wrote |
+| `meta` | Claude `isMeta`, unless its origin is a person | Skill expansions, peer messages, safety and system notices |
+| `compaction` | Claude `isCompactSummary`, or a text opening with the fixed first sentence of its continuation summary | A summary of earlier turns |
+| `harness_origin` | Claude `origin.kind` other than `human`, or `promptSource: system`; a queued command whose origin is not a person | Claude Code says the harness wrote it: task notifications, peers, coordinators |
+| `empty` | No text, as an image alone | Nothing to read |
+| `envelope` | A message that is wholly known harness elements (startup context, notifications, slash-command records, interruptions, Codex's review, skill and plugin elements), Codex's `# AGENTS.md instructions` heading over them, the verbatim interruption notices and local-command caveat, pi's bare `/command` | The harness wrote it into a user turn |
+| `harness_prompt` | A text opening with the fixed first sentence of Codex's `/init`, or of a launch prompt that carries no task (below) | A program wrote it in a person's place |
+| `question_reply` | A Codex reply to its question tool whose every answer is one of the options the question offered | Picking an offered option says nothing in the person's own words; Claude's picks are in its `tool_result` |
+| `fork_copy` | In a Codex fork, the longest run of turns after the copied parent header that matches the parent's transcript turn for turn; all of them, with a limitation, when the parent was not read | A fork copies its parent's transcript stamped with the fork time, so time cannot separate them |
+| `inherited` | In a fork (Codex, pi), a turn from before the fork started; one with no time, with a limitation | Its parent's history |
+| `headless` | Claude `sdk-*` entrypoints and `promptSource: sdk`, decided per turn; a `codex exec` file in which no turn was submitted interactively (a `user_message` event) | A program sent it: `claude -p`, an Agent SDK, `codex exec`. A session resumed by a script keeps its interactive turns |
+| `duplicate` | A message another copy of the session already gave (the same native id, else the same time and text), and a queued message that later arrives as an ordinary one of the same text | Read twice, said once |
+| `retry` | The person's previous message sent again before the agent answered it, because the agent failed or never replied | Re-sent, not said anew |
 
 What a person wrote is listed wherever the record keeps it apart from the
 harness's words:
@@ -373,49 +400,48 @@ harness's words:
 * **Rejecting a tool call.** Claude Code writes the reason after a fixed
   sentence that ends "To tell you how to proceed, the user said:". The reason
   is listed as `rejection`; a rejection with no reason stays a `tool_result`.
-* **A task in a launch prompt.** toimija composes the launch prompt as the
-  launcher's alerts, if any (`## Before anything else (from the launcher)`),
-  the fixed framing and the session packet, then `\nTask: <task>\n`, then
-  ohjaa's briefing as `\n<briefing>\n`. Since ohjaa#56 the briefing's first
-  line is `<!-- ohjaa-briefing v1 -->`, and the task is the text between the
-  last `Task:` line and the first line that, trimmed of whitespace, opens
-  with `<!-- ohjaa-briefing ` and closes with `-->`, in any version: the
-  version tells what follows, not where the briefing starts. A sentinel
-  inside a line is not one. A briefing from an older ohjaa has no such
-  line. It is parts joined by a newline, each opening with a sentence ohjaa
-  always writes: `FLAG: `, `Validation here (sykli's word, …`, `STILL
-  RUNNING: session `, `ORPHANED: session `, `WARNING from `, `Knowledge
-  (ohjaa, knowledge-node.v1):`, `Last session here (`, `How this session
-  works (ohjaa):`, `Sessions in the other worktrees of this clone at
-  launch`, `System perimeter (derived by ohjaa at launch; …`. There the
-  task ends at the first of these after a blank line,
-  so a task containing a blank line followed by one of those sentences ends
-  early. The task is listed as `task`; a launch prompt with no typed words
-  left is a `harness_prompt`. The transcript does not say who wrote the
-  task: a person who ran `ohjaa run`, or an agent that launched the session
-  for one.
+* **A task in a launch prompt.** A launching wrapper (`ohjaa run`, through
+  toimija) composes the launch prompt as the launcher's alerts, if any
+  (`## Before anything else (from the launcher)`), the fixed framing and the
+  session packet, then `\nTask: <task>\n`, then its briefing as
+  `\n<briefing>\n`. Since ohjaa#56 the briefing's first line is
+  `<!-- ohjaa-briefing v1 -->`, and the task is the text between the last
+  `Task:` line and the first line that, trimmed of whitespace, opens with
+  `<!-- ohjaa-briefing ` and closes with `-->`, in any version: the version
+  tells what follows, not where the briefing starts. A sentinel inside a line
+  is not one. A briefing from an older wrapper has no such line. It is parts
+  joined by a newline, each opening with a sentence the briefing always
+  writes: `FLAG: `, `Validation here (sykli's word, …`, `STILL RUNNING:
+  session `, `ORPHANED: session `, `WARNING from `, `Knowledge (ohjaa,
+  knowledge-node.v1):`, `Last session here (`, `How this session works
+  (ohjaa):`, `Sessions in the other worktrees of this clone at launch`,
+  `System perimeter (derived by ohjaa at launch; …`. There the task ends at
+  the first of these after a blank line, so a task containing a blank line
+  followed by one of those sentences ends early. The task is listed as
+  `task`; a launch prompt with no typed words left is a `harness_prompt`.
+  The transcript does not say who wrote the task: a person who ran the
+  launcher, or an agent that launched the session for one.
 
-Intake's 1,500-character limit is not applied: it is a correction heuristic,
-and intake keeps it. Its prefix skip list is replaced by the exact forms above.
+No length limit is applied: one is a correction heuristic, and belongs to the
+reader that looks for corrections. No prefix skip list is used either; the
+exact forms above replace one.
 
 On the local archive (2026-10-26) `messages` listed 5,583 messages: claude
 630, codex 4,649, pi 304, from 628 transcripts, 258 of them Claude
-subagents', in 5.3 s and 129 MB; with `--since 1d`, in 0.6 s. Seula's reader
-counted 5,797 typed human messages in the same folders earlier that day. Of
-those, Vessa excludes the `request_record` copies (72), the harness's own
-`/init` and launch prompts (150; from 4 of them it lists the typed task, and
-24 hold only ohjaa's briefing), the question replies that only pick options
-(43 of 63; the other 20 give 20 answers in the person's words) and one
-`retry`. It also lists what Seula did
-not read: 28 messages written to Claude subagents, 15 queued while the agent
-worked, 4 own answers to Claude's question tool and 1 rejection reason. 2,701
-of the Codex messages carry an id.
+subagents', in 5.3 s and 129 MB; with `--since 1d`, in 0.6 s. The reader it
+replaced counted 5,797 typed human messages in the same folders earlier that
+day. Of those, Vessa excludes the `request_record` copies (72), the harness's
+own `/init` and launch prompts (150; from 4 of them it lists the typed task,
+and 24 hold only the launcher's briefing), the question replies that only pick
+options (43 of 63; the other 20 give 20 answers in the person's words) and one
+`retry`. It also lists what that reader did not read: 28 messages written to
+Claude subagents, 15 queued while the agent worked, 4 own answers to Claude's
+question tool and 1 rejection reason. 2,701 of the Codex messages carry an id.
 
 ## Usage export
 
-Seula, which read this export beside the conversations, was archived on
-2026-10-26, and `messages` took over its reader. Usage exports, receipts and
-reports carry no message text. No sibling crate or binary is needed.
+Usage exports, receipts and reports carry no message text; only `messages`
+prints any. No sibling crate or binary is needed.
 
 ```sh
 vessa usage --input /path/to/session.jsonl --json > /tmp/usage.private.json
@@ -433,9 +459,11 @@ Each session also exports `totals`, calculated by Vessa from deduplicated
 records and grouped by provider/model. Consumers can display these beside work
 evidence without implementing accounting. Unknown categories remain null; older
 exports without this additive field still contain the original usage records.
+`synthetic_records` counts a Claude session's `<synthetic>` messages, read and
+known to hold no usage; it is 0 for other agents.
 
 `totals` stays each transcript's own, so summing it across sessions counts
-every request once. Each session also names its Claude subagents in
+every request once. Each session also names its Claude and Codex subagents in
 `subagents` and sums itself with them in `totals_with_subagents`: the total to
 show for one session. Without subagents the list is empty and the two totals
 are equal. Subagents remain sessions of their own in the export.
@@ -444,7 +472,7 @@ A consumer joins by agent and native session ID only, never directory or time.
 Whole-session spending does not establish spending caused by a conversation
 pattern. Incomplete source coverage remains visible in the export and exit code.
 
-## Ohjaa handoff
+## Wrapper handoff
 
 The programs exchange files; neither links or launches the other.
 
@@ -456,41 +484,42 @@ vessa report --input /path/to/session.jsonl --input /tmp/ohjaa.json --output /tm
 ```
 
 `receipt` requires exactly one native session and emits `agent-usage.v1`.
-A Claude session's receipt includes its subagents and names them in
-`limitations`. Ohjaa attaches it to an explicit wrapper session. Exported work, handover,
-knowledge and outcome evidence appears alongside the usage only when
-that explicit native-session association exists. Directory and time-window
-guesses never establish identity. Unmatched wrapper records are reported.
-Receipt totals and native totals are not added together.
+A Claude or Codex session's receipt includes its subagents and names them in
+`limitations`. The wrapper attaches it to an explicit wrapper session.
+Exported work, handover, knowledge and outcome evidence appears alongside the
+usage only when that explicit native-session association exists. Directory
+and time-window guesses never establish identity. Unmatched wrapper records
+are reported. Receipt totals and native totals are not added together.
 
 With `ohjaa run --usage-file /fresh/receipt.json`, a launched wrapper can write
-the receipt to `OHJAA_USAGE_FILE` before exiting and ohjaa imports it at leaving.
+the receipt to `OHJAA_USAGE_FILE` before exiting, to be imported at leaving.
 Native agents do not emit this normalized receipt by themselves.
 
 ## UI and privacy
 
-The report starts with the known spending subtotal, priced/unpriced record
-coverage and sessions ranked by that subtotal. Rankings are not complete cost
+The report's header and the `report:` line it prints count sessions as
+`stats` does, with their subagents apart. It starts with the known spending
+subtotal, priced/unpriced record coverage and sessions ranked by that subtotal. Rankings are not complete cost
 comparisons when prices are missing. Expand a command to see separate token
 categories, tool/failure/edit counts and the source location; full evidence is
 still available below it. No prompt bodies are retained to label commands.
 
-The report also explains the existing Ohjaa/Toimija workflow for reducing
-repeated discovery: launch once through `ohjaa run` (which invokes Toimija),
-use the delivered workset and handover, and refresh only when facts become
-stale. Use the receipt/export commands above to associate usage with an
-explicit Ohjaa session. These remain optional file exchanges, not runtime
-dependencies. Wrapper association does not prove savings: compare similar
-tasks, model/rates, token categories and verified outcomes before making that
-claim. Do not remove safety instructions or validation to lower usage.
+The report also explains how to reduce repeated discovery: launch once through
+a wrapper, use the working set and handover it delivers, and refresh only when
+facts become stale. Use the receipt/export commands above to associate usage
+with an explicit wrapper session. These remain optional file exchanges, not
+runtime dependencies. Wrapper association does not prove savings: compare
+similar tasks, model/rates, token categories and verified outcomes before
+making that claim. Do not remove safety instructions or validation to lower
+usage.
 
 The HTML is a local, standalone report. Native links, disclosure controls and
 browser Find provide navigation without a server or frontend dependencies.
 All displayed source content is escaped, executable content is blocked by CSP, and
 new reports use mode 0600 on Unix. Existing report paths are never overwritten.
-Reports contain private usage and optional linked ohjaa context: files under `reports/` are
-ignored by Git. JSON printed to stdout inherits the destination permissions
-you choose. No knowledge becomes current automatically.
+Reports contain private usage and optional linked wrapper context: files under
+`reports/` are ignored by Git. JSON printed to stdout inherits the destination
+permissions you choose. No knowledge becomes current automatically.
 
 The in-memory reader is suitable for selected sessions. For very large archives,
 select narrower input directories, or list headers alone with

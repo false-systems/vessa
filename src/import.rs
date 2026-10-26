@@ -9,6 +9,7 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
     // ponytail: selected transcripts are held in memory; stream compact
     // summaries if archive size makes this one-shot reader too expensive.
     let (mut report, wrappers) = sessions(paths, parse_file);
+    roots(&mut report.sessions.iter_mut().collect::<Vec<_>>(), true);
     deduplicate(&mut report);
     link(&mut report, wrappers);
     Ok(report)
@@ -20,6 +21,8 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
 /// so the sessions carry no usage and no limitations.
 pub fn headers(paths: &[PathBuf]) -> Result<Report> {
     let (mut report, wrappers) = sessions(paths, header_file);
+    // Headers carry no limitations: a looping lineage stands alone silently.
+    roots(&mut report.sessions.iter_mut().collect::<Vec<_>>(), false);
     report.schema = "vessa-session-headers.v1".into();
     link(&mut report, wrappers);
     Ok(report)
@@ -57,6 +60,7 @@ fn sessions(paths: &[PathBuf], parse: fn(&Path) -> Result<Parsed>) -> (Report, V
             old.work.extend(session.work);
             old.limitations.extend(session.limitations);
             old.launched.extend(session.launched);
+            old.synthetic.extend(session.synthetic);
         } else {
             merged.insert(key, session);
         }
@@ -66,6 +70,44 @@ fn sessions(paths: &[PathBuf], parse: fn(&Path) -> Result<Parsed>) -> (Report, V
     // original session when both sources are available.
     report.sessions.sort_by_key(|s| s.parent.is_some());
     (report, wrappers)
+}
+
+/// Points each Codex subagent at the session at its root, through the
+/// threads read. Newer Codex names the root itself (`session_id`); older
+/// Codex names only the thread a subagent came from, which may be another
+/// subagent. A lineage that loops has no root: each thread in it stands
+/// alone, and with `limit` says so in its limitations.
+fn roots(sessions: &mut [&mut Session], limit: bool) {
+    let links: HashMap<String, String> = sessions
+        .iter()
+        .filter(|s| s.agent == "codex")
+        .filter_map(|s| Some((s.id.clone(), s.root.clone()?)))
+        .collect();
+    for session in sessions.iter_mut().filter(|s| s.agent == "codex") {
+        let Some(mut root) = session.root.take() else {
+            continue;
+        };
+        // The threads walked so far; reaching one again is a loop.
+        let mut path = vec![session.id.clone()];
+        let looped = loop {
+            let Some(next) = links.get(&root) else {
+                break false;
+            };
+            let again = path.contains(&root);
+            path.push(std::mem::replace(&mut root, next.clone()));
+            if again {
+                break true;
+            }
+        };
+        if !looped {
+            session.root = Some(root);
+        } else if limit {
+            session.limitations.push(format!(
+                "Codex subagent lineage loops ({}); its root session is unknown, so it counts as a session of its own",
+                path.join(" -> ")
+            ));
+        }
+    }
 }
 
 /// Every file under `paths` that may be a transcript or an ohjaa export, in
@@ -197,9 +239,10 @@ fn deduplicate(report: &mut Report) {
         session.usage = usage;
         session.counted_elsewhere = elsewhere.len();
         // A subagent whose every request its session already holds has had
-        // its usage counted there; it is not unknown.
+        // its usage counted there; it is not unknown. Nor is a session whose
+        // only answers were synthetic: what it recorded holds no usage.
         let counted = session.subagent_of().is_some() && session.counted_elsewhere > 0;
-        if session.usage.is_empty() && !counted {
+        if session.usage.is_empty() && !counted && session.synthetic.is_empty() {
             session
                 .limitations
                 .push("No usage records found; consumption is unknown, not zero".into());
@@ -230,7 +273,7 @@ fn link(report: &mut Report, wrappers: Vec<Value>) {
             .any(|s| s.ohjaa.iter().any(|w| w["id"] == wrapper["id"]))
         {
             report.warnings.push(format!(
-                "ohjaa session {} has no explicit matching native transcript",
+                "wrapper session {} has no explicit matching native transcript",
                 wrapper["id"].as_str().unwrap_or("unknown")
             ));
         }
@@ -341,7 +384,7 @@ fn parse_export(path: &Path) -> Result<Parsed> {
         .as_array()
         .context("missing unreadable coverage")?
         .iter()
-        .map(|id| format!("ohjaa could not read session {id}"))
+        .map(|id| format!("the wrapper export could not read session {id}"))
         .collect();
     Ok(Parsed::Wrappers(records, warnings))
 }
@@ -408,6 +451,10 @@ struct Opening {
     cwd: String,
     originator: Option<String>,
     subagent_source: bool,
+    /// The session a Codex thread belongs to: `session_id`, which a child
+    /// thread shares with the session at its root; else, as older Codex
+    /// writes, the thread it was spawned or forked from.
+    root: Option<String>,
 }
 
 impl Opening {
@@ -424,6 +471,11 @@ impl Opening {
             cwd: string(meta, "cwd"),
             originator: meta["originator"].as_str().map(str::to_owned),
             subagent_source: !meta["source"]["subagent"].is_null(),
+            root: meta["session_id"]
+                .as_str()
+                .or_else(|| meta["parent_thread_id"].as_str())
+                .or_else(|| meta["forked_from_id"].as_str())
+                .map(str::to_owned),
         }
     }
 }
@@ -524,6 +576,12 @@ impl Scan {
         if agent == "codex" && opening.subagent_source && parent.is_none() {
             parent = Some("parent identity unavailable (subagent source)".into());
         }
+        // A Codex subagent, or any thread another spawned, counts to the
+        // session at its root, as a Claude subagent counts to its session.
+        let root = (agent == "codex" && opening.subagent_source)
+            .then_some(opening.root)
+            .flatten()
+            .filter(|root| *root != id);
         // Current Claude Code transcripts open with records (`last-prompt`,
         // `mode`) that carry the session id but no time and no folder: those
         // come from the first record that has them.
@@ -545,6 +603,8 @@ impl Scan {
             work: Vec::new(),
             launched: Vec::new(),
             counted_elsewhere: 0,
+            synthetic: Default::default(),
+            root,
             subagent: (agent == "claude" && self.sidechain)
                 || (agent == "codex" && opening.subagent_source),
         })
@@ -691,6 +751,21 @@ fn claude(v: &Value, line: usize, s: &mut Session) -> Result<()> {
             .or_else(|| m["id"].as_str())
             .map(str::to_owned)
             .unwrap_or_else(|| fallback(s, line));
+        // Claude Code writes a `<synthetic>` message itself, with zero usage,
+        // where a request failed or was refused; it may carry that request's
+        // id. It is no request, so it is counted apart, never as usage that
+        // conflicts with the request. One that reports usage is read as usage.
+        let counts = [
+            entry.input_tokens,
+            entry.output_tokens,
+            entry.cache_read_tokens,
+            entry.cache_write_tokens,
+        ];
+        if entry.model == "<synthetic>" && counts.iter().all(|n| n.unwrap_or(0) == 0) {
+            let own = m["id"].as_str().map_or_else(|| id.clone(), str::to_owned);
+            s.synthetic.insert(own);
+            return Ok(());
+        }
         // Claude writes a line per content block of one request. Equal usage
         // deduplicates, a growing output count keeps the largest snapshot, and
         // conflicting snapshots are reported instead of summed (see `read`).
@@ -918,7 +993,7 @@ pub fn messages(
     for file in transcripts(paths, &mut warnings) {
         if file.extension().is_some_and(|s| s == "json") {
             warnings.push(format!(
-                "{}: an ohjaa export holds no messages; not read",
+                "{}: a wrapper export holds no messages; not read",
                 file.display()
             ));
             continue;
@@ -928,6 +1003,11 @@ pub fn messages(
             Err(error) => warnings.push(format!("{}: {error:#}", file.display())),
         }
     }
+    // As the other readers do, so `--session` selects the same subagents.
+    roots(
+        &mut headers.iter_mut().map(|(_, s)| s).collect::<Vec<_>>(),
+        false,
+    );
     let chosen = |s: &Session| {
         select.agent.as_ref().is_none_or(|a| *a == s.agent)
             && select

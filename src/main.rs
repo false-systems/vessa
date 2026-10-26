@@ -11,11 +11,16 @@ use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser, Clone)]
-#[command(about = "Local agent usage and spending evidence. Estimates are not bills.")]
+#[command(
+    name = "vessa",
+    version,
+    about = "Local agent usage and spending evidence. Estimates are not bills."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
-    /// Native JSONL file/directory or ohjaa JSON export; repeatable.
+    /// Native JSONL file/directory, or a wrapper's ohjaa-sessions.v1 JSON
+    /// export; repeatable.
     #[arg(long, global = true)]
     input: Vec<PathBuf>,
     #[arg(long, global = true)]
@@ -57,7 +62,8 @@ enum Cmd {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Emit one agent-usage.v1 snapshot for `ohjaa usage import`.
+    /// Emit one session's usage as an agent-usage.v1 receipt, for a wrapper
+    /// to import.
     Receipt,
     /// Current recorded usage for exactly one explicitly selected session.
     Status,
@@ -103,12 +109,20 @@ fn run(cli: Cli) -> Result<i32> {
 
 fn run_once(cli: Cli) -> Result<i32> {
     if matches!(cli.command, Cmd::ClaudeStatusline) {
+        // A status line that fails goes blank: input that cannot be read is
+        // said on stderr, and every field shows as unknown.
         use std::io::Read;
         let mut bytes = Vec::new();
-        std::io::stdin().take(1_048_577).read_to_end(&mut bytes)?;
-        ensure!(bytes.len() <= 1_048_576, "statusline input exceeds 1 MiB");
-        let input = serde_json::from_slice(&bytes)?;
-        println!("{}", metrics::claude_statusline(&input)?);
+        let input = match std::io::stdin().take(1_048_577).read_to_end(&mut bytes) {
+            Err(error) => Err(format!("cannot read stdin: {error}")),
+            Ok(_) if bytes.len() > 1_048_576 => Err("exceeds 1 MiB".into()),
+            Ok(_) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
+        }
+        .unwrap_or_else(|error| {
+            eprintln!("vessa: status-line input unreadable ({error}); every field is unknown");
+            serde_json::Value::Null
+        });
+        println!("{}", metrics::claude_statusline(&input));
         return Ok(0);
     }
     if let Cmd::Messages { since } = &cli.command {
@@ -132,18 +146,19 @@ fn run_once(cli: Cli) -> Result<i32> {
         !headers || cli.rates.is_none(),
         "--rates cannot be used with sessions --headers, which reads no usage to price"
     );
-    let paths = inputs(&cli)?;
+    let (paths, not_installed) = inputs(&cli)?;
     let mut report = if headers {
         import::headers(&paths)?
     } else {
         import::read(&paths)?
     };
+    report.warnings.extend(not_installed);
     if let Some(agent) = cli.agent {
         supported(&agent)?;
         report.sessions.retain(|s| s.agent == agent);
     }
     if let Some(id) = cli.session {
-        // A Claude session's subagents are part of it: its id selects them too.
+        // A session's subagents are part of it: its id selects them too.
         report
             .sessions
             .retain(|s| s.id == id || s.subagent_of() == Some(id.as_str()));
@@ -201,7 +216,8 @@ fn run_once(cli: Cli) -> Result<i32> {
                 )?;
             } else {
                 let n = family.subagents.len();
-                let scope = if s.agent != "claude" {
+                // pi writes no subagents.
+                let scope = if s.agent == "pi" {
                     String::new()
                 } else if let Some(parent) = s.subagent_of() {
                     format!(" · subagent of {parent}")
@@ -262,17 +278,17 @@ fn run_once(cli: Cli) -> Result<i32> {
                 println!("Calendar usage · UTC · selected local records · estimates are not bills");
                 for b in buckets {
                     println!(
-                        "{} {} · {} sessions{} · known estimate subtotal={} · {} unpriced records",
+                        "{} {} · {}{} · known estimate subtotal={} · {}",
                         b.period,
                         b.agent,
-                        b.sessions,
+                        render::many(b.sessions, "session"),
                         if b.subagents > 0 {
-                            format!(" · {} subagents", b.subagents)
+                            format!(" · {}", render::many(b.subagents, "subagent"))
                         } else {
                             String::new()
                         },
                         render::dollars(Some(b.known_estimated_usd_micros)),
-                        b.unpriced_records
+                        render::many(b.unpriced_records, "unpriced record")
                     );
                     for e in b.entries {
                         println!("  {}", render::usage_line(&e));
@@ -297,9 +313,9 @@ fn run_once(cli: Cli) -> Result<i32> {
             })?;
             file.write_all(html.as_bytes())?;
             println!(
-                "report: {} · {} sessions",
+                "report: {} · {}",
                 output.display(),
-                report.sessions.len()
+                model::counted(&report.sessions)
             );
         }
         Cmd::Receipt => {
@@ -383,6 +399,7 @@ fn run_once(cli: Cli) -> Result<i32> {
                 value["totals"] = serde_json::to_value(totals)?;
                 value["subagents"] = serde_json::to_value(subagents)?;
                 value["totals_with_subagents"] = serde_json::to_value(with_subagents)?;
+                value["synthetic_records"] = session.synthetic.len().into();
                 value["insights"] = serde_json::to_value(work::summarize(session)?)?;
             }
             json(&export)?;
@@ -390,10 +407,14 @@ fn run_once(cli: Cli) -> Result<i32> {
         Cmd::Sessions { .. } => {
             for s in &report.sessions {
                 println!(
-                    "{} {} · {} usage records · {}",
+                    "{} {} · {} usage records{} · {}",
                     s.agent,
                     s.id,
                     s.usage.len(),
+                    match s.synthetic.len() {
+                        0 => String::new(),
+                        n => format!(" · {n} synthetic records (no usage)"),
+                    },
                     s.cwd
                 );
             }
@@ -443,16 +464,38 @@ fn run_once(cli: Cli) -> Result<i32> {
 }
 
 /// The paths given with `--input`, else the agents' own session folders.
-fn inputs(cli: &Cli) -> Result<Vec<PathBuf>> {
+/// A default folder that does not exist is an agent not installed here, or
+/// one that has kept no session yet: nothing to read, and no gap. A path
+/// given with `--input` that does not exist is a warning, and so is the
+/// folder of an agent asked for with `--agent`: what was asked for cannot
+/// be read. Returns the paths to read, and those warnings.
+fn inputs(cli: &Cli) -> Result<(Vec<PathBuf>, Vec<String>)> {
     if !cli.input.is_empty() {
-        return Ok(cli.input.clone());
+        return Ok((cli.input.clone(), Vec::new()));
     }
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable; pass --input")?);
-    Ok(vec![
-        home.join(".claude/projects"),
-        home.join(".codex/sessions"),
-        home.join(".pi/agent/sessions"),
-    ])
+    let mut paths = Vec::new();
+    let mut warnings = Vec::new();
+    for (agent, folder) in [
+        ("claude", ".claude/projects"),
+        ("codex", ".codex/sessions"),
+        ("pi", ".pi/agent/sessions"),
+    ] {
+        let path = home.join(folder);
+        // Any other failure to look, such as a folder that cannot be read,
+        // is still read and reported.
+        let missing = std::fs::symlink_metadata(&path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if !missing {
+            paths.push(path);
+        } else if cli.agent.as_deref() == Some(agent) {
+            warnings.push(format!(
+                "{agent}: not installed here ({} does not exist), so its sessions cannot be read",
+                path.display()
+            ));
+        }
+    }
+    Ok((paths, warnings))
 }
 
 fn supported(agent: &str) -> Result<()> {
@@ -616,7 +659,7 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
         session: cli.session.clone(),
         since: from.map(since).transpose()?,
     };
-    let paths = inputs(cli)?;
+    let (paths, not_installed) = inputs(cli)?;
     // The default sources hold every agent Vessa reads; one it knows of and
     // does not read, written in the window, leaves the list partial.
     let gap = if cli.input.is_empty() && cli.agent.is_none() {
@@ -636,6 +679,7 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
         match import::messages(&paths, &select, &mut |m| doc.message(m)) {
             Ok(mut listing) => {
                 listing.coverage.gaps.extend(gaps);
+                listing.warnings.extend(not_installed);
                 doc.finish(&listing)?;
                 listing
             }
@@ -647,6 +691,7 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
     } else {
         let mut listing = import::messages(&paths, &select, &mut |m| plain(&mut out, m))?;
         listing.coverage.gaps.extend(gaps);
+        listing.warnings.extend(not_installed);
         let c = &listing.coverage;
         let rules = c
             .excluded
@@ -656,9 +701,12 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
             .join(", ");
         writeln!(
             out,
-            "{} messages from {} sessions ({} headless) · {} other user turns not listed{} · {} Codex subagent transcripts not read",
-            c.human,
-            listing.sessions.iter().filter(|s| s.messages > 0).count(),
+            "{} from {} ({} headless) · {} other user turns not listed{} · {} Codex subagent transcripts not read",
+            render::many(c.human, "message"),
+            render::many(
+                listing.sessions.iter().filter(|s| s.messages > 0).count(),
+                "session"
+            ),
             listing.sessions.iter().filter(|s| s.headless).count(),
             c.excluded.values().sum::<usize>(),
             if rules.is_empty() { String::new() } else { format!(": {rules}") },

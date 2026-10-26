@@ -60,6 +60,16 @@ pub struct Session {
     /// Requests this transcript holds that an earlier session counted.
     #[serde(skip)]
     pub counted_elsewhere: usize,
+    /// Claude Code's own `<synthetic>` messages, by id: written with zero
+    /// usage for an API error or a refusal, they are no model request.
+    /// Known records with no usage, so neither usage nor a conflict; the
+    /// usage export counts them as `synthetic_records`.
+    #[serde(skip)]
+    pub synthetic: std::collections::BTreeSet<String>,
+    /// The session a Codex subagent counts to: the root its `session_meta`
+    /// names. None for every other session.
+    #[serde(skip)]
+    pub root: Option<String>,
     /// Another agent started it: a Claude sidechain, or a Codex session
     /// whose `source` names a subagent. Its user turns are that agent's
     /// prompts, not a person's.
@@ -96,10 +106,14 @@ impl Session {
         }
     }
 
-    /// The session a Claude subagent belongs to. Claude Code writes each
-    /// subagent to its own transcript under the parent's session id; Vessa
-    /// names it `parent/agentId`.
+    /// The session a subagent belongs to. Claude Code writes each subagent
+    /// to its own transcript under the parent's session id; Vessa names it
+    /// `parent/agentId`. A Codex subagent, or another thread a session
+    /// spawned, keeps its own thread id and names its root session.
     pub fn subagent_of(&self) -> Option<&str> {
+        if self.agent == "codex" {
+            return self.root.as_deref();
+        }
         let parent = self.parent.as_deref()?;
         (self.agent == "claude" && self.id.strip_prefix(parent)?.starts_with('/')).then_some(parent)
     }
@@ -168,6 +182,30 @@ pub fn families(sessions: &[Session]) -> Vec<Family<'_>> {
         }
     }
     families
+}
+
+/// How many sessions these transcripts are, and how many of them are
+/// subagents, counted with their session as `stats` counts them: a subagent
+/// read without its session's transcript still counts that session.
+pub fn count(sessions: &[Session]) -> (usize, usize) {
+    let roots: std::collections::BTreeSet<_> = sessions
+        .iter()
+        .map(|s| (s.agent.as_str(), s.subagent_of().unwrap_or(&s.id)))
+        .collect();
+    let subagents = sessions
+        .iter()
+        .filter(|s| s.subagent_of().is_some())
+        .count();
+    (roots.len(), subagents)
+}
+
+/// "N sessions", with " · M subagents" when there are any.
+pub fn counted(sessions: &[Session]) -> String {
+    use crate::render::many;
+    match count(sessions) {
+        (n, 0) => many(n, "session"),
+        (n, m) => format!("{} · {}", many(n, "session"), many(m, "subagent")),
+    }
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -250,7 +288,12 @@ pub fn receipt(family: &Family) -> Result<serde_json::Value> {
     if !family.subagents.is_empty() {
         let n = family.subagents.len();
         limitations.push(format!(
-            "Entries include {n} Claude {} of this session, each read from its own transcript: {}",
+            "Entries include {n} {} {} of this session, each read from its own transcript: {}",
+            if session.agent == "codex" {
+                "Codex"
+            } else {
+                "Claude"
+            },
             if n == 1 { "subagent" } else { "subagents" },
             family
                 .subagents

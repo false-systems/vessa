@@ -154,7 +154,57 @@ fn report_explains_partial_spending_and_command_evidence() {
     assert!(html.contains("Savings are not measured here."));
     assert!(html.contains("Do not nest a second wrapper."));
     assert!(!html.contains("Please run the existing local checks"));
+    // Vessa describes itself, naming no other tool, in what it renders. The
+    // wrapper export it imports is named by its schema alone.
+    let help = [
+        &["--help"][..],
+        &["report", "--help"],
+        &["receipt", "--help"],
+    ]
+    .iter()
+    .map(|args| String::from_utf8(cli(args).stdout).unwrap())
+    .collect::<String>();
+    // Given a wrapper's export, with a linked, an unmatched and an unreadable
+    // session, the report and what is said on stderr still name no tool.
+    let receipt = value(cli(&["receipt", "--input", "examples/pi.jsonl"]));
+    let export = temp("wrapper-export.json");
+    let wrappers = serde_json::json!({"schema":"ohjaa-sessions.v1","sessions":[{"id":"oh-fixture","agent":"pi","usage":[receipt]},{"id":"oh-unmatched","agent":"pi","usage":[]}],"unreadable":["oh-gone"]});
+    std::fs::write(&export, serde_json::to_vec(&wrappers).unwrap()).unwrap();
+    let linked = temp("linked.html");
+    let out = cli(&[
+        "report",
+        "--input",
+        "examples/pi.jsonl",
+        "--input",
+        export.to_str().unwrap(),
+        "--output",
+        linked.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    let linked_html = std::fs::read_to_string(&linked).unwrap();
+    assert!(linked_html
+        .contains("wrapper session oh-unmatched has no explicit matching native transcript"));
+    assert!(linked_html.contains("the wrapper export could not read session"));
+    assert!(linked_html.contains("Explicitly linked wrapper session records"));
+    let said = String::from_utf8(out.stderr).unwrap();
+    let messages = cli(&["messages", "--input", export.to_str().unwrap()]);
+    let said_messages = String::from_utf8(messages.stderr).unwrap();
+    assert!(said_messages.contains("a wrapper export holds no messages"));
+    for (what, text) in [
+        ("report", &html),
+        ("help", &help),
+        ("linked report", &linked_html),
+        ("stderr", &said),
+        ("messages stderr", &said_messages),
+    ] {
+        let text = text.to_lowercase().replace("ohjaa-sessions.v1", "");
+        for name in ["ohjaa", "toimija", "seula"] {
+            assert!(!text.contains(name), "{what} names {name}: {text}");
+        }
+    }
     std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(linked).unwrap();
+    std::fs::remove_file(export).unwrap();
 }
 
 #[test]
@@ -366,6 +416,18 @@ fn calendar_statistics_use_usage_time_utc_and_preserve_unknowns() {
 }
 
 #[test]
+fn version_says_which_vessa_this_is() {
+    for flag in ["--version", "-V"] {
+        let out = cli(&[flag]);
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            format!("vessa {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+}
+
+#[test]
 fn live_status_requires_identity_and_watch_is_bounded_when_requested() {
     assert!(!cli(&["status"]).status.success());
     let v = value(cli(&["status", "--input", "examples/pi.jsonl", "--json"]));
@@ -421,6 +483,85 @@ fn native_claude_status_uses_estimate_not_limits_and_sanitizes_terminal_text() {
         .contains("Last API call: input 120 · output 35 · cache read 400 · cache write unknown"));
     assert!(!text.contains('\u{1b}'));
     assert!(!text.contains("88") && !text.contains("limit"));
+}
+
+/// `vessa claude-statusline` given `input` on stdin.
+fn statusline(input: Vec<u8>) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vessa"))
+        .arg("claude-statusline")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // It may stop reading early, as it does past 1 MiB.
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let out = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    out
+}
+
+#[test]
+fn claude_statusline_always_prints_and_says_unknown_for_what_it_cannot_read() {
+    let realistic = serde_json::json!({"hook_event_name":"Status","session_id":"0a1b2c3d-demo","transcript_path":"/demo/t.jsonl","cwd":"/demo/widget","model":{"id":"demo-model-id","display_name":"Demo"},"workspace":{"current_dir":"/demo/widget","project_dir":"/demo/widget"},"version":"2.0.0","output_style":{"name":"default"},"cost":{"total_cost_usd":0.01234,"total_duration_ms":45000,"total_api_duration_ms":2300,"total_lines_added":156,"total_lines_removed":23},"context_window":{"current_usage":{"input_tokens":8500,"output_tokens":1200,"cache_creation_input_tokens":5000,"cache_read_input_tokens":2000}}});
+    let out = statusline(realistic.to_string().into_bytes());
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "session estimate $0.01 · billed unknown · Demo · 0a1b2c3d-demo\n\
+         Last API call: input 8500 · output 1200 · cache read 2000 · cache write 5000\n"
+    );
+
+    // Each field it cannot read is unknown, and the others still show.
+    let broken = serde_json::json!({"session_id":"demo\u{7}\u{1b}]0;title","model":{"display_name":17,"id":"id\u{1b}[2J"},"cost":{"total_cost_usd":-1.5},"context_window":{"current_usage":{"input_tokens":"8500","output_tokens":-3,"cache_read_input_tokens":2.5,"cache_creation_input_tokens":40}}});
+    let out = statusline(broken.to_string().into_bytes());
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "session estimate unknown · billed unknown · id[2J · demo]0;title\n\
+         Last API call: input unknown · output unknown · cache read unknown · cache write 40\n"
+    );
+    // Negative zero is zero; an amount no session could cost is unknown.
+    for (cost, shown) in [
+        ("-0.0", "$0.00"),
+        ("0", "$0.00"),
+        ("18446744073709.5", "$18446744073709.50"),
+        ("1e14", "unknown"),
+        ("1e308", "unknown"),
+    ] {
+        let input = format!(r#"{{"session_id":"demo","cost":{{"total_cost_usd":{cost}}}}}"#);
+        let out = statusline(input.into_bytes());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            text.starts_with(&format!("session estimate {shown} · ")),
+            "{cost}: {text}"
+        );
+    }
+    for input in [
+        br#"{"cost":{"total_cost_usd":"4.45"}}"#.to_vec(),
+        br#"{"session_id":null,"model":null,"cost":7,"context_window":[]}"#.to_vec(),
+        b"[1, 2]".to_vec(),
+        b"null".to_vec(),
+        b"not json".to_vec(),
+        Vec::new(),
+        vec![0xff, 0xfe],
+        vec![b' '; 1_048_577],
+    ] {
+        let out = statusline(input.clone());
+        let label = String::from_utf8_lossy(&input[..input.len().min(40)]).into_owned();
+        assert_eq!(out.status.code(), Some(0), "{label}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "session estimate unknown · billed unknown · unknown model · unknown session\n\
+             Last API call: input unknown · output unknown · cache read unknown · cache write unknown\n",
+            "{label}"
+        );
+    }
 }
 
 #[test]
@@ -498,6 +639,24 @@ fn command_change_and_waste_windows_preserve_totals_unknowns_and_privacy() {
     assert!(report.contains("$0 to $0.003000"));
     assert!(!report.contains("PRIVATE"));
     std::fs::remove_file(html).unwrap();
+}
+
+#[test]
+fn command_elapsed_time_is_said_in_plain_words() {
+    // The first command has usage; the later two have none, so no end.
+    let out = cli(&["status", "--input", "examples/claude.jsonl"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("Command 1 · line 1 · usage records=1 tools=0 recorded changes=0 · elapsed 60s (to its last usage record)\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "Command 2 · line 4 · usage records=0 tools=0 recorded changes=0 · elapsed unknown\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("unknowns") && !text.contains("observed elapsed"));
 }
 
 #[test]
@@ -665,6 +824,115 @@ fn disagreeing_claude_snapshots_are_flagged_not_merged() {
 }
 
 #[test]
+fn claude_synthetic_records_are_counted_as_no_usage_not_conflicts() {
+    // Claude Code writes its own `<synthetic>` assistant message, with zero
+    // usage, for an API error or a refusal. One may carry the request id of
+    // the real request it replaces; another has an id of its own.
+    let mut rows: Vec<Value> = include_str!("../examples/claude.jsonl")
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    let synthetic = |uuid: &str, request: Option<&str>, message: &str| {
+        let mut row = serde_json::json!({"type":"assistant","uuid":uuid,"sessionId":"claude-demo","timestamp":"2026-09-30T09:01:30Z","isApiErrorMessage":true,"message":{"id":message,"role":"assistant","model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"Synthetic API error."}],"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}});
+        if let Some(request) = request {
+            row["requestId"] = request.into();
+        }
+        row
+    };
+    rows.insert(
+        3,
+        synthetic(
+            "s1",
+            Some("req_011CdemoRequest1"),
+            "00000000-0000-4000-8000-000000000001",
+        ),
+    );
+    rows.push(synthetic(
+        "s2",
+        None,
+        "00000000-0000-4000-8000-000000000002",
+    ));
+    let path = temp("synthetic.jsonl");
+    write_lines(&path, &rows);
+    // A copy of the session elsewhere holds the same records: counted once.
+    let copy = temp("synthetic-copy.jsonl");
+    write_lines(&copy, &rows);
+    for inputs in [vec![&path], vec![&path, &copy]] {
+        let mut args = vec!["usage", "--json"];
+        for input in &inputs {
+            args.extend(["--input", input.to_str().unwrap()]);
+        }
+        let output = cli(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let session = &v["sessions"][0];
+        assert!(session["limitations"].as_array().unwrap().is_empty());
+        // Known, and no usage: not a record, not a model, not a price gap.
+        assert_eq!(session["synthetic_records"], 2);
+        assert_eq!(session["usage"].as_array().unwrap().len(), 1);
+        assert_eq!(session["totals"].as_array().unwrap().len(), 1);
+        assert_eq!(session["totals"][0]["model"], "demo-model");
+        assert_eq!(session["totals"][0]["input_tokens"], 1200);
+    }
+    let text = cli(&["sessions", "--input", path.to_str().unwrap()]);
+    assert!(String::from_utf8_lossy(&text.stdout)
+        .contains(" · 1 usage records · 2 synthetic records (no usage) · "));
+    // A session without them says nothing of them in its text line, and 0.
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        "examples/claude.jsonl",
+        "--json",
+    ]));
+    assert_eq!(v["sessions"][0]["synthetic_records"], 0);
+
+    // A session whose only answer was synthetic recorded no usage, and says
+    // so: it is not unknown, as one with no records at all is.
+    let only = temp("synthetic-only.jsonl");
+    write_lines(
+        &only,
+        &[
+            rows[0].clone(),
+            synthetic("s3", None, "00000000-0000-4000-8000-000000000003"),
+        ],
+    );
+    let output = cli(&["usage", "--input", only.to_str().unwrap(), "--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(v["sessions"][0]["synthetic_records"], 1);
+    assert!(v["sessions"][0]["usage"].as_array().unwrap().is_empty());
+    assert!(v["sessions"][0]["limitations"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    write_lines(&only, &rows[..1]);
+    assert_eq!(
+        cli(&["usage", "--input", only.to_str().unwrap()])
+            .status
+            .code(),
+        Some(4)
+    );
+    std::fs::remove_file(only).unwrap();
+
+    // One that reports usage is no known non-usage record: it is read as
+    // usage, and here conflicts with the request it shares an id with.
+    rows[3]["message"]["usage"]["output_tokens"] = 5.into();
+    write_lines(&path, &rows);
+    let output = cli(&["usage", "--input", path.to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(v["sessions"][0]["synthetic_records"], 1);
+    assert!(v["sessions"][0]["limitations"][0]
+        .as_str()
+        .unwrap()
+        .contains("model demo-model then <synthetic>"));
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(copy).unwrap();
+}
+
+#[test]
 fn codex_provider_is_inferred_and_unused_rate_cards_warn() {
     // Without model_provider, a Codex transcript is still OpenAI's.
     let path = temp("codex-no-provider.jsonl");
@@ -757,6 +1025,68 @@ fn full_runs_are_partial_only_for_real_gaps() {
         "{stderr}"
     );
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn an_agent_that_is_not_installed_is_no_gap() {
+    // Only Claude Code is installed: no `~/.codex`, no `~/.pi`.
+    let home = temp("claude-only-home");
+    std::fs::create_dir_all(home.join(".claude/projects/demo")).unwrap();
+    std::fs::copy(
+        "examples/claude.jsonl",
+        home.join(".claude/projects/demo/claude-demo.jsonl"),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vessa"))
+            .args(args)
+            .env("HOME", &home)
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["usage", "--json"][..],
+        &["sessions", "--headers", "--json"],
+        &["messages", "--json"],
+    ] {
+        let out = run(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {stderr}");
+        assert!(stderr.is_empty(), "{args:?}: {stderr}");
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(v["warnings"].as_array().unwrap().is_empty(), "{args:?}");
+    }
+    // A path asked for by name that is not there is a gap.
+    let missing = home.join(".pi/agent/sessions");
+    let out = run(&["usage", "--json", "--input", missing.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["warnings"][0]
+        .as_str()
+        .unwrap()
+        .starts_with(missing.to_str().unwrap()));
+    // So is an agent asked for by name that is not installed: what was asked
+    // for cannot be read.
+    for args in [
+        &["usage", "--json", "--agent", "codex"][..],
+        &["stats", "--json", "--agent", "codex"],
+        &["sessions", "--headers", "--json", "--agent", "codex"],
+        &["messages", "--json", "--agent", "codex"],
+    ] {
+        let out = run(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(4), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("vessa: codex: not installed"),
+            "{args:?}: {stderr}"
+        );
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["warnings"].as_array().unwrap().len(), 1, "{args:?}");
+    }
+    let out = run(&["usage", "--json", "--agent", "claude"]);
+    assert_eq!(out.status.code(), Some(0));
+    std::fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
@@ -1156,6 +1486,36 @@ fn usage_export_links_subagents_to_their_session_additively() {
 }
 
 #[test]
+fn a_report_counts_sessions_with_their_subagents_apart() {
+    let dir = claude_family("family-report", true);
+    let report = |inputs: &[&str]| {
+        let html = temp("count.html");
+        let mut args = vec!["report", "--output", html.to_str().unwrap()];
+        for input in inputs {
+            args.extend(["--input", input]);
+        }
+        let out = cli(&args);
+        assert!(out.status.success());
+        let page = std::fs::read_to_string(&html).unwrap();
+        std::fs::remove_file(html).unwrap();
+        (String::from_utf8(out.stdout).unwrap(), page)
+    };
+    // Two transcripts: one session and its subagent.
+    let (said, page) = report(&[dir.to_str().unwrap()]);
+    assert!(said.ends_with(" · 1 session · 1 subagent\n"), "{said}");
+    assert!(page.contains("<p>1 session · 1 subagent · 0 source warnings</p>"));
+    // A subagent read alone still counts its session, as stats count it.
+    let (said, page) = report(&["examples/claude-subagent.jsonl"]);
+    assert!(said.ends_with(" · 1 session · 1 subagent\n"), "{said}");
+    assert!(page.contains("<p>1 session · 1 subagent · 0 source warnings</p>"));
+    // Without subagents, sessions alone.
+    let (said, page) = report(&["examples/codex.jsonl", "examples/pi.jsonl"]);
+    assert!(said.ends_with(" · 2 sessions\n"), "{said}");
+    assert!(page.contains("<p>2 sessions · 0 source warnings</p>"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn stats_count_top_level_sessions_and_subagents_separately() {
     let dir = claude_family("family-stats", true);
     for input in [dir.to_str().unwrap(), "examples"] {
@@ -1178,10 +1538,7 @@ fn stats_count_top_level_sessions_and_subagents_separately() {
     ]);
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(
-        text.contains("claude · 1 sessions · 1 subagents ·"),
-        "{text}"
-    );
+    assert!(text.contains("claude · 1 session · 1 subagent ·"), "{text}");
     // A subagent read without its main transcript still counts one session.
     let v = value(cli(&[
         "stats",
@@ -1322,6 +1679,227 @@ fn a_subagent_whose_requests_are_all_counted_with_its_session_is_not_unknown() {
         text.contains("no requests of its own; 1 counted in another transcript"),
         "{text}"
     );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// A Codex thread's transcript: its `session_meta` with `meta` added, the
+/// model, and one cumulative token counter with its last request.
+fn codex_thread(dir: &std::path::Path, id: &str, meta: Value, total: [u64; 3], last: [u64; 3]) {
+    let mut payload = serde_json::json!({"id":id,"timestamp":"2026-09-30T10:00:00Z","cwd":"/demo/widget","originator":"codex-tui","model_provider":"openai","source":"cli"});
+    payload
+        .as_object_mut()
+        .unwrap()
+        .extend(meta.as_object().unwrap().clone());
+    let usage = |[input, cached, output]: [u64; 3]| serde_json::json!({"input_tokens":input,"cached_input_tokens":cached,"output_tokens":output});
+    write_lines(
+        &dir.join(format!("{id}.jsonl")),
+        &[
+            serde_json::json!({"timestamp":"2026-09-30T10:00:00Z","type":"session_meta","payload":payload}),
+            serde_json::json!({"type":"turn_context","payload":{"model":"demo-codex"}}),
+            serde_json::json!({"timestamp":"2026-09-30T10:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":usage(total),"last_token_usage":usage(last)}}}),
+        ],
+    );
+}
+
+#[test]
+fn codex_subagents_count_with_their_root_session() {
+    // A Codex session, a subagent it spawned, and a review thread that
+    // subagent spawned. Each child names its root session in `session_id`.
+    let dir = temp("codex-family");
+    std::fs::create_dir_all(&dir).unwrap();
+    codex_thread(
+        &dir,
+        "codex-root",
+        serde_json::json!({"session_id":"codex-root","thread_source":"user"}),
+        [1000, 400, 100],
+        [1000, 400, 100],
+    );
+    let child = |dir: &std::path::Path| {
+        codex_thread(
+            dir,
+            "codex-child",
+            serde_json::json!({"session_id":"codex-root","parent_thread_id":"codex-root","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"codex-root","depth":1}}},"forked_from_id":"codex-root"}),
+            [5000, 1000, 300],
+            [200, 50, 20],
+        );
+        codex_thread(
+            dir,
+            "codex-review",
+            serde_json::json!({"session_id":"codex-root","parent_thread_id":"codex-child","thread_source":"guardian_review","source":{"subagent":{"other":"guardian"}}}),
+            [3000, 0, 100],
+            [100, 0, 10],
+        );
+    };
+    child(&dir);
+    let input = dir.to_str().unwrap();
+
+    // Statistics count one session, with its two subagents apart.
+    let v = value(cli(&["stats", "--input", input, "--json"]));
+    assert_eq!(v["buckets"].as_array().unwrap().len(), 1);
+    assert_eq!(v["buckets"][0]["sessions"], 1);
+    assert_eq!(v["buckets"][0]["subagents"], 2);
+    assert_eq!(v["buckets"][0]["entries"][0]["output_tokens"], 130);
+    let text = String::from_utf8(cli(&["stats", "--input", input]).stdout).unwrap();
+    assert!(text.contains("codex · 1 session · 2 subagents ·"), "{text}");
+
+    // The export keeps each thread's own totals and their parents, and
+    // names the subagents with the session they count to.
+    let v = value(cli(&["usage", "--input", input, "--json"]));
+    let session = |id: &str| {
+        v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    let root = session("codex-root");
+    assert_eq!(
+        root["subagents"],
+        serde_json::json!(["codex-child", "codex-review"])
+    );
+    assert_eq!(root["totals"][0]["input_tokens"], 600);
+    let with = &root["totals_with_subagents"][0];
+    assert_eq!(
+        (
+            &with["input_tokens"],
+            &with["cache_read_tokens"],
+            &with["output_tokens"]
+        ),
+        (&850.into(), &450.into(), &130.into())
+    );
+    assert_eq!(session("codex-child")["parent"], "codex-root");
+    assert_eq!(session("codex-child")["totals"][0]["input_tokens"], 150);
+    assert_eq!(session("codex-child")["subagents"], serde_json::json!([]));
+    assert_eq!(
+        session("codex-review")["parent"],
+        "parent identity unavailable (subagent source)"
+    );
+
+    // A receipt and status for the session total it with its subagents.
+    let v = value(cli(&[
+        "receipt",
+        "--input",
+        input,
+        "--session",
+        "codex-root",
+    ]));
+    assert_eq!(v["session_id"], "codex-root");
+    assert_eq!(v["entries"][0]["output_tokens"], 130);
+    assert!(v["limitations"].as_array().unwrap().iter().any(|l| {
+        l.as_str()
+            .unwrap()
+            .contains("2 Codex subagents of this session")
+    }));
+    let text =
+        String::from_utf8(cli(&["status", "--input", input, "--session", "codex-root"]).stdout)
+            .unwrap();
+    assert!(text.contains("· totals include 2 subagents"), "{text}");
+    // A subagent asked for by its own id is shown alone, and says whose.
+    let out = cli(&["status", "--input", input, "--session", "codex-review"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("· subagent of codex-root"), "{text}");
+    // Selecting the session selects its subagents, which messages count.
+    let (v, _) = messages(&["--input", input, "--session", "codex-root"]);
+    assert_eq!(v["coverage"]["subagent_transcripts"], 2);
+
+    // Its subagents alone are not the session, but still count one.
+    let alone = temp("codex-subagents-alone");
+    std::fs::create_dir_all(&alone).unwrap();
+    child(&alone);
+    let input = alone.to_str().unwrap();
+    let out = cli(&["receipt", "--input", input, "--session", "codex-root"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only 2 of its subagents"));
+    let v = value(cli(&["stats", "--input", input, "--json"]));
+    assert_eq!(v["buckets"][0]["sessions"], 1);
+    assert_eq!(v["buckets"][0]["subagents"], 2);
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(alone).unwrap();
+}
+
+#[test]
+fn an_older_codex_subagents_subagent_still_counts_to_the_root() {
+    // Older Codex writes no `session_id`: a thread names only the thread it
+    // came from. R spawned C, and C spawned the review G.
+    let dir = temp("codex-older-family");
+    std::fs::create_dir_all(&dir).unwrap();
+    codex_thread(&dir, "R", serde_json::json!({}), [100, 0, 10], [100, 0, 10]);
+    codex_thread(
+        &dir,
+        "C",
+        serde_json::json!({"parent_thread_id":"R","source":{"subagent":{"other":"worker"}}}),
+        [500, 0, 50],
+        [100, 0, 10],
+    );
+    codex_thread(
+        &dir,
+        "G",
+        serde_json::json!({"parent_thread_id":"C","source":{"subagent":{"other":"guardian"}}}),
+        [300, 0, 40],
+        [100, 0, 10],
+    );
+    let input = dir.to_str().unwrap();
+    let v = value(cli(&["stats", "--input", input, "--json"]));
+    assert_eq!(v["buckets"][0]["sessions"], 1);
+    assert_eq!(v["buckets"][0]["subagents"], 2);
+    let v = value(cli(&["receipt", "--input", input, "--session", "R"]));
+    assert_eq!(v["entries"][0]["output_tokens"], 30);
+    assert!(v["limitations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|l| l.as_str().unwrap().contains(
+            "2 Codex subagents of this session, each read from its own transcript: C, G"
+        )));
+    let v = value(cli(&["usage", "--input", input, "--json"]));
+    let root = v["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "R")
+        .unwrap();
+    assert_eq!(root["subagents"], serde_json::json!(["C", "G"]));
+    // Selecting the root selects both, in headers too.
+    let v = value(cli(&[
+        "sessions",
+        "--headers",
+        "--json",
+        "--input",
+        input,
+        "--session",
+        "R",
+    ]));
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 3);
+
+    // A lineage that loops names no root: each thread in it stands alone,
+    // and says so.
+    std::fs::remove_file(dir.join("R.jsonl")).unwrap();
+    codex_thread(
+        &dir,
+        "C",
+        serde_json::json!({"parent_thread_id":"G","source":{"subagent":{"other":"worker"}}}),
+        [500, 0, 50],
+        [100, 0, 10],
+    );
+    let output = cli(&["usage", "--input", input, "--json"]);
+    assert_eq!(output.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    for s in v["sessions"].as_array().unwrap() {
+        assert!(
+            s["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l.as_str().unwrap().contains("lineage loops")),
+            "{s}"
+        );
+    }
+    let v: Value =
+        serde_json::from_slice(&cli(&["stats", "--input", input, "--json"]).stdout).unwrap();
+    assert_eq!(v["buckets"][0]["sessions"], 2);
+    assert_eq!(v["buckets"][0]["subagents"], 0);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -1803,7 +2381,7 @@ fn messages_lists_what_a_person_typed_with_the_reply_it_follows() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.starts_with("claude claude-demo · 2026-09-30T09:00:00Z · /demo/widget · "));
     assert!(text.contains("\n  Please run the existing local checks before finishing.\n"));
-    assert!(text.contains("3 messages from 1 sessions (0 headless)"));
+    assert!(text.contains("3 messages from 1 session (0 headless)"));
 }
 
 #[test]
