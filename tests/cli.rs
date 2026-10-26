@@ -564,6 +564,24 @@ fn command_change_and_waste_windows_preserve_totals_unknowns_and_privacy() {
 }
 
 #[test]
+fn command_elapsed_time_is_said_in_plain_words() {
+    // The first command has usage; the later two have none, so no end.
+    let out = cli(&["status", "--input", "examples/claude.jsonl"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("Command 1 · line 1 · usage records=1 tools=0 recorded changes=0 · elapsed 60s (to its last usage record)\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "Command 2 · line 4 · usage records=0 tools=0 recorded changes=0 · elapsed unknown\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("unknowns") && !text.contains("observed elapsed"));
+}
+
+#[test]
 fn native_tool_results_are_not_user_commands_and_unknown_results_are_not_changes() {
     let input = temp("claude-work.jsonl");
     let mut rows: Vec<Value> = include_str!("../examples/claude.jsonl")
