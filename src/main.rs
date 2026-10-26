@@ -39,7 +39,13 @@ struct Cli {
 #[derive(Subcommand, Clone)]
 enum Cmd {
     /// List native sessions and source coverage.
-    Sessions,
+    Sessions {
+        /// Each session's header alone (identity, lineage, start, folder,
+        /// origin), read from a transcript's opening records only. With
+        /// --json: vessa-session-headers.v1.
+        #[arg(long)]
+        headers: bool,
+    },
     /// Token categories and estimates by session/provider/model.
     Usage {
         /// Sum deduplicated usage across native sessions for each agent/model.
@@ -102,6 +108,14 @@ fn run_once(cli: Cli) -> Result<i32> {
             "status requires --input or --session; never guesses the latest session"
         );
     }
+    let headers = matches!(cli.command, Cmd::Sessions { headers: true });
+    // Checked here, not by clap: `--rates` is global, and given before the
+    // subcommand a clap conflict does not see it. Headers read no usage to
+    // price, and rate-card notices would read as source warnings.
+    ensure!(
+        !headers || cli.rates.is_none(),
+        "--rates cannot be used with sessions --headers, which reads no usage to price"
+    );
     let paths = if cli.input.is_empty() {
         let home =
             PathBuf::from(std::env::var_os("HOME").context("HOME unavailable; pass --input")?);
@@ -113,7 +127,11 @@ fn run_once(cli: Cli) -> Result<i32> {
     } else {
         cli.input
     };
-    let mut report = import::read(&paths)?;
+    let mut report = if headers {
+        import::headers(&paths)?
+    } else {
+        import::read(&paths)?
+    };
     if let Some(agent) = cli.agent {
         ensure!(
             ["claude", "codex", "pi"].contains(&agent.as_str()),
@@ -316,7 +334,26 @@ fn run_once(cli: Cli) -> Result<i32> {
                 }
             }
         }
-        Cmd::Sessions | Cmd::Usage { .. } if cli.json => {
+        Cmd::Sessions { headers: true } => {
+            if cli.json {
+                json(&serde_json::json!({
+                    "schema": report.schema,
+                    "sessions": report.sessions.iter().map(model::Session::header).collect::<Vec<_>>(),
+                    "warnings": report.warnings,
+                }))?;
+            } else {
+                for s in &report.sessions {
+                    println!(
+                        "{} {} · started {} · {}",
+                        s.agent,
+                        s.id,
+                        s.started_at.as_deref().unwrap_or("unknown"),
+                        s.cwd
+                    );
+                }
+            }
+        }
+        Cmd::Sessions { .. } | Cmd::Usage { .. } if cli.json => {
             let mut export = serde_json::to_value(&report)?;
             // `totals` stays each transcript's own; a session's subagents are
             // named and summed with it in additive fields.
@@ -347,7 +384,7 @@ fn run_once(cli: Cli) -> Result<i32> {
             }
             json(&export)?;
         }
-        Cmd::Sessions => {
+        Cmd::Sessions { .. } => {
             for s in &report.sessions {
                 println!(
                     "{} {} · {} usage records · {}",
@@ -376,6 +413,19 @@ fn run_once(cli: Cli) -> Result<i32> {
         for limitation in &s.limitations {
             eprintln!("vessa: {} {}: {limitation}", s.agent, s.id);
         }
+    }
+    if incomplete && headers {
+        // Headers read no usage, so they carry no limitations: only a
+        // transcript that could not be read leaves the list partial.
+        eprintln!(
+            "vessa: partial session list (exit 4): {source_warnings} source {}",
+            if source_warnings == 1 {
+                "warning"
+            } else {
+                "warnings"
+            },
+        );
+        return Ok(4);
     }
     if incomplete {
         // Last, so a long list of limitations still ends with why exit is 4.

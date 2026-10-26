@@ -62,7 +62,35 @@ pub struct Session {
     pub counted_elsewhere: usize,
 }
 
+/// What a session's transcript says about itself, without its usage: one
+/// entry of `vessa-session-headers.v1`. Each field is the session's field of
+/// the same name in `vessa-usage.v1`.
+#[derive(Debug, Serialize)]
+pub struct Header<'a> {
+    pub agent: &'a str,
+    pub id: &'a str,
+    pub parent: Option<&'a str>,
+    pub started_at: Option<&'a str>,
+    pub cwd: &'a str,
+    pub source: &'a str,
+    pub entrypoint: Option<&'a str>,
+    pub originator: Option<&'a str>,
+}
+
 impl Session {
+    pub fn header(&self) -> Header<'_> {
+        Header {
+            agent: &self.agent,
+            id: &self.id,
+            parent: self.parent.as_deref(),
+            started_at: self.started_at.as_deref(),
+            cwd: &self.cwd,
+            source: &self.source,
+            entrypoint: self.entrypoint.as_deref(),
+            originator: self.originator.as_deref(),
+        }
+    }
+
     /// The session a Claude subagent belongs to. Claude Code writes each
     /// subagent to its own transcript under the parent's session id; Vessa
     /// names it `parent/agentId`.
