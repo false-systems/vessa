@@ -146,12 +146,13 @@ fn run_once(cli: Cli) -> Result<i32> {
         !headers || cli.rates.is_none(),
         "--rates cannot be used with sessions --headers, which reads no usage to price"
     );
-    let paths = inputs(&cli)?;
+    let (paths, not_installed) = inputs(&cli)?;
     let mut report = if headers {
         import::headers(&paths)?
     } else {
         import::read(&paths)?
     };
+    report.warnings.extend(not_installed);
     if let Some(agent) = cli.agent {
         supported(&agent)?;
         report.sessions.retain(|s| s.agent == agent);
@@ -465,27 +466,36 @@ fn run_once(cli: Cli) -> Result<i32> {
 /// The paths given with `--input`, else the agents' own session folders.
 /// A default folder that does not exist is an agent not installed here, or
 /// one that has kept no session yet: nothing to read, and no gap. A path
-/// given with `--input` that does not exist is a warning.
-fn inputs(cli: &Cli) -> Result<Vec<PathBuf>> {
+/// given with `--input` that does not exist is a warning, and so is the
+/// folder of an agent asked for with `--agent`: what was asked for cannot
+/// be read. Returns the paths to read, and those warnings.
+fn inputs(cli: &Cli) -> Result<(Vec<PathBuf>, Vec<String>)> {
     if !cli.input.is_empty() {
-        return Ok(cli.input.clone());
+        return Ok((cli.input.clone(), Vec::new()));
     }
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable; pass --input")?);
-    Ok([
-        home.join(".claude/projects"),
-        home.join(".codex/sessions"),
-        home.join(".pi/agent/sessions"),
-    ]
-    .into_iter()
-    // Any other failure to look, such as a folder that cannot be read, is
-    // still read and reported.
-    .filter(|path| {
-        std::fs::symlink_metadata(path).map_or_else(
-            |error| error.kind() != std::io::ErrorKind::NotFound,
-            |_| true,
-        )
-    })
-    .collect())
+    let mut paths = Vec::new();
+    let mut warnings = Vec::new();
+    for (agent, folder) in [
+        ("claude", ".claude/projects"),
+        ("codex", ".codex/sessions"),
+        ("pi", ".pi/agent/sessions"),
+    ] {
+        let path = home.join(folder);
+        // Any other failure to look, such as a folder that cannot be read,
+        // is still read and reported.
+        let missing = std::fs::symlink_metadata(&path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        if !missing {
+            paths.push(path);
+        } else if cli.agent.as_deref() == Some(agent) {
+            warnings.push(format!(
+                "{agent}: not installed here ({} does not exist), so its sessions cannot be read",
+                path.display()
+            ));
+        }
+    }
+    Ok((paths, warnings))
 }
 
 fn supported(agent: &str) -> Result<()> {
@@ -649,7 +659,7 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
         session: cli.session.clone(),
         since: from.map(since).transpose()?,
     };
-    let paths = inputs(cli)?;
+    let (paths, not_installed) = inputs(cli)?;
     // The default sources hold every agent Vessa reads; one it knows of and
     // does not read, written in the window, leaves the list partial.
     let gap = if cli.input.is_empty() && cli.agent.is_none() {
@@ -669,6 +679,7 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
         match import::messages(&paths, &select, &mut |m| doc.message(m)) {
             Ok(mut listing) => {
                 listing.coverage.gaps.extend(gaps);
+                listing.warnings.extend(not_installed);
                 doc.finish(&listing)?;
                 listing
             }
@@ -680,6 +691,7 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
     } else {
         let mut listing = import::messages(&paths, &select, &mut |m| plain(&mut out, m))?;
         listing.coverage.gaps.extend(gaps);
+        listing.warnings.extend(not_installed);
         let c = &listing.coverage;
         let rules = c
             .excluded

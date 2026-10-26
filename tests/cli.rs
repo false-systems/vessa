@@ -1050,6 +1050,26 @@ fn an_agent_that_is_not_installed_is_no_gap() {
         .as_str()
         .unwrap()
         .starts_with(missing.to_str().unwrap()));
+    // So is an agent asked for by name that is not installed: what was asked
+    // for cannot be read.
+    for args in [
+        &["usage", "--json", "--agent", "codex"][..],
+        &["stats", "--json", "--agent", "codex"],
+        &["sessions", "--headers", "--json", "--agent", "codex"],
+        &["messages", "--json", "--agent", "codex"],
+    ] {
+        let out = run(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(4), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("vessa: codex: not installed"),
+            "{args:?}: {stderr}"
+        );
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["warnings"].as_array().unwrap().len(), 1, "{args:?}");
+    }
+    let out = run(&["usage", "--json", "--agent", "claude"]);
+    assert_eq!(out.status.code(), Some(0));
     std::fs::remove_dir_all(home).unwrap();
 }
 

@@ -21,7 +21,9 @@ cargo run -- messages --since 7d --json
 
 `--input` is repeatable and accepts a file or directory. Without it, Vessa
 reads `~/.claude/projects`, `~/.codex/sessions`, and `~/.pi/agent/sessions`.
-One of these that does not exist is an agent not installed here, and no gap.
+One of these that does not exist is an agent not installed here, and no gap,
+unless `--agent` asks for that agent: then it is a warning (`codex: not
+installed here`), since what was asked for cannot be read.
 Directories discover native `.jsonl` transcripts; select a wrapper's
 `ohjaa-sessions.v1` `.json` export as an explicit file, so agent metadata JSON
 is not mistaken for a usage source.
