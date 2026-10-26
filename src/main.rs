@@ -383,6 +383,7 @@ fn run_once(cli: Cli) -> Result<i32> {
                 value["totals"] = serde_json::to_value(totals)?;
                 value["subagents"] = serde_json::to_value(subagents)?;
                 value["totals_with_subagents"] = serde_json::to_value(with_subagents)?;
+                value["synthetic_records"] = session.synthetic.len().into();
                 value["insights"] = serde_json::to_value(work::summarize(session)?)?;
             }
             json(&export)?;
@@ -390,10 +391,14 @@ fn run_once(cli: Cli) -> Result<i32> {
         Cmd::Sessions { .. } => {
             for s in &report.sessions {
                 println!(
-                    "{} {} · {} usage records · {}",
+                    "{} {} · {} usage records{} · {}",
                     s.agent,
                     s.id,
                     s.usage.len(),
+                    match s.synthetic.len() {
+                        0 => String::new(),
+                        n => format!(" · {n} synthetic records (no usage)"),
+                    },
                     s.cwd
                 );
             }

@@ -665,6 +665,86 @@ fn disagreeing_claude_snapshots_are_flagged_not_merged() {
 }
 
 #[test]
+fn claude_synthetic_records_are_counted_as_no_usage_not_conflicts() {
+    // Claude Code writes its own `<synthetic>` assistant message, with zero
+    // usage, for an API error or a refusal. One may carry the request id of
+    // the real request it replaces; another has an id of its own.
+    let mut rows: Vec<Value> = include_str!("../examples/claude.jsonl")
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    let synthetic = |uuid: &str, request: Option<&str>, message: &str| {
+        let mut row = serde_json::json!({"type":"assistant","uuid":uuid,"sessionId":"claude-demo","timestamp":"2026-09-30T09:01:30Z","isApiErrorMessage":true,"message":{"id":message,"role":"assistant","model":"<synthetic>","stop_reason":"stop_sequence","content":[{"type":"text","text":"Synthetic API error."}],"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}});
+        if let Some(request) = request {
+            row["requestId"] = request.into();
+        }
+        row
+    };
+    rows.insert(
+        3,
+        synthetic(
+            "s1",
+            Some("req_011CdemoRequest1"),
+            "00000000-0000-4000-8000-000000000001",
+        ),
+    );
+    rows.push(synthetic(
+        "s2",
+        None,
+        "00000000-0000-4000-8000-000000000002",
+    ));
+    let path = temp("synthetic.jsonl");
+    write_lines(&path, &rows);
+    // A copy of the session elsewhere holds the same records: counted once.
+    let copy = temp("synthetic-copy.jsonl");
+    write_lines(&copy, &rows);
+    for inputs in [vec![&path], vec![&path, &copy]] {
+        let mut args = vec!["usage", "--json"];
+        for input in &inputs {
+            args.extend(["--input", input.to_str().unwrap()]);
+        }
+        let output = cli(&args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let session = &v["sessions"][0];
+        assert!(session["limitations"].as_array().unwrap().is_empty());
+        // Known, and no usage: not a record, not a model, not a price gap.
+        assert_eq!(session["synthetic_records"], 2);
+        assert_eq!(session["usage"].as_array().unwrap().len(), 1);
+        assert_eq!(session["totals"].as_array().unwrap().len(), 1);
+        assert_eq!(session["totals"][0]["model"], "demo-model");
+        assert_eq!(session["totals"][0]["input_tokens"], 1200);
+    }
+    let text = cli(&["sessions", "--input", path.to_str().unwrap()]);
+    assert!(String::from_utf8_lossy(&text.stdout)
+        .contains(" · 1 usage records · 2 synthetic records (no usage) · "));
+    // A session without them says nothing of them in its text line, and 0.
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        "examples/claude.jsonl",
+        "--json",
+    ]));
+    assert_eq!(v["sessions"][0]["synthetic_records"], 0);
+
+    // One that reports usage is no known non-usage record: it is read as
+    // usage, and here conflicts with the request it shares an id with.
+    rows[3]["message"]["usage"]["output_tokens"] = 5.into();
+    write_lines(&path, &rows);
+    let output = cli(&["usage", "--input", path.to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(v["sessions"][0]["synthetic_records"], 1);
+    assert!(v["sessions"][0]["limitations"][0]
+        .as_str()
+        .unwrap()
+        .contains("model demo-model then <synthetic>"));
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_file(copy).unwrap();
+}
+
+#[test]
 fn codex_provider_is_inferred_and_unused_rate_cards_warn() {
     // Without model_provider, a Codex transcript is still OpenAI's.
     let path = temp("codex-no-provider.jsonl");

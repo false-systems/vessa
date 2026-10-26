@@ -60,6 +60,12 @@ pub struct Session {
     /// Requests this transcript holds that an earlier session counted.
     #[serde(skip)]
     pub counted_elsewhere: usize,
+    /// Claude Code's own `<synthetic>` messages, by id: written with zero
+    /// usage for an API error or a refusal, they are no model request.
+    /// Known records with no usage, so neither usage nor a conflict; the
+    /// usage export counts them as `synthetic_records`.
+    #[serde(skip)]
+    pub synthetic: std::collections::BTreeSet<String>,
     /// Another agent started it: a Claude sidechain, or a Codex session
     /// whose `source` names a subagent. Its user turns are that agent's
     /// prompts, not a person's.

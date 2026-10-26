@@ -219,6 +219,11 @@ never adds a reasoning subcategory a second time.
   the response ids: `msg_01…` or a `req_…` request id is `anthropic`,
   `msg_bdrk_…` is `bedrock`, `msg_vrtx_…` is `vertex`, and anything else is
   `unknown`. A model name proves nothing about who served the request.
+  Claude Code also writes `<synthetic>` assistant messages of its own, with
+  zero usage, where a request failed or was refused, some under that
+  request's id. They are no request: each session counts them once in
+  `synthetic_records`, and they are neither usage nor a conflict. One that
+  reports usage is read as usage.
 * Codex: differences cumulative input/output/cache counters, ignores repeated
   totals, and associates deltas with the current model context. Counter resets
   are flagged, with a new baseline, rather than inventing negative usage. The
@@ -428,6 +433,8 @@ Each session also exports `totals`, calculated by Vessa from deduplicated
 records and grouped by provider/model. Consumers can display these beside work
 evidence without implementing accounting. Unknown categories remain null; older
 exports without this additive field still contain the original usage records.
+`synthetic_records` counts a Claude session's `<synthetic>` messages, read and
+known to hold no usage; it is 0 for other agents.
 
 `totals` stays each transcript's own, so summing it across sessions counts
 every request once. Each session also names its Claude subagents in

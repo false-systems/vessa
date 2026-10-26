@@ -57,6 +57,7 @@ fn sessions(paths: &[PathBuf], parse: fn(&Path) -> Result<Parsed>) -> (Report, V
             old.work.extend(session.work);
             old.limitations.extend(session.limitations);
             old.launched.extend(session.launched);
+            old.synthetic.extend(session.synthetic);
         } else {
             merged.insert(key, session);
         }
@@ -545,6 +546,7 @@ impl Scan {
             work: Vec::new(),
             launched: Vec::new(),
             counted_elsewhere: 0,
+            synthetic: Default::default(),
             subagent: (agent == "claude" && self.sidechain)
                 || (agent == "codex" && opening.subagent_source),
         })
@@ -691,6 +693,21 @@ fn claude(v: &Value, line: usize, s: &mut Session) -> Result<()> {
             .or_else(|| m["id"].as_str())
             .map(str::to_owned)
             .unwrap_or_else(|| fallback(s, line));
+        // Claude Code writes a `<synthetic>` message itself, with zero usage,
+        // where a request failed or was refused; it may carry that request's
+        // id. It is no request, so it is counted apart, never as usage that
+        // conflicts with the request. One that reports usage is read as usage.
+        let counts = [
+            entry.input_tokens,
+            entry.output_tokens,
+            entry.cache_read_tokens,
+            entry.cache_write_tokens,
+        ];
+        if entry.model == "<synthetic>" && counts.iter().all(|n| n.unwrap_or(0) == 0) {
+            let own = m["id"].as_str().map_or_else(|| id.clone(), str::to_owned);
+            s.synthetic.insert(own);
+            return Ok(());
+        }
         // Claude writes a line per content block of one request. Equal usage
         // deduplicates, a growing output count keeps the largest snapshot, and
         // conflicting snapshots are reported instead of summed (see `read`).
