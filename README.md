@@ -181,7 +181,10 @@ This reads Claude's native session identity and running estimate on stdin and
 prints the session estimate first, separately from unknown actual billing.
 A second line shows the last API call's input, output, cache-read and
 cache-write tokens. These are not cumulative session counts; absent categories
-remain unknown, including before the first response or after compaction. It makes
+remain unknown, including before the first response or after compaction. A
+field it cannot read, such as a negative cost or a count sent as text, shows
+as unknown, and input that is not JSON shows every field unknown: the status
+line always prints and exits 0, so it never goes blank. It makes
 no model calls and displays no budgets, quotas or limits. Preserve any existing
 status-line customization when installing. See the official
 [Claude status-line contract](https://code.claude.com/docs/en/statusline).

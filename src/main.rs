@@ -103,12 +103,20 @@ fn run(cli: Cli) -> Result<i32> {
 
 fn run_once(cli: Cli) -> Result<i32> {
     if matches!(cli.command, Cmd::ClaudeStatusline) {
+        // A status line that fails goes blank: input that cannot be read is
+        // said on stderr, and every field shows as unknown.
         use std::io::Read;
         let mut bytes = Vec::new();
-        std::io::stdin().take(1_048_577).read_to_end(&mut bytes)?;
-        ensure!(bytes.len() <= 1_048_576, "statusline input exceeds 1 MiB");
-        let input = serde_json::from_slice(&bytes)?;
-        println!("{}", metrics::claude_statusline(&input)?);
+        let input = match std::io::stdin().take(1_048_577).read_to_end(&mut bytes) {
+            Err(error) => Err(format!("cannot read stdin: {error}")),
+            Ok(_) if bytes.len() > 1_048_576 => Err("exceeds 1 MiB".into()),
+            Ok(_) => serde_json::from_slice(&bytes).map_err(|error| error.to_string()),
+        }
+        .unwrap_or_else(|error| {
+            eprintln!("vessa: status-line input unreadable ({error}); every field is unknown");
+            serde_json::Value::Null
+        });
+        println!("{}", metrics::claude_statusline(&input));
         return Ok(0);
     }
     if let Cmd::Messages { since } = &cli.command {

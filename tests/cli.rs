@@ -423,6 +423,69 @@ fn native_claude_status_uses_estimate_not_limits_and_sanitizes_terminal_text() {
     assert!(!text.contains("88") && !text.contains("limit"));
 }
 
+/// `vessa claude-statusline` given `input` on stdin.
+fn statusline(input: Vec<u8>) -> Output {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_vessa"))
+        .arg("claude-statusline")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // It may stop reading early, as it does past 1 MiB.
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let out = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    out
+}
+
+#[test]
+fn claude_statusline_always_prints_and_says_unknown_for_what_it_cannot_read() {
+    let realistic = serde_json::json!({"hook_event_name":"Status","session_id":"0a1b2c3d-demo","transcript_path":"/demo/t.jsonl","cwd":"/demo/widget","model":{"id":"demo-model-id","display_name":"Demo"},"workspace":{"current_dir":"/demo/widget","project_dir":"/demo/widget"},"version":"2.0.0","output_style":{"name":"default"},"cost":{"total_cost_usd":0.01234,"total_duration_ms":45000,"total_api_duration_ms":2300,"total_lines_added":156,"total_lines_removed":23},"context_window":{"current_usage":{"input_tokens":8500,"output_tokens":1200,"cache_creation_input_tokens":5000,"cache_read_input_tokens":2000}}});
+    let out = statusline(realistic.to_string().into_bytes());
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "session estimate $0.01 · billed unknown · Demo · 0a1b2c3d-demo\n\
+         Last API call: input 8500 · output 1200 · cache read 2000 · cache write 5000\n"
+    );
+
+    // Each field it cannot read is unknown, and the others still show.
+    let broken = serde_json::json!({"session_id":"demo\u{7}\u{1b}]0;title","model":{"display_name":17,"id":"id\u{1b}[2J"},"cost":{"total_cost_usd":-1.5},"context_window":{"current_usage":{"input_tokens":"8500","output_tokens":-3,"cache_read_input_tokens":2.5,"cache_creation_input_tokens":40}}});
+    let out = statusline(broken.to_string().into_bytes());
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "session estimate unknown · billed unknown · id[2J · demo]0;title\n\
+         Last API call: input unknown · output unknown · cache read unknown · cache write 40\n"
+    );
+    for input in [
+        br#"{"cost":{"total_cost_usd":"4.45"}}"#.to_vec(),
+        br#"{"session_id":null,"model":null,"cost":7,"context_window":[]}"#.to_vec(),
+        b"[1, 2]".to_vec(),
+        b"null".to_vec(),
+        b"not json".to_vec(),
+        Vec::new(),
+        vec![0xff, 0xfe],
+        vec![b' '; 1_048_577],
+    ] {
+        let out = statusline(input.clone());
+        let label = String::from_utf8_lossy(&input[..input.len().min(40)]).into_owned();
+        assert_eq!(out.status.code(), Some(0), "{label}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "session estimate unknown · billed unknown · unknown model · unknown session\n\
+             Last API call: input unknown · output unknown · cache read unknown · cache write unknown\n",
+            "{label}"
+        );
+    }
+}
+
 #[test]
 fn native_directory_metadata_is_not_misread_as_an_export() {
     let dir = temp("native-dir");

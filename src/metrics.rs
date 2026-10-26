@@ -88,21 +88,12 @@ pub fn history(report: &Report, period: Period) -> Result<Vec<Bucket>> {
 
 /// Claude supplies this session's identity and estimate directly; no guessing
 /// from recent files, and no token/rate conversion into subscription charges.
-pub fn claude_statusline(input: &serde_json::Value) -> Result<String> {
-    let id = input["session_id"]
-        .as_str()
-        .context("statusline input missing session_id")?;
-    let model = input["model"]["display_name"]
-        .as_str()
-        .or_else(|| input["model"]["id"].as_str())
-        .unwrap_or("unknown model");
-    let estimate = match input["cost"]["total_cost_usd"].as_f64() {
-        Some(cost) => {
-            anyhow::ensure!(cost.is_finite() && cost >= 0.0, "invalid session cost");
-            format!("${cost:.2}")
-        }
-        None => "unknown".into(),
-    };
+///
+/// A status line that fails goes blank, so this always renders: a field it
+/// cannot read (absent, of another type, a negative cost or count) is
+/// `unknown`, and the others still show. Input that is not JSON at all is
+/// given here as null, and every field is unknown.
+pub fn claude_statusline(input: &serde_json::Value) -> String {
     // Source strings are untrusted terminal content; never emit control codes.
     let clean = |s: &str| {
         s.chars()
@@ -110,24 +101,28 @@ pub fn claude_statusline(input: &serde_json::Value) -> Result<String> {
             .take(100)
             .collect::<String>()
     };
+    let id = input["session_id"]
+        .as_str()
+        .map_or_else(|| "unknown session".into(), clean);
+    let model = input["model"]["display_name"]
+        .as_str()
+        .or_else(|| input["model"]["id"].as_str())
+        .map_or_else(|| "unknown model".into(), clean);
+    let estimate = input["cost"]["total_cost_usd"]
+        .as_f64()
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+        .map_or_else(|| "unknown".into(), |cost| format!("${cost:.2}"));
     let usage = &input["context_window"]["current_usage"];
-    let tokens = |key: &str| -> Result<String> {
-        let value = &usage[key];
-        if value.is_null() {
-            return Ok("unknown".into());
-        }
-        Ok(value
+    let tokens = |key: &str| {
+        usage[key]
             .as_u64()
-            .context("invalid status-line token count")?
-            .to_string())
+            .map_or_else(|| "unknown".into(), |n| n.to_string())
     };
-    Ok(format!(
-        "session estimate {estimate} · billed unknown · {} · {}\nLast API call: input {} · output {} · cache read {} · cache write {}",
-        clean(model),
-        clean(id),
-        tokens("input_tokens")?,
-        tokens("output_tokens")?,
-        tokens("cache_read_input_tokens")?,
-        tokens("cache_creation_input_tokens")?,
-    ))
+    format!(
+        "session estimate {estimate} · billed unknown · {model} · {id}\nLast API call: input {} · output {} · cache read {} · cache write {}",
+        tokens("input_tokens"),
+        tokens("output_tokens"),
+        tokens("cache_read_input_tokens"),
+        tokens("cache_creation_input_tokens"),
+    )
 }
