@@ -1195,3 +1195,132 @@ fn stats_count_top_level_sessions_and_subagents_separately() {
     assert_eq!(v["buckets"][0]["subagents"], 0);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn a_session_whose_main_transcript_was_not_read_is_not_found() {
+    // Only the subagent's transcript was read: `--session` for its parent
+    // must not answer with the subagent as if it were the session.
+    let dir = claude_family("family-no-main", true);
+    std::fs::remove_file(dir.join("claude-demo.jsonl")).unwrap();
+    for command in ["receipt", "status"] {
+        let output = cli(&[
+            command,
+            "--input",
+            dir.to_str().unwrap(),
+            "--session",
+            "claude-demo",
+        ]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{command}: {stderr}");
+        assert!(output.stdout.is_empty(), "{command}");
+        assert!(
+            stderr.contains("native session claude-demo not found")
+                && stderr.contains("main transcript was not read")
+                && stderr.contains("1 of its subagents"),
+            "{command}: {stderr}"
+        );
+    }
+    // The subagent is still there by its own id.
+    let v = value(cli(&[
+        "receipt",
+        "--input",
+        dir.to_str().unwrap(),
+        "--session",
+        "claude-demo/subagent-demo",
+    ]));
+    assert_eq!(v["session_id"], "claude-demo/subagent-demo");
+    std::fs::remove_dir_all(dir).unwrap();
+
+    // A main transcript holding a sidechain record is read as a subagent
+    // transcript; its session id alone still does not select it.
+    let path = temp("main-with-sidechain.jsonl");
+    std::fs::write(
+        &path,
+        format!(
+            "{}{}\n",
+            include_str!("../examples/claude.jsonl"),
+            r#"{"type":"user","uuid":"x1","isSidechain":true,"agentId":"stray","sessionId":"claude-demo","timestamp":"2026-09-30T09:04:00Z","message":{"role":"user","content":"Look."}}"#
+        ),
+    )
+    .unwrap();
+    let output = cli(&[
+        "receipt",
+        "--input",
+        path.to_str().unwrap(),
+        "--session",
+        "claude-demo",
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_subagent_named_from_its_file_is_the_one_its_launch_names() {
+    // Without an agentId in its records, a subagent is named from its file,
+    // `agent-<id>.jsonl`: the same id the launch record gives.
+    let dir = claude_family("family-no-agent-id", true);
+    let path = dir.join("claude-demo/subagents/agent-subagent-demo.jsonl");
+    let rows: Vec<Value> = include_str!("../examples/claude-subagent.jsonl")
+        .lines()
+        .map(|s| {
+            let mut row: Value = serde_json::from_str(s).unwrap();
+            row.as_object_mut().unwrap().remove("agentId");
+            row
+        })
+        .collect();
+    write_lines(&path, &rows);
+    let output = cli(&["receipt", "--input", dir.to_str().unwrap()]);
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{v}");
+    assert_eq!(v["entries"][0]["output_tokens"], 300 + 1375);
+    assert!(v["limitations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|l| l.as_str().unwrap().contains("claude-demo/subagent-demo")));
+    assert!(!v.to_string().contains("not read"), "{v}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_subagent_whose_requests_are_all_counted_with_its_session_is_not_unknown() {
+    // Every request in this subagent transcript is one its session already
+    // holds: its usage is counted once, with the session, not unknown.
+    let dir = claude_family("family-all-dedup", true);
+    let mut rows = vec![
+        serde_json::json!({"type":"user","uuid":"s1","isSidechain":true,"agentId":"subagent-demo","sessionId":"claude-demo","timestamp":"2026-09-30T09:00:30Z","message":{"role":"user","content":"Check."}}),
+    ];
+    for line in include_str!("../examples/claude.jsonl")
+        .lines()
+        .skip(1)
+        .take(2)
+    {
+        let mut row: Value = serde_json::from_str(line).unwrap();
+        row["isSidechain"] = true.into();
+        row["agentId"] = "subagent-demo".into();
+        rows.push(row);
+    }
+    write_lines(
+        &dir.join("claude-demo/subagents/agent-subagent-demo.jsonl"),
+        &rows,
+    );
+    let output = cli(&["receipt", "--input", dir.to_str().unwrap()]);
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{v}");
+    assert_eq!(v["entries"][0]["input_tokens"], 1200);
+    assert_eq!(v["entries"][0]["output_tokens"], 300);
+    assert!(!v.to_string().contains("unknown, not zero"), "{v}");
+    let out = cli(&["status", "--input", dir.to_str().unwrap()]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("no requests of its own; 1 counted in another transcript"),
+        "{text}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
