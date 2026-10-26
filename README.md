@@ -16,6 +16,7 @@ cargo run -- status --input /path/to/session.jsonl --watch 5
 cargo run -- stats --period month
 cargo run -- stats --period year
 cargo run -- report --input /path/to/session.jsonl --output /tmp/vessa.html
+cargo run -- messages --since 7d --json
 ```
 
 `--input` is repeatable and accepts a file or directory. Without it, Vessa
@@ -190,8 +191,8 @@ missing account cost is not fabricated from tokens. Use `vessa status` with
 an explicit transcript and dated `--rates` for an external priced view. Pi
 already shows accumulated usage/cost in its footer and `/session`; its cost is
 still an estimate. Native display support differs by agent/account; this is
-not a universal live billing API. Seula owns repeated-correction patterns and
-their calendar counts; Vessa does not call a whole session's spending waste.
+not a universal live billing API. Correction patterns belong to ohjaa intake,
+which reads `messages`; Vessa does not call a whole session's spending waste.
 
 In Codex, use `/statusline` to move spending/token fields before long model and
 session labels; `/status` opens the native usage details. The footer supports
@@ -246,15 +247,111 @@ the output partial (exit 4).
 Keep plan multipliers, discounts and service tiers out of this simple API-rate
 estimate unless the supplied rate actually represents them.
 
-## Seula handoff
+## Messages
 
-Conversation analysis is now a separate product, Seula. Vessa no longer has a
-`patterns` command, retains no native message bodies and does not render chats.
-Each product builds and runs independently. No sibling crate or binary is needed.
+`messages` lists what people typed into their agent sessions, each message
+with the agent reply it follows: the evidence a lesson drafter such as
+`ohjaa intake` reads corrections from. Vessa is the one reader of agent
+conversations. It reads Claude Code, Codex and pi transcripts with the same
+discovery and headers as its other commands, and keeps nothing: no cache, no
+database. Text goes only to stdout, which inherits the permissions you give it.
+
+```sh
+cargo run -- messages --since 7d
+cargo run -- messages --since 2026-10-01 --agent codex --json
+cargo run -- messages --session NATIVE-ID --json
+```
+
+`--since` takes RFC 3339, a UTC date (`YYYY-MM-DD`) or an age (`7d`, `12h`);
+`--agent` and `--session` select as they do elsewhere. With `--json` it emits
+`vessa-messages.v1`, one message a line inside one JSON document, each written
+as soon as its transcript is read, so memory holds one transcript at a time:
+
+```json
+{"schema":"vessa-messages.v1","messages":[
+{"agent":"claude","session":"claude-demo","parent":null,"id":"u2","at":"2026-09-30T09:02:00Z","cwd":"/demo/widget","text":"I already told you to run the local checks.","reply":{"text":"The implementation is ready.","truncated":false,"failed":false,"line":3},"source":"/path/to/claude-demo.jsonl","line":4}
+],
+"sessions":[{"agent":"claude","id":"claude-demo","parent":null,"started_at":"2026-09-30T09:00:00Z","cwd":"/demo/widget","source":"/path/to/claude-demo.jsonl","headless":false,"messages":3}],
+"coverage":{"transcripts":1,"subagent_transcripts":0,"unmodified_transcripts":0,"user_turns":3,"human":3,"excluded":{},"since":null,"earlier":0,"undated":0,"gaps":[],"limitations":[]},
+"warnings":[]}
+```
+
+* A message names its `agent`, native `session`, the `parent` it was forked
+  from (a Codex `forked_from_id`, a pi `parentSession`), its native `id`
+  (Claude and pi write one; Codex does not), `at`, `cwd` (the record's, or
+  the turn's for Codex, else the session's), its `text` without the
+  `<system-reminder>` blocks a harness writes into it, and the `source` and
+  `line` it was read from.
+* `reply` is the agent turn it follows in its transcript: the last 600
+  characters of its text, as ohjaa intake has taken them, with `truncated`
+  and `line`. `failed` says the turn was a Claude API error, a Codex error
+  event or a pi error stop: the message answers a failure, so "try again"
+  there is a retry, not a correction. Null when no agent turn came before.
+* `sessions` lists each transcript read, its copies as one session, with how
+  many messages it gave. `headless` marks one whose every prompt a program
+  sent.
+* `coverage` says what was read and why each other user turn is not listed:
+  `user_turns` is `human` plus every count in `excluded` plus `earlier` and
+  `undated` (with `--since`, a message before it or with no time).
+  Subagent transcripts and, with `--since`, transcripts last written before
+  it are counted and not read. `gaps` names sources Vessa knows of and does
+  not read: opencode keeps its sessions in SQLite
+  (`~/.local/share/opencode/opencode.db`), and Vessa takes no SQLite
+  dependency, so a default run where that file exists is partial.
+* Exit 4 means the list is partial: a source warning, a gap, or a session
+  limitation, each printed to stderr. Transcripts are read in path order, a
+  Codex fork after the session it was forked from; messages in file order.
+
+### What counts as a person's message
+
+Each rule names the user turns it excludes in `coverage.excluded`; a turn is
+counted under the first that applies. The rules are structural: what the
+record says about itself, or a harness text in its exact form, never a
+prefix, so a person who starts a message with "Caveat:", a path or a tag
+name is still a person. They come from Seula's reader, which was the most
+careful, with ohjaa intake's where they are stricter, and a few the archive
+called for:
+
+| Rule | Excludes | Why | From |
+| --- | --- | --- | --- |
+| `tool_result` | A Claude user turn holding any tool result, even with text beside it | Claude Code returns tool output, and answers to its question tool, as user turns | intake; Seula took the text beside a result |
+| `request_record` | A Claude record of another type that carries a user message (`api-request-blob`) | It copies a request's content, without uuid or time | the archive |
+| `subagent` | A sidechain record inside a main transcript | A subagent's prompt | intake |
+| `other_session` | A Claude record naming another session; also a limitation | Not this session's | Seula |
+| `meta` | Claude `isMeta` | Skill expansions, peer messages, safety and system notices | Seula |
+| `compaction` | Claude `isCompactSummary`, or the fixed first sentence of its continuation summary | A summary of earlier turns | Seula, intake |
+| `harness_origin` | Claude `origin.kind` other than `human`, or `promptSource: system` | Claude Code says the harness wrote it: task notifications, peers, coordinators | the archive; Seula's envelopes caught the same turns by their text |
+| `empty` | No text, as an image alone | Nothing to read | Seula |
+| `envelope` | A message that is wholly known harness elements (startup context, notifications, slash-command records, interruptions, Codex's review, skill and plugin elements), Codex's `# AGENTS.md instructions` heading over them, the verbatim interruption notices and local-command caveat, pi's bare `/command` | The harness wrote it into a user turn | Seula, whose element set followed intake's |
+| `harness_prompt` | A prompt opening with the fixed first sentence of Codex's `/init` or of toimija's launch prompt, inside or outside a repository | A program wrote it in a person's place; the task a launch prompt carries is not separated from it | the archive |
+| `question_reply` | A Codex message that is wholly `<send_user_message_question_reply>` | The answer to the agent's question tool, which Claude records as a tool result | the archive |
+| `fork_copy` | In a Codex fork, the longest run of turns after the copied parent header that matches the parent's transcript turn for turn; all of them, with a limitation, when the parent was not read | A fork copies its parent's transcript stamped with the fork time, so time cannot separate them | Seula |
+| `inherited` | In a fork (Codex, pi), a turn from before the fork started; one with no time, with a limitation | Its parent's history | Seula |
+| `headless` | Claude `sdk-*` entrypoints and `promptSource: sdk`, decided per turn; a `codex exec` file in which no turn was submitted interactively (a `user_message` event) | A program sent it: `claude -p`, an Agent SDK, `codex exec`. A session resumed by a script keeps its interactive turns | Seula |
+| `duplicate` | A message another copy of the session already gave: the same native id, else the same time and text | Read twice, said once | Seula, by id |
+| `retry` | The person's previous message sent again before the agent answered it, because the agent failed or never replied | Re-sent, not said anew | the archive |
+
+Subagent transcripts are not read at all: Claude's `subagents/` transcripts
+and Codex sessions whose `source` names a subagent. Their user turns are the
+parent agent's prompts, not a person's.
+
+Intake's 1,500-character limit is not applied: it is a correction heuristic,
+and intake keeps it. Its prefix skip list is replaced by the exact forms above.
+
+On the local archive (2026-10-26) `messages` listed 5,511 messages, from 370
+transcripts, in 4.5 s and 126 MB. Seula's reader counted 5,797 typed human
+messages in the same files. Every message Vessa lists is one of them; the 286
+others are `request_record` 72, `harness_prompt` 150, `question_reply` 63
+and `retry` 1. Its other rules exclude the same turns Seula's did.
+
+## Usage export
+
+Seula, which read this export beside the conversations, was archived on
+2026-10-26, and `messages` took over its reader. Usage exports, receipts and
+reports carry no message text. No sibling crate or binary is needed.
 
 ```sh
 vessa usage --input /path/to/session.jsonl --json > /tmp/usage.private.json
-seula report --input /path/to/session.jsonl --usage /tmp/usage.private.json --output /tmp/conversations.html
 ```
 
 `usage --json` and `sessions --json` emit `vessa-usage.v1`: `sessions` and
@@ -276,7 +373,7 @@ every request once. Each session also names its Claude subagents in
 show for one session. Without subagents the list is empty and the two totals
 are equal. Subagents remain sessions of their own in the export.
 
-Seula joins by agent and native session ID only, never directory or time.
+A consumer joins by agent and native session ID only, never directory or time.
 Whole-session spending does not establish spending caused by a conversation
 pattern. Incomplete source coverage remains visible in the export and exit code.
 

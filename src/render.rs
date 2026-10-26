@@ -180,6 +180,6 @@ pub fn html(report: &Report) -> Result<String> {
         out.push_str(&escape(&serde_json::to_string_pretty(&s.usage)?));
         out.push_str("</pre></details></section>");
     }
-    out.push_str("<footer>Vessa · source adapters v1 · Conversation analysis belongs to Seula.</footer></main></html>");
+    out.push_str("<footer>Vessa · source adapters v1 · Reports carry no message text.</footer></main></html>");
     Ok(out)
 }
