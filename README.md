@@ -8,6 +8,7 @@ network calls. Original files stay untouched.
 ```sh
 cargo build --locked
 cargo run -- sessions --input /path/to/session.jsonl
+cargo run -- sessions --headers --json
 cargo run -- usage --input /path/to/session.jsonl
 cargo run -- usage --by-agent --input /path/to/sessions/
 cargo run -- usage --input /path/to/session.jsonl --json
@@ -63,6 +64,63 @@ usage is its session's usage:
   session, and subagents are counted apart in `subagents`.
 
 A request is still counted once, however many transcripts hold it.
+
+### Session headers
+
+`sessions --headers` lists each session's header alone: what its transcript
+says about itself, without its usage. A caller that needs only these, such as
+`ohjaa report`, need not wait for every usage record to be read. With `--json`
+it emits `vessa-session-headers.v1`:
+
+```json
+{
+  "schema": "vessa-session-headers.v1",
+  "sessions": [
+    {
+      "agent": "claude",
+      "cwd": "/demo/widget",
+      "entrypoint": "cli",
+      "id": "claude-demo/subagent-demo",
+      "originator": null,
+      "parent": "claude-demo",
+      "source": "/path/to/claude-demo/subagents/agent-subagent-demo.jsonl",
+      "started_at": "2026-09-30T09:10:00Z"
+    }
+  ],
+  "warnings": []
+}
+```
+
+* `agent` is `claude`, `codex` or `pi`; `id` the native session id, with a
+  Claude subagent as `<session>/<agentId>`.
+* `parent` is the session it descends from: a Claude subagent's session, a
+  Codex fork's `forked_from_id`, a pi `parentSession`. Null for none.
+* `started_at` (RFC 3339) and `cwd` come from the header, else from the first
+  record that has them; unknown is null and `""`.
+* `source` is the transcript read; of copies of one session, the first path.
+* `entrypoint` (Claude: `cli`, or `sdk-cli` for `claude -p`) and `originator`
+  (Codex: `codex-tui`, or `codex_exec` for `codex exec`) say how a session was
+  started, and are null when unknown or for other agents.
+
+Each field is the session's field of the same name in `vessa-usage.v1`, found
+by the same code, and the list holds the same sessions in the same order, with
+the same warnings. `--agent` and `--session` select as they do for `sessions`.
+
+The header reader reads a transcript only until its header is known, and keeps
+no records. Each fact is the first record's that states it, so a transcript
+that never states one, such as a Claude session that never names its
+`entrypoint`, is read to its end. Two rules look at every record; here the
+header reader relies on how the agents write: each opens its own transcripts
+with its header and none holds another agent's records, and Claude Code marks
+every record of a transcript alike as a sidechain or not. On 928 local
+transcripts (3.2 GB, 2026-10-26) the two listings were identical; headers took
+under 0.5 s and 8 MB of memory, the full listing over 20 s and 1.2 GB on a
+loaded machine. Damage further into
+a transcript, which the full listing reports instead of the session, does not
+reach the header reader.
+
+No usage is read, so headers carry no limitations, and exit 4 means only a
+source warning: a transcript that could not be read. `--rates` is refused.
 
 Status, HTML reports and usage JSON also show **command and change insights**.
 A command is a recorded user message and the usage up to the next user message;
@@ -258,8 +316,9 @@ ignored by Git. JSON printed to stdout inherits the destination permissions
 you choose. No knowledge becomes current automatically.
 
 The in-memory reader is suitable for selected sessions. For very large archives,
-select narrower input directories; streaming summaries can replace it when
-archive size warrants that work. Unsupported schema versions, inherited fork
+select narrower input directories, or list headers alone with
+`sessions --headers`; streaming summaries can replace it when archive size
+warrants that work. Unsupported schema versions, inherited fork
 history without its original source, model rerouting absent from logs, and
 unlogged requests limit what a local transcript can establish.
 
