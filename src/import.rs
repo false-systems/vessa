@@ -1362,9 +1362,11 @@ fn list(
             .at
             .as_deref()
             .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok());
+        // A message is one identity however many copies hold it: its native
+        // id, else its time and text.
         let key = match (&turn.id, &turn.at) {
             (Some(id), _) => Some(format!("id {id}")),
-            (None, Some(at)) => Some(format!("at {at} {:x}", digest("user", &text))),
+            (None, Some(at)) => Some(format!("at {at} {:x}", digest("user", text))),
             (None, None) => None,
         };
         let rule = turn.rule.or_else(|| {
@@ -1395,10 +1397,7 @@ fn list(
             } else if turn.headless || read.exec {
                 prompts += 1;
                 Some("headless")
-            } else if key
-                .clone()
-                .is_some_and(|k| !seen.insert((s.agent.clone(), s.id.clone(), k)))
-            {
+            } else if key.is_some_and(|k| !seen.insert((s.agent.clone(), s.id.clone(), k))) {
                 Some("duplicate")
             } else if !answered && last.as_deref() == Some(text) {
                 Some("retry")
@@ -1407,6 +1406,12 @@ fn list(
             }
         });
         if let Some(rule) = rule {
+            if rule == "other_session" {
+                limitations.push(format!(
+                    "line {}: a record of another session; not listed",
+                    turn.line
+                ));
+            }
             *coverage.excluded.entry(rule).or_default() += 1;
             continue;
         }

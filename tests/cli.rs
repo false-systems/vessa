@@ -1697,3 +1697,609 @@ fn session_headers_print_a_line_each_and_refuse_rates_wherever_given() {
         assert!(stderr.contains("--rates"), "{args:?}: {stderr}");
     }
 }
+
+// ---- messages ---------------------------------------------------------------
+
+/// `vessa messages --json` with `args`, and its exit code.
+fn messages(args: &[&str]) -> (Value, Option<i32>) {
+    let output = cli(&[&["messages", "--json"], args].concat());
+    let v = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!("{e}: {}", String::from_utf8_lossy(&output.stderr));
+    });
+    (v, output.status.code())
+}
+fn texts(v: &Value) -> Vec<&str> {
+    v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["text"].as_str().unwrap())
+        .collect()
+}
+fn excluded(v: &Value) -> &serde_json::Map<String, Value> {
+    v["coverage"]["excluded"].as_object().unwrap()
+}
+/// A synthetic transcript in a file of its own.
+fn transcript(name: &str, rows: &[Value]) -> PathBuf {
+    let path = temp(name);
+    write_lines(&path, rows);
+    path
+}
+fn claude_user(uuid: &str, minute: u32, content: Value) -> Value {
+    serde_json::json!({"type":"user","uuid":uuid,"sessionId":"claude-demo","cwd":"/demo/widget","entrypoint":"cli","isSidechain":false,"timestamp":format!("2026-09-30T09:{minute:02}:00Z"),"message":{"role":"user","content":content}})
+}
+fn claude_reply(uuid: &str, minute: u32, text: &str) -> Value {
+    serde_json::json!({"type":"assistant","uuid":uuid,"sessionId":"claude-demo","timestamp":format!("2026-09-30T09:{minute:02}:30Z"),"message":{"role":"assistant","content":[{"type":"text","text":text}]}})
+}
+fn codex_meta(id: &str, extra: Value) -> Value {
+    let mut payload = serde_json::json!({"id":id,"cwd":"/demo/widget","source":"cli","originator":"codex-tui","timestamp":"2026-09-30T10:00:00Z"});
+    payload
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    serde_json::json!({"timestamp":"2026-09-30T10:00:00Z","type":"session_meta","payload":payload})
+}
+fn codex_turn(role: &str, minute: u32, text: &str) -> Value {
+    let kind = if role == "user" {
+        "input_text"
+    } else {
+        "output_text"
+    };
+    serde_json::json!({"timestamp":format!("2026-09-30T10:{minute:02}:00Z"),"type":"response_item","payload":{"type":"message","role":role,"content":[{"type":kind,"text":text}]}})
+}
+
+#[test]
+fn messages_lists_what_a_person_typed_with_the_reply_it_follows() {
+    let (v, code) = messages(&["--input", "examples/claude.jsonl"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(v["schema"], "vessa-messages.v1");
+    let m = &v["messages"][1];
+    for (key, expected) in [
+        ("agent", "claude"),
+        ("session", "claude-demo"),
+        ("id", "u2"),
+        ("at", "2026-09-30T09:02:00Z"),
+        ("cwd", "/demo/widget"),
+        ("text", "I already told you to run the local checks."),
+    ] {
+        assert_eq!(m[key], expected, "{key}");
+    }
+    assert!(m["parent"].is_null());
+    assert_eq!(m["line"], 4);
+    assert!(m["source"]
+        .as_str()
+        .unwrap()
+        .ends_with("examples/claude.jsonl"));
+    assert_eq!(m["reply"]["text"], "The implementation is ready.");
+    assert_eq!(m["reply"]["line"], 3);
+    assert_eq!(m["reply"]["failed"], false);
+    assert_eq!(m["reply"]["truncated"], false);
+    // The first message follows no reply.
+    assert!(v["messages"][0]["reply"].is_null());
+    assert_eq!(v["coverage"]["human"], 3);
+    assert_eq!(v["coverage"]["user_turns"], 3);
+    assert_eq!(v["sessions"][0]["messages"], 3);
+    assert_eq!(v["sessions"][0]["headless"], false);
+
+    // A long reply travels as its last 600 characters.
+    let long = format!("{}END", "x".repeat(700));
+    let path = transcript(
+        "long-reply.jsonl",
+        &[
+            claude_user("u1", 0, "Explain the parser.".into()),
+            claude_reply("a1", 0, &long),
+            claude_user("u2", 1, "Shorter, please.".into()),
+        ],
+    );
+    let (v, _) = messages(&["--input", path.to_str().unwrap()]);
+    let reply = &v["messages"][1]["reply"];
+    assert_eq!(reply["text"].as_str().unwrap().chars().count(), 600);
+    assert!(reply["text"].as_str().unwrap().ends_with("END"));
+    assert_eq!(reply["truncated"], true);
+    std::fs::remove_file(path).unwrap();
+
+    // The plain form prints each message under the place it was said.
+    let out = cli(&["messages", "--input", "examples/claude.jsonl"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.starts_with("claude claude-demo · 2026-09-30T09:00:00Z · /demo/widget · "));
+    assert!(text.contains("\n  Please run the existing local checks before finishing.\n"));
+    assert!(text.contains("3 messages from 1 sessions (0 headless)"));
+}
+
+#[test]
+fn harness_envelopes_and_prompts_are_counted_not_listed() {
+    let notice = serde_json::json!({"type":"user","uuid":"n1","sessionId":"claude-demo","timestamp":"2026-09-30T09:20:00Z","origin":{"kind":"task-notification"},"promptSource":"system","message":{"role":"user","content":"<task-notification>\n<status>completed</status>\n</task-notification>"}});
+    let mut meta = claude_user("m1", 21, "Base directory for this skill: /demo".into());
+    meta["isMeta"] = true.into();
+    let mut summary = claude_user("c1", 22, "Summary of the work so far.".into());
+    summary["isCompactSummary"] = true.into();
+    let blob = serde_json::json!({"type":"api-request-blob","sessionId":"claude-demo","hash":"h1","message":{"role":"user","content":[{"type":"text","text":"Keep the parser strict."}]}});
+    let path = transcript(
+        "envelopes.jsonl",
+        &[
+            claude_user(
+                "e1",
+                1,
+                "<command-name>/model</command-name>\n<command-message>model</command-message>\n<command-args></command-args>".into(),
+            ),
+            claude_user("e2", 2, "[Request interrupted by user]".into()),
+            claude_user("e3", 3, "<local-command-stdout>Set model</local-command-stdout>".into()),
+            claude_user(
+                "e4",
+                4,
+                "This session is being continued from a previous conversation that ran out of context. The summary follows.".into(),
+            ),
+            claude_user(
+                "e5",
+                5,
+                "Your toimija session packet is below. It is your workset contract: work from it.\n\nTask: fix the parser".into(),
+            ),
+            notice,
+            meta,
+            summary,
+            blob,
+            claude_user(
+                "h1",
+                6,
+                "<system-reminder>Injected context.</system-reminder>\nKeep the parser strict.".into(),
+            ),
+            // A person may start a message as a harness would.
+            claude_user("h2", 7, "Caveat: the fixture is synthetic.".into()),
+            claude_user("h3", 8, "<command-name> is the tag I meant".into()),
+        ],
+    );
+    let (v, code) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        texts(&v),
+        [
+            "Keep the parser strict.",
+            "Caveat: the fixture is synthetic.",
+            "<command-name> is the tag I meant"
+        ]
+    );
+    let rules = excluded(&v);
+    for (rule, n) in [
+        ("envelope", 3),
+        ("compaction", 2),
+        ("harness_prompt", 1),
+        ("harness_origin", 1),
+        ("meta", 1),
+        ("request_record", 1),
+    ] {
+        assert_eq!(rules[rule], n, "{rule}");
+    }
+    assert_eq!(v["coverage"]["user_turns"], 12);
+    std::fs::remove_file(path).unwrap();
+
+    // Codex: startup context, the AGENTS.md heading, `/init`, and the answer
+    // to the agent's question tool.
+    let path = transcript(
+        "codex-envelopes.jsonl",
+        &[
+            codex_meta("codex-envelopes", serde_json::json!({})),
+            codex_turn(
+                "user",
+                1,
+                "<environment_context>\n  <cwd>/demo/widget</cwd>\n</environment_context>",
+            ),
+            codex_turn(
+                "user",
+                2,
+                "# AGENTS.md instructions for /demo/widget\n\n<INSTRUCTIONS>\nRust only.\n</INSTRUCTIONS>",
+            ),
+            codex_turn(
+                "user",
+                3,
+                "Generate a file named AGENTS.md that serves as a contributor guide for this repository.\nYour goal is a clear guide.",
+            ),
+            codex_turn(
+                "user",
+                4,
+                "<send_user_message_question_reply>\n[{\"answer\":\"Yes\",\"question\":\"Proceed?\"}]\n</send_user_message_question_reply>",
+            ),
+            codex_turn("user", 5, "Please run the existing local checks."),
+        ],
+    );
+    let (v, _) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(texts(&v), ["Please run the existing local checks."]);
+    let rules = excluded(&v);
+    assert_eq!(rules["envelope"], 2);
+    assert_eq!(rules["harness_prompt"], 1);
+    assert_eq!(rules["question_reply"], 1);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn tool_results_are_not_messages() {
+    // Any tool result makes the turn a tool's, even with text beside it.
+    let path = transcript(
+        "tool-results.jsonl",
+        &[
+            claude_user("u1", 0, "Run the tests.".into()),
+            claude_user(
+                "t1",
+                1,
+                serde_json::json!([{"type":"tool_result","tool_use_id":"x1","content":"ok"}]),
+            ),
+            claude_user(
+                "t2",
+                2,
+                serde_json::json!([{"type":"tool_result","tool_use_id":"x2","content":"ok"},{"type":"text","text":"Tool output follows."}]),
+            ),
+        ],
+    );
+    let (v, _) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(texts(&v), ["Run the tests."]);
+    assert_eq!(excluded(&v)["tool_result"], 2);
+    std::fs::remove_file(path).unwrap();
+
+    // pi and Codex write tool results as records of their own, not user turns.
+    let pi = transcript(
+        "pi-tools.jsonl",
+        &[
+            serde_json::json!({"type":"session","version":3,"id":"pi-tools","timestamp":"2026-09-30T11:00:00Z","cwd":"/demo/widget"}),
+            serde_json::json!({"type":"message","id":"p1","timestamp":"2026-09-30T11:00:00Z","message":{"role":"user","content":[{"type":"text","text":"Run the tests."}]}}),
+            serde_json::json!({"type":"message","id":"p2","timestamp":"2026-09-30T11:00:10Z","message":{"role":"toolResult","toolCallId":"c1","content":[{"type":"text","text":"ok"}]}}),
+        ],
+    );
+    let codex = transcript(
+        "codex-tools.jsonl",
+        &[
+            codex_meta("codex-tools", serde_json::json!({})),
+            codex_turn("user", 1, "Run the tests."),
+            serde_json::json!({"timestamp":"2026-09-30T10:02:00Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok"}}),
+        ],
+    );
+    let (v, _) = messages(&[
+        "--input",
+        pi.to_str().unwrap(),
+        "--input",
+        codex.to_str().unwrap(),
+    ]);
+    assert_eq!(texts(&v), ["Run the tests.", "Run the tests."]);
+    assert_eq!(v["coverage"]["user_turns"], 2);
+    std::fs::remove_file(pi).unwrap();
+    std::fs::remove_file(codex).unwrap();
+}
+
+#[test]
+fn a_codex_fork_lists_only_its_own_turns() {
+    let dir = temp("codex-fork");
+    std::fs::create_dir_all(&dir).unwrap();
+    let history = [
+        codex_turn("user", 1, "Add the parser."),
+        codex_turn("assistant", 2, "Added the parser."),
+        codex_turn("user", 3, "Now test it."),
+        codex_turn("assistant", 4, "The tests pass."),
+    ];
+    let parent = dir.join("a-parent.jsonl");
+    let mut rows = vec![codex_meta("codex-parent", serde_json::json!({}))];
+    rows.extend(history.iter().cloned());
+    write_lines(&parent, &rows);
+    // A fork copies its parent's transcript, header included, behind its own
+    // header, stamped with the fork time; then come its own turns.
+    let fork = dir.join("b-fork.jsonl");
+    let mut rows = vec![
+        codex_meta(
+            "codex-fork",
+            serde_json::json!({"forked_from_id":"codex-parent","timestamp":"2026-09-30T10:30:00Z"}),
+        ),
+        codex_meta("codex-parent", serde_json::json!({})),
+    ];
+    rows.extend(history.iter().cloned().map(|mut r| {
+        r["timestamp"] = "2026-09-30T10:30:00Z".into();
+        r
+    }));
+    rows.push(codex_turn("user", 31, "Try a different parser."));
+    write_lines(&fork, &rows);
+
+    let (v, code) = messages(&["--input", dir.to_str().unwrap()]);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        texts(&v),
+        ["Add the parser.", "Now test it.", "Try a different parser."]
+    );
+    let own = &v["messages"][2];
+    assert_eq!(own["session"], "codex-fork");
+    assert_eq!(own["parent"], "codex-parent");
+    // Its reply is the copied history's last, which the person saw.
+    assert_eq!(own["reply"]["text"], "The tests pass.");
+    assert_eq!(excluded(&v)["fork_copy"], 2);
+
+    // Selected alone, the fork still needs its parent's transcript.
+    let (v, _) = messages(&["--input", dir.to_str().unwrap(), "--session", "codex-fork"]);
+    assert_eq!(texts(&v), ["Try a different parser."]);
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 1);
+
+    // Without it, copied history cannot be told from the fork's own turns.
+    let (v, code) = messages(&["--input", fork.to_str().unwrap()]);
+    assert_eq!(code, Some(4));
+    assert!(texts(&v).is_empty());
+    assert_eq!(excluded(&v)["fork_copy"], 3);
+    assert!(v["coverage"]["limitations"][0]
+        .as_str()
+        .unwrap()
+        .contains("parent transcript not read"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn subagent_transcripts_are_an_agents_prompts_not_a_persons() {
+    let dir = claude_family("messages-subagent", true);
+    let codex = dir.join("codex-subagent.jsonl");
+    write_lines(
+        &codex,
+        &[
+            codex_meta(
+                "codex-subagent",
+                serde_json::json!({"source":{"subagent":{"thread_spawn":{"parent_thread_id":"codex-demo"}}}}),
+            ),
+            codex_turn("user", 1, "Review the parser change."),
+        ],
+    );
+    let (v, code) = messages(&["--input", dir.to_str().unwrap()]);
+    assert_eq!(code, Some(0));
+    assert_eq!(v["coverage"]["subagent_transcripts"], 2);
+    assert!(!texts(&v).contains(&"Find the parser tests and report their names."));
+    assert!(!texts(&v).contains(&"Review the parser change."));
+    assert_eq!(texts(&v).len(), 3);
+    // A subagent alone is no conversation with a person.
+    let out = cli(&[
+        "messages",
+        "--input",
+        dir.to_str().unwrap(),
+        "--session",
+        "claude-demo/subagent-demo",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only 1 subagent transcripts"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn headless_prompts_are_not_listed_and_their_sessions_say_so() {
+    let mut sdk = claude_user("s1", 0, "Summarise the diff.".into());
+    sdk["entrypoint"] = "sdk-cli".into();
+    let headless = transcript("headless.jsonl", &[sdk.clone()]);
+    // An interactive session later resumed by a script keeps its own turns.
+    let mut resumed = sdk;
+    resumed["uuid"] = "s2".into();
+    resumed["timestamp"] = "2026-09-30T09:05:00Z".into();
+    let mixed = temp("mixed");
+    std::fs::create_dir_all(&mixed).unwrap();
+    write_lines(
+        &mixed.join("claude-mixed.jsonl"),
+        &[
+            claude_user("u1", 0, "Fix the parser.".into()),
+            claude_reply("a1", 0, "Fixed."),
+            resumed,
+        ],
+    );
+    let exec = transcript(
+        "codex-exec.jsonl",
+        &[
+            codex_meta(
+                "codex-exec",
+                serde_json::json!({"source":"exec","originator":"codex_exec"}),
+            ),
+            codex_turn("user", 1, "Measure only: respond OK."),
+        ],
+    );
+    let (v, _) = messages(&[
+        "--input",
+        headless.to_str().unwrap(),
+        "--input",
+        exec.to_str().unwrap(),
+    ]);
+    assert!(texts(&v).is_empty());
+    assert_eq!(excluded(&v)["headless"], 2);
+    let sessions = v["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(sessions.iter().all(|s| s["headless"] == true));
+    let (v, _) = messages(&["--input", mixed.to_str().unwrap()]);
+    assert_eq!(texts(&v), ["Fix the parser."]);
+    assert_eq!(excluded(&v)["headless"], 1);
+    assert_eq!(v["sessions"][0]["headless"], false);
+    std::fs::remove_file(headless).unwrap();
+    std::fs::remove_file(exec).unwrap();
+    std::fs::remove_dir_all(mixed).unwrap();
+}
+
+#[test]
+fn a_resent_message_is_a_retry_and_one_after_a_failure_says_so() {
+    let mut failure = claude_reply("a1", 0, "API Error: 500 server error");
+    failure["isApiErrorMessage"] = true.into();
+    let path = transcript(
+        "retry.jsonl",
+        &[
+            claude_user("u1", 0, "Run the checks.".into()),
+            failure,
+            // The same request sent again, unanswered: not a new message.
+            claude_user("u2", 1, "Run the checks.".into()),
+            claude_user("u3", 2, "continue".into()),
+            claude_reply("a2", 2, "The checks pass."),
+            claude_user("u4", 3, "yes".into()),
+            claude_reply("a3", 3, "Shall I commit?"),
+            // Said again after a reply, it is a message of its own.
+            claude_user("u5", 4, "yes".into()),
+        ],
+    );
+    let (v, _) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(texts(&v), ["Run the checks.", "continue", "yes", "yes"]);
+    assert_eq!(excluded(&v)["retry"], 1);
+    // "continue" answers a failure, not a reply.
+    let after = &v["messages"][1]["reply"];
+    assert_eq!(after["failed"], true);
+    assert_eq!(after["text"], "API Error: 500 server error");
+    assert_eq!(v["messages"][2]["reply"]["failed"], false);
+    std::fs::remove_file(path).unwrap();
+
+    // A Codex error event is a failed turn too.
+    let path = transcript(
+        "codex-error.jsonl",
+        &[
+            codex_meta("codex-error", serde_json::json!({})),
+            codex_turn("user", 1, "Run the checks."),
+            serde_json::json!({"timestamp":"2026-09-30T10:02:00Z","type":"event_msg","payload":{"type":"error","message":"stream disconnected"}}),
+            codex_turn("user", 3, "try again"),
+        ],
+    );
+    let (v, _) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(v["messages"][1]["reply"]["failed"], true);
+    assert_eq!(v["messages"][1]["reply"]["text"], "stream disconnected");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_pi_session_lists_its_messages_and_a_fork_only_its_own() {
+    let (v, code) = messages(&["--input", "examples/pi.jsonl"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(texts(&v), ["Find the error and show the fix working."]);
+    assert_eq!(v["messages"][0]["id"], "p1");
+    assert_eq!(v["messages"][0]["cwd"], "/demo/widget");
+
+    let session = |id: &str, parent: Option<&str>, at: &str| {
+        let mut row = serde_json::json!({"type":"session","version":3,"id":id,"timestamp":at,"cwd":"/demo/widget"});
+        if let Some(parent) = parent {
+            row["parentSession"] = parent.into();
+        }
+        row
+    };
+    let user = |id: &str, at: &str, text: &str| serde_json::json!({"type":"message","id":id,"timestamp":at,"message":{"role":"user","content":[{"type":"text","text":text}]}});
+    let path = transcript(
+        "pi-fork.jsonl",
+        &[
+            session("pi-fork", Some("pi-demo"), "2026-09-30T12:00:00Z"),
+            // Copied from the parent, before the fork.
+            user(
+                "p1",
+                "2026-09-30T11:00:00Z",
+                "Find the error and show the fix working.",
+            ),
+            serde_json::json!({"type":"message","id":"p9","timestamp":"2026-09-30T12:01:00Z","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"rate limited"}}),
+            user("f1", "2026-09-30T12:02:00Z", "/model"),
+            user("f2", "2026-09-30T12:03:00Z", "Try the smaller model."),
+        ],
+    );
+    let (v, _) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(texts(&v), ["Try the smaller model."]);
+    assert_eq!(v["messages"][0]["parent"], "pi-demo");
+    assert_eq!(v["messages"][0]["reply"]["text"], "rate limited");
+    assert_eq!(v["messages"][0]["reply"]["failed"], true);
+    let rules = excluded(&v);
+    assert_eq!(rules["inherited"], 1);
+    assert_eq!(rules["envelope"], 1);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn messages_select_by_time_session_and_agent() {
+    let all = [
+        "--input",
+        "examples/claude.jsonl",
+        "--input",
+        "examples/codex.jsonl",
+        "--input",
+        "examples/pi.jsonl",
+    ];
+    let (v, _) = messages(&[&all[..], &["--since", "2026-09-30T09:01:00Z"]].concat());
+    assert_eq!(texts(&v).len(), 4);
+    assert_eq!(v["coverage"]["earlier"], 1);
+    assert_eq!(v["coverage"]["since"], "2026-09-30T09:01:00+00:00");
+    let (v, _) = messages(&[&all[..], &["--since", "2026-10-01"]].concat());
+    assert!(texts(&v).is_empty());
+    assert_eq!(v["coverage"]["earlier"], 5);
+    let (v, _) = messages(&[&all[..], &["--since", "100000d"]].concat());
+    assert_eq!(texts(&v).len(), 5);
+    let (v, _) = messages(&[&all[..], &["--agent", "codex"]].concat());
+    assert_eq!(
+        texts(&v),
+        ["Please run the existing local checks before finishing."]
+    );
+    let (v, _) = messages(&[&all[..], &["--session", "pi-demo"]].concat());
+    assert_eq!(texts(&v), ["Find the error and show the fix working."]);
+
+    // A message with no time cannot be placed after `--since`.
+    let mut undated = claude_user("u9", 0, "When was this?".into());
+    undated.as_object_mut().unwrap().remove("timestamp");
+    let path = transcript("undated.jsonl", &[undated]);
+    let (v, _) = messages(&["--input", path.to_str().unwrap(), "--since", "7d"]);
+    assert_eq!(v["coverage"]["undated"], 1);
+    // A transcript last written before `--since` is not read.
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000))
+        .unwrap();
+    let (v, _) = messages(&["--input", path.to_str().unwrap(), "--since", "7d"]);
+    assert_eq!(v["coverage"]["unmodified_transcripts"], 1);
+    assert_eq!(v["coverage"]["transcripts"], 0);
+    std::fs::remove_file(path).unwrap();
+
+    for (args, error) in [
+        (
+            &["--session", "missing"][..],
+            "native session missing not found",
+        ),
+        (&["--agent", "opencode"][..], "SQLite"),
+        (&["--since", "soon"][..], "expected RFC 3339"),
+        (
+            &["--rates", "examples/rates.json"][..],
+            "--rates cannot be used",
+        ),
+    ] {
+        let out = cli(&[&["messages"], &all[..], args].concat());
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(error),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn opencode_is_a_known_gap_in_the_default_sources() {
+    let home = temp("home");
+    for dir in [
+        ".claude/projects/demo",
+        ".codex/sessions",
+        ".pi/agent/sessions",
+    ] {
+        std::fs::create_dir_all(home.join(dir)).unwrap();
+    }
+    std::fs::copy(
+        "examples/claude.jsonl",
+        home.join(".claude/projects/demo/claude-demo.jsonl"),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vessa"))
+            .args(args)
+            .env("HOME", &home)
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap()
+    };
+    let out = run(&["messages", "--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    let db = home.join(".local/share/opencode");
+    std::fs::create_dir_all(&db).unwrap();
+    std::fs::write(db.join("opencode.db"), "").unwrap();
+    let out = run(&["messages", "--json"]);
+    assert_eq!(out.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(texts(&v).len(), 3);
+    assert!(v["coverage"]["gaps"][0]
+        .as_str()
+        .unwrap()
+        .starts_with("opencode: "));
+    // Asked for one agent, the others are no gap.
+    assert_eq!(
+        run(&["messages", "--agent", "claude"]).status.code(),
+        Some(0)
+    );
+    std::fs::remove_dir_all(home).unwrap();
+}
