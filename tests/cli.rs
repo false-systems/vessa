@@ -2812,19 +2812,7 @@ fn a_launch_task_is_what_the_person_typed_without_the_briefing() {
         launch_prompt(false, Some(&briefing), None),
         launch_prompt(false, Some(&format!("ship it\n\n{briefing}")), None),
     ];
-    let rows: Vec<Value> = prompts
-        .iter()
-        .enumerate()
-        .flat_map(|(i, prompt)| {
-            [
-                claude_user(&format!("l{i}"), i as u32 * 2, prompt.clone().into()),
-                claude_reply(&format!("a{i}"), i as u32 * 2, "Ready."),
-            ]
-        })
-        .collect();
-    let path = transcript("launch-tasks.jsonl", &rows);
-    let (v, code) = messages(&["--input", path.to_str().unwrap()]);
-    assert_eq!(code, Some(0));
+    let v = launches("launch-tasks.jsonl", &prompts);
     assert_eq!(
         texts(&v),
         [
@@ -2841,5 +2829,108 @@ fn a_launch_task_is_what_the_person_typed_without_the_briefing() {
         .iter()
         .all(|m| m["kind"] == "task"));
     assert_eq!(excluded(&v)["harness_prompt"], 4);
+}
+
+/// ohjaa's `BRIEFING_SENTINEL` (false-systems/ohjaa, src/main.rs, since
+/// ohjaa#56): the first line of the briefing ohjaa gives every launch. ohjaa
+/// pins it in its own tests/cli.rs and vessa pins it here, so a change on
+/// either side fails a test. Both match it byte for byte: a change is a new
+/// version, never an edit.
+const OHJAA_BRIEFING_SENTINEL: &str = "<!-- ohjaa-briefing v1 -->";
+
+/// ohjaa's briefing as ohjaa writes it since #56: the sentinel line, the
+/// unproven branch flag, then the other parts, all joined by a newline.
+fn ohjaa_briefing_v1() -> String {
+    [
+        OHJAA_BRIEFING_SENTINEL.to_owned(),
+        "FLAG: main of acme/widget is unproven since 1111111 (2 commits: ? 0000000, ✗ \
+         1111111; origin/main as of a fetch at 2026-10-13 09:12 UTC). Start by running \
+         `ohjaa gate` on main and fix forward what fails."
+            .to_owned(),
+        ohjaa_briefing(true),
+    ]
+    .join("\n")
+}
+
+/// `vessa messages --json` over one Claude transcript holding each prompt as
+/// a person's turn, each answered.
+fn launches(name: &str, prompts: &[String]) -> Value {
+    let rows: Vec<Value> = prompts
+        .iter()
+        .enumerate()
+        .flat_map(|(i, prompt)| {
+            [
+                claude_user(&format!("l{i}"), i as u32 * 2, prompt.clone().into()),
+                claude_reply(&format!("a{i}"), i as u32 * 2, "Ready."),
+            ]
+        })
+        .collect();
+    let path = transcript(name, &rows);
+    let (v, code) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(code, Some(0));
     std::fs::remove_file(path).unwrap();
+    v
+}
+
+#[test]
+fn a_launch_task_ends_at_ohjaas_briefing_sentinel() {
+    let briefing = ohjaa_briefing_v1();
+    let v = launches(
+        "sentinel-tasks.jsonl",
+        &[
+            // A task, then the briefing: the sentinel ends it, and neither it
+            // nor the flag after it is the person's.
+            launch_prompt(false, Some("tidy the docs"), Some(&briefing)),
+            launch_prompt(true, Some("check the gate"), Some(&briefing)),
+            // With the sentinel there, a task that opens as a part of the
+            // briefing does is still typed.
+            launch_prompt(false, Some("FLAG: what does it mean?"), Some(&briefing)),
+            // A briefing of the sentinel line alone ends the prompt.
+            launch_prompt(false, Some("fix the lexer"), Some(OHJAA_BRIEFING_SENTINEL)),
+            // The briefing with no task, or an empty one, is harness text.
+            launch_prompt(false, None, Some(&briefing)),
+            launch_prompt(false, Some(""), Some(&briefing)),
+            // An older ohjaa's briefing has no sentinel: still cut at its
+            // first part.
+            launch_prompt(false, Some("ship it"), Some(&ohjaa_briefing(true))),
+        ],
+    );
+    assert_eq!(
+        texts(&v),
+        [
+            "tidy the docs",
+            "check the gate",
+            "FLAG: what does it mean?",
+            "fix the lexer",
+            "ship it"
+        ]
+    );
+    assert!(v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["kind"] == "task"));
+    assert_eq!(excluded(&v)["harness_prompt"], 2);
+}
+
+#[test]
+fn ohjaas_briefing_sentinel_is_matched_byte_for_byte() {
+    // A task with a paragraph of its own that opens as a part of ohjaa's
+    // briefing does: with the sentinel, all of it is the person's.
+    let task = "Quote the launch's warning in the notes:\n\nFLAG: main is unproven.";
+    let v = launches(
+        "sentinel-pinned.jsonl",
+        &[launch_prompt(false, Some(task), Some(&ohjaa_briefing_v1()))],
+    );
+    assert_eq!(texts(&v), [task]);
+    // A line that differs from ohjaa's is not its sentinel (another version
+    // is a new line to learn), so the task is cut as an older ohjaa's is: at
+    // the first part of a briefing after a blank line.
+    let other =
+        ohjaa_briefing_v1().replacen(OHJAA_BRIEFING_SENTINEL, "<!-- ohjaa-briefing v2 -->", 1);
+    let v = launches(
+        "sentinel-other.jsonl",
+        &[launch_prompt(false, Some(task), Some(&other))],
+    );
+    assert_eq!(texts(&v), ["Quote the launch's warning in the notes:"]);
 }
