@@ -1746,8 +1746,8 @@ const ALERTS: &str = "## Before anything else (from the launcher)\n";
 /// branch flag, validation, still-running, orphaned and warned sessions,
 /// Knowledge (whose preamble also opens scoped knowledge), the last session
 /// here, how the session works, sibling worktrees, and the system perimeter.
-/// toimija appends the briefing after the task, so the first of these after
-/// a blank line ends the task.
+/// toimija appends the briefing after the task, so in a prompt from an ohjaa
+/// before its sentinel the first of these after a blank line ends the task.
 const BRIEFING: [&str; 10] = [
     "FLAG: ",
     "Validation here (sykli's word, asked at launch;",
@@ -1760,6 +1760,12 @@ const BRIEFING: [&str; 10] = [
     "Sessions in the other worktrees of this clone at launch",
     "System perimeter (derived by ohjaa at launch;",
 ];
+/// How the line ohjaa's briefing opens with since ohjaa#56 begins and ends.
+/// ohjaa writes `<!-- ohjaa-briefing v1 -->` (its `BRIEFING_SENTINEL`) to say
+/// where its words begin. A line of this form, after trimming, ends the task
+/// in any version: the version tells what follows, not where it starts.
+const SENTINEL_OPENS: &str = "<!-- ohjaa-briefing ";
+const SENTINEL_CLOSES: &str = "-->";
 
 /// Whether `text` is a toimija launch prompt: its fixed opening, after the
 /// launcher's alerts when there are any.
@@ -1779,22 +1785,43 @@ fn launched(text: &str) -> bool {
 /// The task a person typed into a launch prompt. toimija writes the packet,
 /// then `\nTask: <task>\n`, then `\n<briefing>\n`; before ohjaa 7ba9a68 the
 /// task line held `<task>\n\n<briefing>`, or the briefing alone. The task is
-/// what lies between the last `Task:` line and the first part of ohjaa's
-/// briefing. None when nothing typed is left.
+/// what lies between the last `Task:` line and ohjaa's briefing: its
+/// sentinel line, or in a prompt from an older ohjaa the first part of it.
+/// None when nothing typed is left.
 fn launch_task(text: &str) -> Option<String> {
-    let end = BRIEFING
-        .iter()
-        .filter_map(|opening| text.find(&format!("\n\n{opening}")))
-        .min()
-        .unwrap_or(text.len());
-    let (_, task) = text[..end].rsplit_once("\n\nTask: ")?;
-    // Before ohjaa passed its briefing apart (7ba9a68), the briefing was the
-    // task itself when no task was typed: `Task: <briefing>`.
-    if BRIEFING.iter().any(|opening| task.starts_with(opening)) {
-        return None;
-    }
+    let task = match sentinel_line(text) {
+        Some(end) => text[..end].rsplit_once("\n\nTask: ")?.1,
+        None => {
+            let end = BRIEFING
+                .iter()
+                .filter_map(|opening| text.find(&format!("\n\n{opening}")))
+                .min()
+                .unwrap_or(text.len());
+            let (_, task) = text[..end].rsplit_once("\n\nTask: ")?;
+            // Before ohjaa passed its briefing apart (7ba9a68), the briefing
+            // was the task itself when no task was typed: `Task: <briefing>`.
+            if BRIEFING.iter().any(|opening| task.starts_with(opening)) {
+                return None;
+            }
+            task
+        }
+    };
     let task = task.trim();
     (!task.is_empty()).then(|| task.to_owned())
+}
+
+/// Where the first line of `text` that is a sentinel of ohjaa's briefing, and
+/// nothing else but whitespace, begins.
+fn sentinel_line(text: &str) -> Option<usize> {
+    let mut at = 0;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed.starts_with(SENTINEL_OPENS) && trimmed.ends_with(SENTINEL_CLOSES) {
+            return Some(at);
+        }
+        at += line.len();
+    }
+    None
 }
 
 /// Text a harness wrote into a user turn, matched in its exact form: a whole
