@@ -90,6 +90,9 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
     // One record per usage identity: (owning session, slot, owner ID).
     let mut seen: HashMap<(String, String), (usize, usize, String)> = HashMap::new();
     let mut kept: Vec<Vec<Usage>> = report.sessions.iter().map(|_| Vec::new()).collect();
+    // Requests a session holds that an earlier session already counted.
+    let mut elsewhere: Vec<std::collections::HashSet<String>> =
+        report.sessions.iter().map(|_| Default::default()).collect();
     for (index, session) in report.sessions.iter_mut().enumerate() {
         for item in session.usage.drain(..) {
             let started = session
@@ -112,6 +115,9 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             };
             let key = (session.agent.clone(), event_id);
             if let Some((owner, slot, owner_id)) = seen.get(&key) {
+                if *owner != index {
+                    elsewhere[index].insert(item.id.clone());
+                }
                 let old = &mut kept[*owner][*slot];
                 if extends(&old.entry, &item.entry) {
                     // A later snapshot of the same request. Within one file it
@@ -155,8 +161,9 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             }
         }
     }
-    for (session, usage) in report.sessions.iter_mut().zip(kept) {
+    for ((session, usage), elsewhere) in report.sessions.iter_mut().zip(kept).zip(elsewhere) {
         session.usage = usage;
+        session.counted_elsewhere = elsewhere.len();
         for wrapper in &wrappers {
             if wrapper["usage"].as_array().is_some_and(|receipts| {
                 receipts
@@ -166,7 +173,10 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
                 session.ohjaa.push(wrapper.clone());
             }
         }
-        if session.usage.is_empty() {
+        // A subagent whose every request its session already holds has had
+        // its usage counted there; it is not unknown.
+        let counted = session.subagent_of().is_some() && session.counted_elsewhere > 0;
+        if session.usage.is_empty() && !counted {
             session
                 .limitations
                 .push("No usage records found; consumption is unknown, not zero".into());
@@ -343,12 +353,15 @@ fn parse_file(path: &Path) -> Result<Parsed> {
         .map(str::to_owned);
     if agent == "claude" && records.iter().any(|(_, v)| v["isSidechain"] == true) {
         parent = Some(id.clone());
+        // Claude Code names the file `agent-<agentId>.jsonl`, so a file
+        // whose records omit the agentId gives the id its launch names.
         let child = records
             .iter()
             .find_map(|(_, v)| v["agentId"].as_str())
             .unwrap_or_else(|| {
                 path.file_stem()
                     .and_then(|s| s.to_str())
+                    .map(|s| s.strip_prefix("agent-").unwrap_or(s))
                     .unwrap_or("unknown")
             });
         id = format!("{id}/{child}");
@@ -383,6 +396,7 @@ fn parse_file(path: &Path) -> Result<Parsed> {
         ohjaa: Vec::new(),
         work: Vec::new(),
         launched: Vec::new(),
+        counted_elsewhere: 0,
     };
     let mut model = "unknown".to_owned();
     // Codex is OpenAI's agent; its session_meta names the provider when it

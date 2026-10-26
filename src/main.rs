@@ -126,7 +126,18 @@ fn run_once(cli: Cli) -> Result<i32> {
         report
             .sessions
             .retain(|s| s.id == id || s.subagent_of() == Some(id.as_str()));
-        ensure!(!report.sessions.is_empty(), "native session {id} not found");
+        // Never answer for a session with its subagents alone: its own usage
+        // would be unknown, and a subagent is not the session.
+        let subagents = report.sessions.iter().filter(|s| s.id != id).count();
+        ensure!(
+            report.sessions.len() > subagents,
+            "native session {id} not found{}",
+            if subagents > 0 {
+                format!("; its main transcript was not read, only {subagents} of its subagents")
+            } else {
+                String::new()
+            }
+        );
     }
     // Partial means the usage evidence itself is incomplete: a source warning
     // or a session limitation. Rate-card notices added below concern pricing
@@ -206,7 +217,14 @@ fn run_once(cli: Cli) -> Result<i32> {
                                 .as_deref()
                                 .unwrap_or("unknown")
                         );
-                        print("    ", model::aggregate(sub)?);
+                        if sub.usage.is_empty() && sub.counted_elsewhere > 0 {
+                            println!(
+                                "    no requests of its own; {} counted in another transcript",
+                                sub.counted_elsewhere
+                            );
+                        } else {
+                            print("    ", model::aggregate(sub)?);
+                        }
                     }
                     println!("Commands below are the main transcript's; subagent usage is in the totals above.");
                 }

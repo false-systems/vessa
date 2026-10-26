@@ -46,8 +46,11 @@ subagent `<session>/<agentId>`, with the session as its `parent`. A subagent's
 usage is its session's usage:
 
 * `--session ID` selects the session and its subagents; a subagent's own id
-  selects it alone. A transcript given with `--input` brings its
-  `subagents/` directory along.
+  selects it alone. A session whose main transcript was not read is not
+  found, even when its subagents were. A transcript given with `--input`
+  brings its `subagents/` directory along.
+* A subagent whose requests its session already holds counts nothing twice
+  and is not unknown: status says how many it shares.
 * `status` and `receipt` total the session with its subagents. Status says how
   many it included and shows each one; its JSON `entries` are that total, with
   `main_entries` and a `subagents` breakdown beside them. Command windows stay

@@ -57,6 +57,9 @@ pub struct Session {
     /// with the line that says so. Checked against the transcripts read.
     #[serde(skip)]
     pub launched: Vec<(String, usize)>,
+    /// Requests this transcript holds that an earlier session counted.
+    #[serde(skip)]
+    pub counted_elsewhere: usize,
 }
 
 impl Session {
