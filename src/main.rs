@@ -312,9 +312,9 @@ fn run_once(cli: Cli) -> Result<i32> {
             })?;
             file.write_all(html.as_bytes())?;
             println!(
-                "report: {} · {} sessions",
+                "report: {} · {}",
                 output.display(),
-                report.sessions.len()
+                model::counted(&report.sessions)
             );
         }
         Cmd::Receipt => {

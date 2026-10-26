@@ -487,8 +487,9 @@ Native agents do not emit this normalized receipt by themselves.
 
 ## UI and privacy
 
-The report starts with the known spending subtotal, priced/unpriced record
-coverage and sessions ranked by that subtotal. Rankings are not complete cost
+The report's header and the `report:` line it prints count sessions as
+`stats` does, with their subagents apart. It starts with the known spending
+subtotal, priced/unpriced record coverage and sessions ranked by that subtotal. Rankings are not complete cost
 comparisons when prices are missing. Expand a command to see separate token
 categories, tool/failure/edit counts and the source location; full evidence is
 still available below it. No prompt bodies are retained to label commands.

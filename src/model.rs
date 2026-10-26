@@ -184,6 +184,29 @@ pub fn families(sessions: &[Session]) -> Vec<Family<'_>> {
     families
 }
 
+/// How many sessions these transcripts are, and how many of them are
+/// subagents, counted with their session as `stats` counts them: a subagent
+/// read without its session's transcript still counts that session.
+pub fn count(sessions: &[Session]) -> (usize, usize) {
+    let roots: std::collections::BTreeSet<_> = sessions
+        .iter()
+        .map(|s| (s.agent.as_str(), s.subagent_of().unwrap_or(&s.id)))
+        .collect();
+    let subagents = sessions
+        .iter()
+        .filter(|s| s.subagent_of().is_some())
+        .count();
+    (roots.len(), subagents)
+}
+
+/// "N sessions", with " · M subagents" when there are any.
+pub fn counted(sessions: &[Session]) -> String {
+    match count(sessions) {
+        (n, 0) => format!("{n} sessions"),
+        (n, m) => format!("{n} sessions · {m} subagents"),
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Report {
     pub schema: String,

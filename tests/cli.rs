@@ -1387,6 +1387,36 @@ fn usage_export_links_subagents_to_their_session_additively() {
 }
 
 #[test]
+fn a_report_counts_sessions_with_their_subagents_apart() {
+    let dir = claude_family("family-report", true);
+    let report = |inputs: &[&str]| {
+        let html = temp("count.html");
+        let mut args = vec!["report", "--output", html.to_str().unwrap()];
+        for input in inputs {
+            args.extend(["--input", input]);
+        }
+        let out = cli(&args);
+        assert!(out.status.success());
+        let page = std::fs::read_to_string(&html).unwrap();
+        std::fs::remove_file(html).unwrap();
+        (String::from_utf8(out.stdout).unwrap(), page)
+    };
+    // Two transcripts: one session and its subagent.
+    let (said, page) = report(&[dir.to_str().unwrap()]);
+    assert!(said.ends_with(" · 1 sessions · 1 subagents\n"), "{said}");
+    assert!(page.contains("<p>1 sessions · 1 subagents · 0 source warnings</p>"));
+    // A subagent read alone still counts its session, as stats count it.
+    let (said, page) = report(&["examples/claude-subagent.jsonl"]);
+    assert!(said.ends_with(" · 1 sessions · 1 subagents\n"), "{said}");
+    assert!(page.contains("<p>1 sessions · 1 subagents · 0 source warnings</p>"));
+    // Without subagents, sessions alone.
+    let (said, page) = report(&["examples/codex.jsonl", "examples/pi.jsonl"]);
+    assert!(said.ends_with(" · 2 sessions\n"), "{said}");
+    assert!(page.contains("<p>2 sessions · 0 source warnings</p>"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn stats_count_top_level_sessions_and_subagents_separately() {
     let dir = claude_family("family-stats", true);
     for input in [dir.to_str().unwrap(), "examples"] {
