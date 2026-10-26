@@ -401,10 +401,11 @@ struct Opening {
 }
 
 impl Opening {
-    /// `meta` is the record itself, or Codex's `payload`; `id` its id field.
-    fn new(record: &Value, meta: &Value, id: &str) -> Self {
+    /// `meta` is the record itself, or Codex's `payload`; `id_key` names the
+    /// field of `meta` that holds the session id.
+    fn new(record: &Value, meta: &Value, id_key: &str) -> Self {
         Opening {
-            id: string(meta, id),
+            id: string(meta, id_key),
             parent: meta["parentSession"]
                 .as_str()
                 .or_else(|| meta["forked_from_id"].as_str())
