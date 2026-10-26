@@ -1669,6 +1669,9 @@ fn session_headers_differ_from_the_full_listing_only_where_documented() {
     assert_eq!(headers["sessions"][0]["cwd"], "/demo/widget");
     assert_eq!(headers["sessions"][0]["started_at"], "2026-09-30T09:00:00Z");
     assert_eq!(headers["warnings"], serde_json::json!([]));
+    let source = |v: &Value| v["sessions"][0]["source"].as_str().unwrap().to_owned();
+    assert!(source(&full).ends_with("b.jsonl"), "{full}");
+    assert!(source(&headers).ends_with("a.jsonl"), "{headers}");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
