@@ -1832,7 +1832,7 @@ fn harness_envelopes_and_prompts_are_counted_not_listed() {
             claude_user(
                 "e5",
                 5,
-                "Your toimija session packet is below. It is your workset contract: work from it.\n\nTask: fix the parser".into(),
+                "Your toimija session packet is below. It is your workset contract: work from it.\n\n# Toimija Context\n- branch: main".into(),
             ),
             notice,
             meta,
@@ -1893,10 +1893,11 @@ fn harness_envelopes_and_prompts_are_counted_not_listed() {
                 3,
                 "Generate a file named AGENTS.md that serves as a contributor guide for this repository.\nYour goal is a clear guide.",
             ),
+            codex_question("q1", &[("Proceed?", Some(&["Yes", "No"]))]),
             codex_turn(
                 "user",
                 4,
-                "<send_user_message_question_reply>\n[{\"answer\":\"Yes\",\"question\":\"Proceed?\"}]\n</send_user_message_question_reply>",
+                &codex_reply(&[("q1", 0, "Proceed?", "Yes")]),
             ),
             codex_turn("user", 5, "Please run the existing local checks."),
         ],
@@ -2025,8 +2026,19 @@ fn a_codex_fork_lists_only_its_own_turns() {
 }
 
 #[test]
-fn subagent_transcripts_are_an_agents_prompts_not_a_persons() {
+fn a_subagents_prompts_are_its_parents_and_a_person_can_write_to_it() {
     let dir = claude_family("messages-subagent", true);
+    // A person writes to the running subagent: Claude Code records it in the
+    // subagent's transcript, as meta, with a person's origin.
+    let subagent = dir.join("claude-demo/subagents/agent-subagent-demo.jsonl");
+    let mut rows: Vec<Value> = include_str!("../examples/claude-subagent.jsonl")
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    rows.push(serde_json::json!({"parentUuid":"s3","isSidechain":true,"isMeta":true,"agentId":"subagent-demo","type":"user","uuid":"s9","sessionId":"claude-demo","cwd":"/demo/widget","entrypoint":"cli","timestamp":"2026-09-30T09:12:00Z","origin":{"kind":"human"},"message":{"role":"user","content":"Only the parser tests, not the fixtures."}}));
+    // A subagent copies no history: an undated message to it is still its own.
+    rows.push(serde_json::json!({"parentUuid":"s9","isSidechain":true,"isMeta":true,"agentId":"subagent-demo","type":"user","uuid":"s10","sessionId":"claude-demo","cwd":"/demo/widget","entrypoint":"cli","origin":{"kind":"human"},"message":{"role":"user","content":"Skip the slow tests."}}));
+    write_lines(&subagent, &rows);
     let codex = dir.join("codex-subagent.jsonl");
     write_lines(
         &codex,
@@ -2040,20 +2052,62 @@ fn subagent_transcripts_are_an_agents_prompts_not_a_persons() {
     );
     let (v, code) = messages(&["--input", dir.to_str().unwrap()]);
     assert_eq!(code, Some(0));
-    assert_eq!(v["coverage"]["subagent_transcripts"], 2);
-    assert!(!texts(&v).contains(&"Find the parser tests and report their names."));
+    // Codex subagents are not read; Claude's are, for what a person sent.
+    assert_eq!(v["coverage"]["subagent_transcripts"], 1);
     assert!(!texts(&v).contains(&"Review the parser change."));
-    assert_eq!(texts(&v).len(), 3);
-    // A subagent alone is no conversation with a person.
-    let out = cli(&[
-        "messages",
+    // The parent agent's prompt to its subagent is not a person's.
+    assert!(!texts(&v).contains(&"Find the parser tests and report their names."));
+    assert_eq!(excluded(&v)["subagent"], 1);
+    assert_eq!(texts(&v).len(), 5);
+    assert!(texts(&v).contains(&"Skip the slow tests."));
+    assert!(v["coverage"]["limitations"].as_array().unwrap().is_empty());
+    let sent = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["session"] != "claude-demo")
+        .unwrap();
+    assert_eq!(sent["text"], "Only the parser tests, not the fixtures.");
+    assert_eq!(sent["session"], "claude-demo/subagent-demo");
+    assert_eq!(sent["parent"], "claude-demo");
+    assert_eq!(
+        sent["reply"]["text"],
+        "The parser tests live in tests/parser.rs."
+    );
+    let subagents: Vec<&Value> = v["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["subagent"] == true)
+        .collect();
+    assert_eq!(subagents.len(), 1);
+    assert_eq!(subagents[0]["messages"], 2);
+    // A subagent's own id selects it alone.
+    let (v, code) = messages(&[
         "--input",
         dir.to_str().unwrap(),
         "--session",
         "claude-demo/subagent-demo",
     ]);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        texts(&v),
+        [
+            "Only the parser tests, not the fixtures.",
+            "Skip the slow tests."
+        ]
+    );
+    // A session whose main transcript was not read is not found.
+    std::fs::remove_file(dir.join("claude-demo.jsonl")).unwrap();
+    let out = cli(&[
+        "messages",
+        "--input",
+        dir.to_str().unwrap(),
+        "--session",
+        "claude-demo",
+    ]);
     assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("only 1 subagent transcripts"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("its main transcript was not read"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -2301,5 +2355,377 @@ fn opencode_is_a_known_gap_in_the_default_sources() {
         run(&["messages", "--agent", "claude"]).status.code(),
         Some(0)
     );
+    // A store last written before the window holds nothing from it.
+    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let age = |path: &std::path::Path| {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap()
+    };
+    age(&db.join("opencode.db"));
+    let out = run(&["messages", "--json", "--since", "7d"]);
+    assert_eq!(out.status.code(), Some(0));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["coverage"]["gaps"].as_array().unwrap().is_empty());
+    // SQLite writes through its WAL: a recent one is a gap.
+    std::fs::write(db.join("opencode.db-wal"), "").unwrap();
+    assert_eq!(
+        run(&["messages", "--json", "--since", "7d"]).status.code(),
+        Some(4)
+    );
+    age(&db.join("opencode.db-wal"));
+    assert_eq!(
+        run(&["messages", "--json", "--since", "7d"]).status.code(),
+        Some(0)
+    );
     std::fs::remove_dir_all(home).unwrap();
+}
+
+/// Codex's question tool asking `questions` (title, options), as item `id`.
+fn codex_question(id: &str, questions: &[(&str, Option<&[&str]>)]) -> Value {
+    let questions: Vec<Value> = questions
+        .iter()
+        .map(|(title, options)| serde_json::json!({"title":title,"options":options}))
+        .collect();
+    serde_json::json!({"timestamp":"2026-09-30T10:03:30Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":id,"delivery":"async","content":[],"questions":questions}}})
+}
+/// Codex's reply to its question tool: (item, index, question, answer), with
+/// `questionItemId` a JSON string, as Codex writes it.
+fn codex_reply(answers: &[(&str, u64, &str, &str)]) -> String {
+    let answers: Vec<Value> = answers
+        .iter()
+        .map(|(item, index, question, answer)| serde_json::json!({"answer":answer,"question":question,"questionItemId":serde_json::json!(["request_user_input_async",item,index]).to_string()}))
+        .collect();
+    format!(
+        "<send_user_message_question_reply>\n{}\n</send_user_message_question_reply>",
+        Value::from(answers)
+    )
+}
+
+#[test]
+fn a_persons_own_answers_rejections_and_tasks_are_listed_and_picks_are_not() {
+    // Codex: one question offers options and gets a pick; one offers them and
+    // gets an answer of the person's own; one offers none.
+    let path = transcript(
+        "codex-answers.jsonl",
+        &[
+            codex_meta("codex-answers", serde_json::json!({})),
+            codex_turn("assistant", 1, "Which parser should I keep?"),
+            codex_question(
+                "q1",
+                &[
+                    ("Which parser?", Some(&["Strict", "Lenient"])),
+                    ("Keep the fixtures?", Some(&["Yes", "No"])),
+                ],
+            ),
+            codex_question("q2", &[("Anything else?", None)]),
+            codex_turn(
+                "user",
+                4,
+                &codex_reply(&[
+                    ("q1", 0, "Which parser?", "Strict"),
+                    ("q1", 1, "Keep the fixtures?", "Neither; regenerate them."),
+                    ("q2", 0, "Anything else?", "Name the error type."),
+                ]),
+            ),
+            // Every answer a pick: nobody's own words.
+            codex_turn(
+                "user",
+                5,
+                &codex_reply(&[("q1", 0, "Which parser?", "Lenient")]),
+            ),
+        ],
+    );
+    let (v, code) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        texts(&v),
+        ["Neither; regenerate them.", "Name the error type."]
+    );
+    let answer = &v["messages"][0];
+    assert_eq!(answer["kind"], "answer");
+    assert_eq!(answer["question"], "Keep the fixtures?");
+    assert_eq!(answer["reply"]["text"], "Which parser should I keep?");
+    assert_eq!(excluded(&v)["question_reply"], 1);
+    std::fs::remove_file(path).unwrap();
+
+    // Claude: a free-text answer to its question tool, a pick (one, and
+    // several joined), and the reason given for rejecting a tool call.
+    let question = |uuid: &str, answers: Value| {
+        let mut row = claude_user(
+            uuid,
+            1,
+            serde_json::json!([{"type":"tool_result","tool_use_id":uuid,"content":"Answered."}]),
+        );
+        row["toolUseResult"] = serde_json::json!({"questions":[
+            {"question":"Which parser?","header":"Parser","multiSelect":false,"options":[{"label":"Strict","description":"s"},{"label":"Lenient","description":"l"}]},
+            {"question":"Which checks?","header":"Checks","multiSelect":true,"options":[{"label":"fmt","description":"f"},{"label":"clippy","description":"c"}]}
+        ],"answers":answers,"annotations":{}});
+        row
+    };
+    let rejected = claude_user(
+        "r1",
+        3,
+        serde_json::json!([{"type":"tool_result","tool_use_id":"x1","is_error":true,"content":"The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said:\nEdit the parser, not the tests."}]),
+    );
+    let refused = claude_user(
+        "r2",
+        4,
+        serde_json::json!([{"type":"tool_result","tool_use_id":"x2","is_error":true,"content":"The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed."}]),
+    );
+    let path = transcript(
+        "claude-answers.jsonl",
+        &[
+            question(
+                "q1",
+                serde_json::json!({"Which parser?":"Strict","Which checks?":"fmt, clippy"}),
+            ),
+            question(
+                "q2",
+                serde_json::json!({"Which parser?":"Write one by hand.","Which checks?":"fmt"}),
+            ),
+            rejected,
+            refused,
+            // The task a person typed into a launch prompt follows its packet.
+            claude_user(
+                "l1",
+                5,
+                "You are in a toimija session outside any Git repository (/demo). There is no session packet.\n\nTask: Write the release notes.\n".into(),
+            ),
+        ],
+    );
+    let (v, _) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(
+        texts(&v),
+        [
+            "Write one by hand.",
+            "Edit the parser, not the tests.",
+            "Write the release notes."
+        ]
+    );
+    let kinds: Vec<&str> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["answer", "rejection", "task"]);
+    assert_eq!(v["messages"][0]["question"], "Which parser?");
+    assert_eq!(excluded(&v)["tool_result"], 2);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_message_typed_while_the_agent_works_is_listed_once() {
+    let queued = |uuid: &str, minute: u32, text: &str| serde_json::json!({"type":"attachment","uuid":uuid,"sessionId":"claude-demo","cwd":"/demo/widget","entrypoint":"cli","isSidechain":false,"timestamp":format!("2026-09-30T09:{minute:02}:10Z"),"attachment":{"type":"queued_command","commandMode":"prompt","prompt":text,"origin":{"kind":"human"}}});
+    let path = transcript(
+        "queued.jsonl",
+        &[
+            claude_user("u1", 0, "Refactor the parser.".into()),
+            // Absorbed mid-turn: the attachment is its only record.
+            queued("q1", 1, "Keep the public API."),
+            // Queued, then delivered as a message of its own.
+            queued("q2", 2, "Also update the docs."),
+            claude_reply("a1", 3, "Refactored."),
+            claude_user("u2", 4, "Also update the docs.".into()),
+            // A notification the harness queued is no person's.
+            serde_json::json!({"type":"attachment","uuid":"q3","sessionId":"claude-demo","timestamp":"2026-09-30T09:05:00Z","attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification>done</task-notification>"}}),
+        ],
+    );
+    let (v, _) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(
+        texts(&v),
+        [
+            "Refactor the parser.",
+            "Keep the public API.",
+            "Also update the docs."
+        ]
+    );
+    assert_eq!(v["messages"][1]["kind"], "queued");
+    assert_eq!(v["messages"][2]["kind"], "message");
+    assert_eq!(excluded(&v)["duplicate"], 1);
+    assert_eq!(excluded(&v)["harness_origin"], 1);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn each_structural_rule_excludes_what_it_names() {
+    // A message read again from a copy of its session counts once.
+    let dir = temp("copies");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy("examples/claude.jsonl", dir.join("a.jsonl")).unwrap();
+    std::fs::copy("examples/claude.jsonl", dir.join("b.jsonl")).unwrap();
+    let (v, _) = messages(&["--input", dir.to_str().unwrap()]);
+    assert_eq!(texts(&v).len(), 3);
+    assert_eq!(excluded(&v)["duplicate"], 3);
+    std::fs::remove_dir_all(dir).unwrap();
+
+    let mut sidechain = claude_user("c1", 3, "Find the tests.".into());
+    sidechain["isSidechain"] = true.into();
+    let mut sdk = claude_user("c2", 4, "Summarise.".into());
+    sdk["promptSource"] = "sdk".into();
+    let mut peer = claude_user("c3", 5, "Review done.".into());
+    peer["origin"] = serde_json::json!({"kind":"peer"});
+    let mut system = claude_user("c4", 6, "Scheduled check.".into());
+    system["promptSource"] = "system".into();
+    let mut other = claude_user("c5", 7, "From elsewhere.".into());
+    other["sessionId"] = "claude-other".into();
+    let path = transcript(
+        "structural.jsonl",
+        &[
+            claude_user("u1", 0, "Fix the parser.".into()),
+            // An image alone has no text to read.
+            claude_user(
+                "e1",
+                1,
+                serde_json::json!([{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]),
+            ),
+            sidechain,
+            sdk,
+            peer,
+            system,
+            other,
+        ],
+    );
+    let (v, code) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(texts(&v), ["Fix the parser."]);
+    let rules = excluded(&v);
+    for (rule, n) in [
+        ("empty", 1),
+        ("subagent", 1),
+        ("headless", 1),
+        ("harness_origin", 2),
+        ("other_session", 1),
+    ] {
+        assert_eq!(rules[rule], n, "{rule}");
+    }
+    // A record of another session leaves this one's list partial.
+    assert_eq!(code, Some(4));
+    assert!(v["coverage"]["limitations"][0]
+        .as_str()
+        .unwrap()
+        .contains("a record of another session"));
+    std::fs::remove_file(path).unwrap();
+
+    // Codex: the bare AGENTS.md heading, and a `codex exec` run in which a
+    // person submitted a turn interactively.
+    let path = transcript(
+        "codex-exec-interactive.jsonl",
+        &[
+            codex_meta(
+                "codex-exec-interactive",
+                serde_json::json!({"source":"exec","originator":"codex_exec"}),
+            ),
+            codex_turn(
+                "user",
+                1,
+                "# AGENTS.md instructions\n<INSTRUCTIONS>\nRust only.\n</INSTRUCTIONS>",
+            ),
+            {
+                let mut turn = codex_turn("user", 2, "Now check the parser.");
+                turn["payload"]["id"] = "msg_demo".into();
+                turn
+            },
+            serde_json::json!({"timestamp":"2026-09-30T10:02:00Z","type":"event_msg","payload":{"type":"user_message","message":"Now check the parser."}}),
+        ],
+    );
+    let (v, _) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(texts(&v), ["Now check the parser."]);
+    assert_eq!(v["messages"][0]["id"], "msg_demo");
+    assert_eq!(excluded(&v)["envelope"], 1);
+    assert_eq!(v["sessions"][0]["headless"], false);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_fork_of_a_fork_is_read_after_its_parents_whatever_their_paths() {
+    // Path order would read the grandchild first, then the child, then the
+    // parent; each needs its parent's transcript first.
+    let dir = temp("fork-chain");
+    std::fs::create_dir_all(&dir).unwrap();
+    let parent = vec![
+        codex_meta("codex-parent", serde_json::json!({})),
+        codex_turn("user", 1, "Add the parser."),
+        codex_turn("assistant", 2, "Added the parser."),
+    ];
+    let fork = |id: &str, from: &str, copied: &[Value], own: &str, minute: u32| {
+        let mut rows = vec![codex_meta(
+            id,
+            serde_json::json!({"forked_from_id":from,"timestamp":format!("2026-09-30T10:{minute:02}:00Z")}),
+        )];
+        rows.extend(copied.iter().cloned());
+        rows.push(codex_turn("user", minute + 1, own));
+        rows.push(codex_turn("assistant", minute + 2, "Done."));
+        rows
+    };
+    let child = fork(
+        "codex-child",
+        "codex-parent",
+        &parent,
+        "Try the strict parser.",
+        20,
+    );
+    let grandchild = fork(
+        "codex-grandchild",
+        "codex-child",
+        &child,
+        "Try the lenient one.",
+        40,
+    );
+    write_lines(&dir.join("a-grandchild.jsonl"), &grandchild);
+    write_lines(&dir.join("b-child.jsonl"), &child);
+    write_lines(&dir.join("c-parent.jsonl"), &parent);
+    let (v, code) = messages(&["--input", dir.to_str().unwrap()]);
+    assert_eq!(code, Some(0), "{}", v["coverage"]["limitations"]);
+    let mut listed = texts(&v);
+    listed.sort();
+    assert_eq!(
+        listed,
+        [
+            "Add the parser.",
+            "Try the lenient one.",
+            "Try the strict parser."
+        ]
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn since_is_exclusive_like_intakes_window_and_errors_leave_no_partial_json() {
+    // A reader passes the time of the last message it handled: that message
+    // is not listed again.
+    let (v, _) = messages(&[
+        "--input",
+        "examples/claude.jsonl",
+        "--since",
+        "2026-09-30T09:02:00Z",
+    ]);
+    assert_eq!(
+        texts(&v),
+        ["Please run the existing local checks before finishing."]
+    );
+    assert_eq!(v["messages"][0]["id"], "u3");
+    assert_eq!(v["coverage"]["earlier"], 2);
+    let (v, _) = messages(&[
+        "--input",
+        "examples/claude.jsonl",
+        "--since",
+        "2026-09-30T09:01:59.999Z",
+    ]);
+    assert_eq!(texts(&v).len(), 2);
+
+    // A run that fails before its first message writes nothing to stdout.
+    let out = cli(&[
+        "messages",
+        "--json",
+        "--input",
+        "examples/claude.jsonl",
+        "--session",
+        "missing",
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
 }

@@ -467,12 +467,28 @@ fn supported(agent: &str) -> Result<()> {
     Ok(())
 }
 
-/// opencode's session store, where it is: a known source Vessa does not read.
-fn opencode() -> Option<PathBuf> {
+/// opencode's session store, when it was written in the window: a known
+/// source Vessa does not read. SQLite writes through its `-wal` file, so
+/// either may be the newer; a time that cannot be read counts as written.
+fn opencode(since: Option<chrono::DateTime<chrono::FixedOffset>>) -> Option<PathBuf> {
     let data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
-    Some(data.join("opencode/opencode.db")).filter(|p| p.exists())
+    let db = data.join("opencode/opencode.db");
+    if !db.exists() {
+        return None;
+    }
+    let Some(since) = since else {
+        return Some(db);
+    };
+    let wal = db.with_file_name("opencode.db-wal");
+    let written = |path: &std::path::Path| {
+        path.exists()
+            && std::fs::metadata(path)
+                .and_then(|m| m.modified())
+                .map_or(true, |t| chrono::DateTime::<chrono::Utc>::from(t) > since)
+    };
+    (written(&db) || written(&wal)).then_some(db)
 }
 
 /// `--since`: RFC 3339, a UTC date, or an age in days or hours.
@@ -504,6 +520,92 @@ fn since(text: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
         .fixed_offset())
 }
 
+/// `vessa-messages.v1`, written as messages arrive, one a line. The document
+/// opens with its first message, so a run that fails before one leaves
+/// nothing on stdout, and one that fails after ends it with its `error`.
+struct Document<W: Write> {
+    out: W,
+    written: usize,
+}
+
+impl<W: Write> Document<W> {
+    fn new(out: W) -> Self {
+        Document { out, written: 0 }
+    }
+
+    fn message(&mut self, m: &model::Message) -> Result<()> {
+        if self.written == 0 {
+            write!(
+                self.out,
+                "{{\"schema\":\"vessa-messages.v1\",\"messages\":["
+            )?;
+        } else {
+            write!(self.out, ",")?;
+        }
+        writeln!(self.out)?;
+        serde_json::to_writer(&mut self.out, m)?;
+        self.written += 1;
+        Ok(())
+    }
+
+    fn finish(&mut self, listing: &import::Listing) -> Result<()> {
+        if self.written == 0 {
+            write!(
+                self.out,
+                "{{\"schema\":\"vessa-messages.v1\",\"messages\":["
+            )?;
+        }
+        write!(self.out, "\n],\n\"sessions\":")?;
+        serde_json::to_writer(&mut self.out, &listing.sessions)?;
+        write!(self.out, ",\n\"coverage\":")?;
+        serde_json::to_writer(&mut self.out, &listing.coverage)?;
+        write!(self.out, ",\n\"warnings\":")?;
+        serde_json::to_writer(&mut self.out, &listing.warnings)?;
+        writeln!(self.out, "}}")?;
+        self.out.flush()?;
+        Ok(())
+    }
+
+    /// Ends a document the failure left open. Its messages are those read
+    /// before it; without coverage, it says nothing of the rest.
+    fn fail(&mut self, error: &anyhow::Error) {
+        if self.written > 0 {
+            let _ = write!(self.out, "\n],\n\"error\":");
+            let _ = serde_json::to_writer(&mut self.out, &format!("{error:#}"));
+            let _ = writeln!(self.out, "}}");
+        }
+        let _ = self.out.flush();
+    }
+}
+
+/// One message in the plain form: where it was said, then its text.
+fn plain(out: &mut impl Write, m: &model::Message) -> Result<()> {
+    let mut notes = String::new();
+    if m.kind != "message" {
+        notes.push_str(" · ");
+        notes.push_str(m.kind);
+    }
+    if m.reply.as_ref().is_some_and(|r| r.failed) {
+        notes.push_str(" · after a failed reply");
+    }
+    writeln!(
+        out,
+        "{} {} · {} · {} · {}:{}{notes}",
+        m.agent,
+        m.session,
+        m.at.as_deref().unwrap_or("undated"),
+        m.cwd,
+        m.source,
+        m.line,
+    )?;
+    for line in m.text.lines() {
+        // Imported text is untrusted terminal content.
+        let line: String = line.chars().filter(|c| !c.is_control()).collect();
+        writeln!(out, "  {line}")?;
+    }
+    Ok(())
+}
+
 /// `vessa messages`: each message is written as its transcript is read.
 fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
     if let Some(agent) = &cli.agent {
@@ -515,66 +617,37 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
         since: from.map(since).transpose()?,
     };
     let paths = inputs(cli)?;
-    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
-    if cli.json {
-        write!(out, "{{\"schema\":\"vessa-messages.v1\",\"messages\":[")?;
-    }
-    let mut first = true;
-    let mut emit = |m: &model::Message| -> Result<()> {
-        if cli.json {
-            // One message a line, inside one JSON document.
-            if !first {
-                write!(out, ",")?;
-            }
-            writeln!(out)?;
-            serde_json::to_writer(&mut out, m)?;
-        } else {
-            writeln!(
-                out,
-                "{} {} · {} · {} · {}:{}{}",
-                m.agent,
-                m.session,
-                m.at.as_deref().unwrap_or("undated"),
-                m.cwd,
-                m.source,
-                m.line,
-                if m.reply.as_ref().is_some_and(|r| r.failed) {
-                    " · after a failed reply"
-                } else {
-                    ""
-                }
-            )?;
-            for line in m.text.lines() {
-                // Imported text is untrusted terminal content.
-                let line: String = line.chars().filter(|c| !c.is_control()).collect();
-                writeln!(out, "  {line}")?;
-            }
-        }
-        first = false;
-        Ok(())
-    };
-    let mut listing = import::messages(&paths, &select, &mut emit)?;
     // The default sources hold every agent Vessa reads; one it knows of and
-    // does not read leaves the list partial.
-    if cli.input.is_empty() && cli.agent.is_none() {
-        if let Some(db) = opencode() {
-            listing.coverage.gaps.push(format!(
-                "opencode: {} not read; opencode keeps its sessions in SQLite, which Vessa does not read",
-                db.display()
-            ));
-        }
-    }
-    let c = &listing.coverage;
-    if cli.json {
-        write!(out, "\n],\n\"sessions\":")?;
-        serde_json::to_writer(&mut out, &listing.sessions)?;
-        write!(out, ",\n\"coverage\":")?;
-        serde_json::to_writer(&mut out, c)?;
-        write!(out, ",\n\"warnings\":")?;
-        serde_json::to_writer(&mut out, &listing.warnings)?;
-        writeln!(out, "}}")?;
+    // does not read, written in the window, leaves the list partial.
+    let gap = if cli.input.is_empty() && cli.agent.is_none() {
+        opencode(select.since)
     } else {
-        let excluded: usize = c.excluded.values().sum();
+        None
+    };
+    let gaps = gap.into_iter().map(|db| {
+        format!(
+            "opencode: {} not read; opencode keeps its sessions in SQLite, which Vessa does not read",
+            db.display()
+        )
+    });
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    let listing = if cli.json {
+        let mut doc = Document::new(&mut out);
+        match import::messages(&paths, &select, &mut |m| doc.message(m)) {
+            Ok(mut listing) => {
+                listing.coverage.gaps.extend(gaps);
+                doc.finish(&listing)?;
+                listing
+            }
+            Err(error) => {
+                doc.fail(&error);
+                return Err(error);
+            }
+        }
+    } else {
+        let mut listing = import::messages(&paths, &select, &mut |m| plain(&mut out, m))?;
+        listing.coverage.gaps.extend(gaps);
+        let c = &listing.coverage;
         let rules = c
             .excluded
             .iter()
@@ -583,27 +656,26 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
             .join(", ");
         writeln!(
             out,
-            "{} messages from {} sessions ({} headless) · {} other user turns not listed{} · {} subagent transcripts not read",
+            "{} messages from {} sessions ({} headless) · {} other user turns not listed{} · {} Codex subagent transcripts not read",
             c.human,
             listing.sessions.iter().filter(|s| s.messages > 0).count(),
             listing.sessions.iter().filter(|s| s.headless).count(),
-            excluded,
+            c.excluded.values().sum::<usize>(),
             if rules.is_empty() { String::new() } else { format!(": {rules}") },
             c.subagent_transcripts,
         )?;
-        if c.since.is_some() {
+        if let Some(since) = &c.since {
             writeln!(
                 out,
-                "since {}: {} earlier and {} undated messages not listed; {} transcripts unmodified since, not read",
-                c.since.as_deref().unwrap_or_default(),
-                c.earlier,
-                c.undated,
-                c.unmodified_transcripts
+                "after {since}: {} earlier and {} undated messages not listed; {} transcripts unmodified since, not read",
+                c.earlier, c.undated, c.unmodified_transcripts
             )?;
         }
-    }
-    out.flush()?;
+        out.flush()?;
+        listing
+    };
     drop(out);
+    let c = &listing.coverage;
     for warning in listing.warnings.iter().chain(&c.gaps) {
         eprintln!("vessa: {warning}");
     }
@@ -650,5 +722,48 @@ fn main() {
             eprintln!("vessa: {e:#}");
             std::process::exit(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(text: &str) -> model::Message {
+        model::Message {
+            agent: "claude".into(),
+            session: "claude-demo".into(),
+            parent: None,
+            kind: "message",
+            id: Some("u1".into()),
+            at: Some("2026-09-30T09:00:00Z".into()),
+            cwd: "/demo/widget".into(),
+            text: text.into(),
+            question: None,
+            reply: None,
+            source: "/demo/claude-demo.jsonl".into(),
+            line: 1,
+        }
+    }
+
+    #[test]
+    fn a_failure_mid_stream_still_leaves_one_json_document() {
+        let mut out = Vec::new();
+        let mut doc = Document::new(&mut out);
+        doc.message(&message("Run the checks.")).unwrap();
+        doc.message(&message("Then commit.")).unwrap();
+        doc.fail(&anyhow::anyhow!("transcript vanished"));
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["schema"], "vessa-messages.v1");
+        assert_eq!(v["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(v["error"], "transcript vanished");
+        assert!(v.get("coverage").is_none());
+    }
+
+    #[test]
+    fn a_failure_before_any_message_leaves_nothing() {
+        let mut out = Vec::new();
+        Document::new(&mut out).fail(&anyhow::anyhow!("no such session"));
+        assert!(out.is_empty());
     }
 }
