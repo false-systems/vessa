@@ -74,7 +74,9 @@ Codex writes each subagent, and each other thread a session spawns (such as a
 review), to a transcript of its own, under its own thread id. Its
 `session_meta` says it is a subagent (`source.subagent`) and names the session
 at its root (`session_id`; older Codex writes only the thread it came from,
-`parent_thread_id` or `forked_from_id`). Vessa keeps the thread id and its
+`parent_thread_id` or `forked_from_id`, which Vessa follows through the threads
+read to the root). A lineage that loops has no root: each thread in it stands
+alone, with a limitation. Vessa keeps the thread id and its
 `parent`, and counts it to that root session by the rules above: `--session`
 selects the session with its subagents, `status` and `receipt` total them
 (the receipt names them in `limitations`), `stats` counts the session once and

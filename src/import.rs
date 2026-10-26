@@ -9,6 +9,7 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
     // ponytail: selected transcripts are held in memory; stream compact
     // summaries if archive size makes this one-shot reader too expensive.
     let (mut report, wrappers) = sessions(paths, parse_file);
+    roots(&mut report.sessions.iter_mut().collect::<Vec<_>>(), true);
     deduplicate(&mut report);
     link(&mut report, wrappers);
     Ok(report)
@@ -20,6 +21,8 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
 /// so the sessions carry no usage and no limitations.
 pub fn headers(paths: &[PathBuf]) -> Result<Report> {
     let (mut report, wrappers) = sessions(paths, header_file);
+    // Headers carry no limitations: a looping lineage stands alone silently.
+    roots(&mut report.sessions.iter_mut().collect::<Vec<_>>(), false);
     report.schema = "vessa-session-headers.v1".into();
     link(&mut report, wrappers);
     Ok(report)
@@ -67,6 +70,44 @@ fn sessions(paths: &[PathBuf], parse: fn(&Path) -> Result<Parsed>) -> (Report, V
     // original session when both sources are available.
     report.sessions.sort_by_key(|s| s.parent.is_some());
     (report, wrappers)
+}
+
+/// Points each Codex subagent at the session at its root, through the
+/// threads read. Newer Codex names the root itself (`session_id`); older
+/// Codex names only the thread a subagent came from, which may be another
+/// subagent. A lineage that loops has no root: each thread in it stands
+/// alone, and with `limit` says so in its limitations.
+fn roots(sessions: &mut [&mut Session], limit: bool) {
+    let links: HashMap<String, String> = sessions
+        .iter()
+        .filter(|s| s.agent == "codex")
+        .filter_map(|s| Some((s.id.clone(), s.root.clone()?)))
+        .collect();
+    for session in sessions.iter_mut().filter(|s| s.agent == "codex") {
+        let Some(mut root) = session.root.take() else {
+            continue;
+        };
+        // The threads walked so far; reaching one again is a loop.
+        let mut path = vec![session.id.clone()];
+        let looped = loop {
+            let Some(next) = links.get(&root) else {
+                break false;
+            };
+            let again = path.contains(&root);
+            path.push(std::mem::replace(&mut root, next.clone()));
+            if again {
+                break true;
+            }
+        };
+        if !looped {
+            session.root = Some(root);
+        } else if limit {
+            session.limitations.push(format!(
+                "Codex subagent lineage loops ({}); its root session is unknown, so it counts as a session of its own",
+                path.join(" -> ")
+            ));
+        }
+    }
 }
 
 /// Every file under `paths` that may be a transcript or an ohjaa export, in
@@ -962,6 +1003,11 @@ pub fn messages(
             Err(error) => warnings.push(format!("{}: {error:#}", file.display())),
         }
     }
+    // As the other readers do, so `--session` selects the same subagents.
+    roots(
+        &mut headers.iter_mut().map(|(_, s)| s).collect::<Vec<_>>(),
+        false,
+    );
     let chosen = |s: &Session| {
         select.agent.as_ref().is_none_or(|a| *a == s.agent)
             && select

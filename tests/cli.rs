@@ -1755,6 +1755,90 @@ fn codex_subagents_count_with_their_root_session() {
     std::fs::remove_dir_all(alone).unwrap();
 }
 
+#[test]
+fn an_older_codex_subagents_subagent_still_counts_to_the_root() {
+    // Older Codex writes no `session_id`: a thread names only the thread it
+    // came from. R spawned C, and C spawned the review G.
+    let dir = temp("codex-older-family");
+    std::fs::create_dir_all(&dir).unwrap();
+    codex_thread(&dir, "R", serde_json::json!({}), [100, 0, 10], [100, 0, 10]);
+    codex_thread(
+        &dir,
+        "C",
+        serde_json::json!({"parent_thread_id":"R","source":{"subagent":{"other":"worker"}}}),
+        [500, 0, 50],
+        [100, 0, 10],
+    );
+    codex_thread(
+        &dir,
+        "G",
+        serde_json::json!({"parent_thread_id":"C","source":{"subagent":{"other":"guardian"}}}),
+        [300, 0, 40],
+        [100, 0, 10],
+    );
+    let input = dir.to_str().unwrap();
+    let v = value(cli(&["stats", "--input", input, "--json"]));
+    assert_eq!(v["buckets"][0]["sessions"], 1);
+    assert_eq!(v["buckets"][0]["subagents"], 2);
+    let v = value(cli(&["receipt", "--input", input, "--session", "R"]));
+    assert_eq!(v["entries"][0]["output_tokens"], 30);
+    assert!(v["limitations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|l| l.as_str().unwrap().contains(
+            "2 Codex subagents of this session, each read from its own transcript: C, G"
+        )));
+    let v = value(cli(&["usage", "--input", input, "--json"]));
+    let root = v["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "R")
+        .unwrap();
+    assert_eq!(root["subagents"], serde_json::json!(["C", "G"]));
+    // Selecting the root selects both, in headers too.
+    let v = value(cli(&[
+        "sessions",
+        "--headers",
+        "--json",
+        "--input",
+        input,
+        "--session",
+        "R",
+    ]));
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 3);
+
+    // A lineage that loops names no root: each thread in it stands alone,
+    // and says so.
+    std::fs::remove_file(dir.join("R.jsonl")).unwrap();
+    codex_thread(
+        &dir,
+        "C",
+        serde_json::json!({"parent_thread_id":"G","source":{"subagent":{"other":"worker"}}}),
+        [500, 0, 50],
+        [100, 0, 10],
+    );
+    let output = cli(&["usage", "--input", input, "--json"]);
+    assert_eq!(output.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    for s in v["sessions"].as_array().unwrap() {
+        assert!(
+            s["limitations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l.as_str().unwrap().contains("lineage loops")),
+            "{s}"
+        );
+    }
+    let v: Value =
+        serde_json::from_slice(&cli(&["stats", "--input", input, "--json"]).stdout).unwrap();
+    assert_eq!(v["buckets"][0]["sessions"], 2);
+    assert_eq!(v["buckets"][0]["subagents"], 0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 /// A session header's fields: `vessa-session-headers.v1` has these and no
 /// others, each as `vessa-usage.v1` has it.
 const HEADER: [&str; 8] = [
