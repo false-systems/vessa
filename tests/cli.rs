@@ -2083,7 +2083,7 @@ fn headless_prompts_are_not_listed_and_their_sessions_say_so() {
                 "codex-exec",
                 serde_json::json!({"source":"exec","originator":"codex_exec"}),
             ),
-            codex_turn("user", 1, "Measure only: respond OK."),
+            codex_turn("user", 1, "Summarise the widget changelog."),
         ],
     );
     let (v, _) = messages(&[
