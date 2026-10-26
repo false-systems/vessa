@@ -15,7 +15,8 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
-    /// Native JSONL file/directory or ohjaa JSON export; repeatable.
+    /// Native JSONL file/directory, or a wrapper's ohjaa-sessions.v1 JSON
+    /// export; repeatable.
     #[arg(long, global = true)]
     input: Vec<PathBuf>,
     #[arg(long, global = true)]
@@ -57,7 +58,8 @@ enum Cmd {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Emit one agent-usage.v1 snapshot for `ohjaa usage import`.
+    /// Emit one session's usage as an agent-usage.v1 receipt, for a wrapper
+    /// to import.
     Receipt,
     /// Current recorded usage for exactly one explicitly selected session.
     Status,

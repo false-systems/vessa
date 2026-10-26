@@ -81,12 +81,12 @@ fn overview(out: &mut String, report: &Report) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
     ranked.sort_by_key(|(_, _, known, _)| std::cmp::Reverse(*known));
-    out.push_str("<h3>Sessions by known estimate subtotal</h3><p>Unpriced sessions can cost more than their position suggests.</p><div class=\"scroll\"><table><thead><tr><th scope=\"col\">Session</th><th scope=\"col\">Known estimate subtotal</th><th scope=\"col\">Unpriced records</th><th scope=\"col\">Linked Ohjaa records</th></tr></thead><tbody>");
+    out.push_str("<h3>Sessions by known estimate subtotal</h3><p>Unpriced sessions can cost more than their position suggests.</p><div class=\"scroll\"><table><thead><tr><th scope=\"col\">Session</th><th scope=\"col\">Known estimate subtotal</th><th scope=\"col\">Unpriced records</th><th scope=\"col\">Linked wrapper records</th></tr></thead><tbody>");
     for (i, s, known, unpriced) in ranked {
         let _ = write!(out, "<tr><th scope=\"row\"><a href=\"#s{i}\">{} · {}</a></th><td>{}</td><td>{unpriced}</td><td>{}</td></tr>", escape(&s.agent), escape(&s.id), dollars(Some(known)), s.ohjaa.len());
     }
     out.push_str("</tbody></table></div><h3>What the token categories mean</h3><p>Uncached input is new input processing; cached input read is reused input processing, not free tokens. Cache writes and output have separate rates. Output already includes reasoning where the source counts it. These categories do not identify which file or instruction caused the usage.</p></section>");
-    out.push_str("<section aria-labelledby=\"reduce\"><h2 id=\"reduce\">Reduce repeated work with Ohjaa and Toimija</h2><ol><li>Start in the task repository through <code>ohjaa run --intent &quot;bounded task&quot; --task &quot;bounded task&quot; codex</code>. Ohjaa supplies knowledge and the previous handover, then launches through Toimija. Do not nest a second wrapper.</li><li>Use the delivered Toimija workset and read order instead of scanning the repository again. Read additional files only for a concrete missing dependency; refresh when Git facts become stale.</li><li>Use Ohjaa's decisions and handover instead of rediscovering accepted choices. Record remaining work at completion, not after every reply. Do not trim safety instructions or skip checks to save tokens.</li><li>Attach a Vessa receipt to the explicit Ohjaa session and include its export in this report. Compare similar tasks with the same model, rates and validation: uncached input, output, cache usage and completion evidence, not dollars alone.</li></ol><p><strong>Savings are not measured here.</strong> A linked wrapper record proves association, not that its briefing was used or that it saved tokens. A before/after comparison needs comparable task and outcome evidence; launch overhead alone is not net savings.</p></section>");
+    out.push_str("<section aria-labelledby=\"reduce\"><h2 id=\"reduce\">Reduce repeated work</h2><ol><li>Start each bounded task in its repository through one launching wrapper that hands the agent what is already known and the previous handover. Do not nest a second wrapper.</li><li>Use the working set and read order it delivers instead of scanning the repository again. Read additional files only for a concrete missing dependency; refresh when Git facts become stale.</li><li>Use recorded decisions and the handover instead of rediscovering accepted choices. Record remaining work at completion, not after every reply. Do not trim safety instructions or skip checks to save tokens.</li><li>Attach a Vessa receipt (<code>vessa receipt</code>) to the explicit wrapper session and include the wrapper's session export in this report. Compare similar tasks with the same model, rates and validation: uncached input, output, cache usage and completion evidence, not dollars alone.</li></ol><p><strong>Savings are not measured here.</strong> A linked wrapper record proves association, not that its briefing was used or that it saved tokens. A before/after comparison needs comparable task and outcome evidence; launch overhead alone is not net savings.</p></section>");
     Ok(())
 }
 pub fn html(report: &Report) -> Result<String> {
@@ -171,7 +171,7 @@ pub fn html(report: &Report) -> Result<String> {
         );
         if !s.ohjaa.is_empty() {
             out.push_str(
-                "<details><summary>Explicitly linked ohjaa session records</summary><pre>",
+                "<details><summary>Explicitly linked wrapper session records</summary><pre>",
             );
             out.push_str(&escape(&serde_json::to_string_pretty(&s.ohjaa)?));
             out.push_str("</pre></details>");

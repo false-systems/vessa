@@ -154,6 +154,22 @@ fn report_explains_partial_spending_and_command_evidence() {
     assert!(html.contains("Savings are not measured here."));
     assert!(html.contains("Do not nest a second wrapper."));
     assert!(!html.contains("Please run the existing local checks"));
+    // Vessa describes itself, naming no other tool, in what it renders. The
+    // wrapper export it imports is named by its schema alone.
+    let help = [
+        &["--help"][..],
+        &["report", "--help"],
+        &["receipt", "--help"],
+    ]
+    .iter()
+    .map(|args| String::from_utf8(cli(args).stdout).unwrap())
+    .collect::<String>();
+    for (what, text) in [("report", &html), ("help", &help)] {
+        let text = text.to_lowercase().replace("ohjaa-sessions.v1", "");
+        for name in ["ohjaa", "toimija", "seula"] {
+            assert!(!text.contains(name), "{what} names {name}");
+        }
+    }
     std::fs::remove_file(path).unwrap();
 }
 
