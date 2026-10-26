@@ -43,7 +43,7 @@ enum Cmd {
         /// Each session's header alone (identity, lineage, start, folder,
         /// origin), read from a transcript's opening records only. With
         /// --json: vessa-session-headers.v1.
-        #[arg(long, conflicts_with = "rates")]
+        #[arg(long)]
         headers: bool,
     },
     /// Token categories and estimates by session/provider/model.
@@ -108,6 +108,14 @@ fn run_once(cli: Cli) -> Result<i32> {
             "status requires --input or --session; never guesses the latest session"
         );
     }
+    let headers = matches!(cli.command, Cmd::Sessions { headers: true });
+    // Checked here, not by clap: `--rates` is global, and given before the
+    // subcommand a clap conflict does not see it. Headers read no usage to
+    // price, and rate-card notices would read as source warnings.
+    ensure!(
+        !headers || cli.rates.is_none(),
+        "--rates cannot be used with sessions --headers, which reads no usage to price"
+    );
     let paths = if cli.input.is_empty() {
         let home =
             PathBuf::from(std::env::var_os("HOME").context("HOME unavailable; pass --input")?);
@@ -119,7 +127,6 @@ fn run_once(cli: Cli) -> Result<i32> {
     } else {
         cli.input
     };
-    let headers = matches!(cli.command, Cmd::Sessions { headers: true });
     let mut report = if headers {
         import::headers(&paths)?
     } else {
