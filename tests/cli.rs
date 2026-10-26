@@ -760,6 +760,48 @@ fn full_runs_are_partial_only_for_real_gaps() {
 }
 
 #[test]
+fn an_agent_that_is_not_installed_is_no_gap() {
+    // Only Claude Code is installed: no `~/.codex`, no `~/.pi`.
+    let home = temp("claude-only-home");
+    std::fs::create_dir_all(home.join(".claude/projects/demo")).unwrap();
+    std::fs::copy(
+        "examples/claude.jsonl",
+        home.join(".claude/projects/demo/claude-demo.jsonl"),
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_vessa"))
+            .args(args)
+            .env("HOME", &home)
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap()
+    };
+    for args in [
+        &["usage", "--json"][..],
+        &["sessions", "--headers", "--json"],
+        &["messages", "--json"],
+    ] {
+        let out = run(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {stderr}");
+        assert!(stderr.is_empty(), "{args:?}: {stderr}");
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert!(v["warnings"].as_array().unwrap().is_empty(), "{args:?}");
+    }
+    // A path asked for by name that is not there is a gap.
+    let missing = home.join(".pi/agent/sessions");
+    let out = run(&["usage", "--json", "--input", missing.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(v["warnings"][0]
+        .as_str()
+        .unwrap()
+        .starts_with(missing.to_str().unwrap()));
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
 fn codex_cache_writes_are_read_when_present() {
     // Newer Codex counters also report cache writes. Vessa assumes that, like
     // cached reads, they are part of the inclusive input count. Every real

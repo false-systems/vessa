@@ -21,12 +21,13 @@ cargo run -- messages --since 7d --json
 
 `--input` is repeatable and accepts a file or directory. Without it, Vessa
 reads `~/.claude/projects`, `~/.codex/sessions`, and `~/.pi/agent/sessions`.
+One of these that does not exist is an agent not installed here, and no gap.
 Directories discover native `.jsonl` transcripts; select ohjaa `.json` exports
 as explicit files so agent metadata JSON is not mistaken for a usage source.
 Pass explicit paths for relocated agent directories or a bounded selection.
 Use `--agent claude|codex|pi` or `--session NATIVE-ID` to filter results.
-Missing paths, malformed records and unsupported formats are reported, not
-silently treated as zero. Exit 4 means the usage evidence is partial: a source
+Missing `--input` paths, malformed records and unsupported formats are
+reported, not silently treated as zero. Exit 4 means the usage evidence is partial: a source
 warning or a session limitation, each printed to stderr, and a last line that
 counts them. Rate-card notices do not set it. Exit 1 means the requested
 operation failed. Use the emitted limitations to judge coverage.

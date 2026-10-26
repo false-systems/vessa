@@ -443,16 +443,29 @@ fn run_once(cli: Cli) -> Result<i32> {
 }
 
 /// The paths given with `--input`, else the agents' own session folders.
+/// A default folder that does not exist is an agent not installed here, or
+/// one that has kept no session yet: nothing to read, and no gap. A path
+/// given with `--input` that does not exist is a warning.
 fn inputs(cli: &Cli) -> Result<Vec<PathBuf>> {
     if !cli.input.is_empty() {
         return Ok(cli.input.clone());
     }
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable; pass --input")?);
-    Ok(vec![
+    Ok([
         home.join(".claude/projects"),
         home.join(".codex/sessions"),
         home.join(".pi/agent/sessions"),
-    ])
+    ]
+    .into_iter()
+    // Any other failure to look, such as a folder that cannot be read, is
+    // still read and reported.
+    .filter(|path| {
+        std::fs::symlink_metadata(path).map_or_else(
+            |error| error.kind() != std::io::ErrorKind::NotFound,
+            |_| true,
+        )
+    })
+    .collect())
 }
 
 fn supported(agent: &str) -> Result<()> {
