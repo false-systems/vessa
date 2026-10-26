@@ -837,6 +837,35 @@ fn claude_synthetic_records_are_counted_as_no_usage_not_conflicts() {
     ]));
     assert_eq!(v["sessions"][0]["synthetic_records"], 0);
 
+    // A session whose only answer was synthetic recorded no usage, and says
+    // so: it is not unknown, as one with no records at all is.
+    let only = temp("synthetic-only.jsonl");
+    write_lines(
+        &only,
+        &[
+            rows[0].clone(),
+            synthetic("s3", None, "00000000-0000-4000-8000-000000000003"),
+        ],
+    );
+    let output = cli(&["usage", "--input", only.to_str().unwrap(), "--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(v["sessions"][0]["synthetic_records"], 1);
+    assert!(v["sessions"][0]["usage"].as_array().unwrap().is_empty());
+    assert!(v["sessions"][0]["limitations"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    write_lines(&only, &rows[..1]);
+    assert_eq!(
+        cli(&["usage", "--input", only.to_str().unwrap()])
+            .status
+            .code(),
+        Some(4)
+    );
+    std::fs::remove_file(only).unwrap();
+
     // One that reports usage is no known non-usage record: it is read as
     // usage, and here conflicts with the request it shares an id with.
     rows[3]["message"]["usage"]["output_tokens"] = 5.into();

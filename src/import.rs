@@ -198,9 +198,10 @@ fn deduplicate(report: &mut Report) {
         session.usage = usage;
         session.counted_elsewhere = elsewhere.len();
         // A subagent whose every request its session already holds has had
-        // its usage counted there; it is not unknown.
+        // its usage counted there; it is not unknown. Nor is a session whose
+        // only answers were synthetic: what it recorded holds no usage.
         let counted = session.subagent_of().is_some() && session.counted_elsewhere > 0;
-        if session.usage.is_empty() && !counted {
+        if session.usage.is_empty() && !counted && session.synthetic.is_empty() {
             session
                 .limitations
                 .push("No usage records found; consumption is unknown, not zero".into());

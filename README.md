@@ -239,8 +239,9 @@ never adds a reasoning subcategory a second time.
   Claude Code also writes `<synthetic>` assistant messages of its own, with
   zero usage, where a request failed or was refused, some under that
   request's id. They are no request: each session counts them once in
-  `synthetic_records`, and they are neither usage nor a conflict. One that
-  reports usage is read as usage.
+  `synthetic_records`, and they are neither usage nor a conflict. A session
+  whose only answers were synthetic recorded no usage, so it is not unknown.
+  One that reports usage is read as usage.
 * Codex: differences cumulative input/output/cache counters, ignores repeated
   totals, and associates deltas with the current model context. Counter resets
   are flagged, with a new baseline, rather than inventing negative usage. The
