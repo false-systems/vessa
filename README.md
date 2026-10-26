@@ -249,9 +249,9 @@ estimate unless the supplied rate actually represents them.
 
 ## Messages
 
-`messages` lists what people typed into their agent sessions, each message
-with the agent reply it follows: the evidence a lesson drafter such as
-`ohjaa intake` reads corrections from. Vessa is the one reader of agent
+`messages` lists what people wrote in their agent sessions, each message with
+the agent reply it follows: the evidence a lesson drafter such as `ohjaa
+intake` reads corrections from. Vessa is the one reader of agent
 conversations. It reads Claude Code, Codex and pi transcripts with the same
 discovery and headers as its other commands, and keeps nothing: no cache, no
 database. Text goes only to stdout, which inherits the permissions you give it.
@@ -262,26 +262,37 @@ cargo run -- messages --since 2026-10-01 --agent codex --json
 cargo run -- messages --session NATIVE-ID --json
 ```
 
-`--since` takes RFC 3339, a UTC date (`YYYY-MM-DD`) or an age (`7d`, `12h`);
-`--agent` and `--session` select as they do elsewhere. With `--json` it emits
-`vessa-messages.v1`, one message a line inside one JSON document, each written
-as soon as its transcript is read, so memory holds one transcript at a time:
+`--since` takes RFC 3339, a UTC date (`YYYY-MM-DD`) or an age (`7d`, `12h`),
+and lists the messages after it: exclusive, as ohjaa intake windows
+(`at_ms > since`), so a reader can pass the time of the last message it
+handled and not get that message again. `--agent` and `--session` select as
+they do elsewhere; a Claude subagent's own id selects it alone. With `--json`
+it emits `vessa-messages.v1`, one message a line inside one JSON document,
+each written as soon as its transcript is read, so memory holds one transcript
+at a time:
 
 ```json
 {"schema":"vessa-messages.v1","messages":[
-{"agent":"claude","session":"claude-demo","parent":null,"id":"u2","at":"2026-09-30T09:02:00Z","cwd":"/demo/widget","text":"I already told you to run the local checks.","reply":{"text":"The implementation is ready.","truncated":false,"failed":false,"line":3},"source":"/path/to/claude-demo.jsonl","line":4}
+{"agent":"claude","session":"claude-demo","parent":null,"kind":"message","id":"u2","at":"2026-09-30T09:02:00Z","cwd":"/demo/widget","text":"I already told you to run the local checks.","question":null,"reply":{"text":"The implementation is ready.","truncated":false,"failed":false,"line":3},"source":"/path/to/claude-demo.jsonl","line":4}
 ],
-"sessions":[{"agent":"claude","id":"claude-demo","parent":null,"started_at":"2026-09-30T09:00:00Z","cwd":"/demo/widget","source":"/path/to/claude-demo.jsonl","headless":false,"messages":3}],
+"sessions":[{"agent":"claude","id":"claude-demo","parent":null,"subagent":false,"started_at":"2026-09-30T09:00:00Z","cwd":"/demo/widget","source":"/path/to/claude-demo.jsonl","headless":false,"messages":3}],
 "coverage":{"transcripts":1,"subagent_transcripts":0,"unmodified_transcripts":0,"user_turns":3,"human":3,"excluded":{},"since":null,"earlier":0,"undated":0,"gaps":[],"limitations":[]},
 "warnings":[]}
 ```
 
-* A message names its `agent`, native `session`, the `parent` it was forked
-  from (a Codex `forked_from_id`, a pi `parentSession`), its native `id`
-  (Claude and pi write one; Codex does not), `at`, `cwd` (the record's, or
-  the turn's for Codex, else the session's), its `text` without the
+* A message names its `agent` and native `session` (a Claude subagent's is
+  `<session>/<agentId>`), the `parent` it descends from (a Claude subagent's
+  session, a Codex `forked_from_id`, a pi `parentSession`), and the native
+  `id` of its record: Claude's `uuid`, pi's `id`, and Codex's `payload.id`,
+  which newer Codex versions write. Then `at`, `cwd` (the record's, or the
+  turn's for Codex, else the session's), its `text` without the
   `<system-reminder>` blocks a harness writes into it, and the `source` and
   `line` it was read from.
+* `kind` says what the words are. `message`: typed into the conversation.
+  `queued`: typed while the agent worked, and handed to it mid-turn.
+  `answer`: a person's own answer to the agent's question tool, with the
+  `question` it answers. `rejection`: the reason a person gave for rejecting
+  a tool call. `task`: the task a person typed into a launch prompt.
 * `reply` is the agent turn it follows in its transcript: the last 600
   characters of its text, as ohjaa intake has taken them, with `truncated`
   and `line`. `failed` says the turn was a Claude API error, a Codex error
@@ -289,60 +300,101 @@ as soon as its transcript is read, so memory holds one transcript at a time:
   there is a retry, not a correction. Null when no agent turn came before.
 * `sessions` lists each transcript read, its copies as one session, with how
   many messages it gave. `headless` marks one whose every prompt a program
-  sent.
+  sent; `subagent` a Claude subagent.
 * `coverage` says what was read and why each other user turn is not listed:
   `user_turns` is `human` plus every count in `excluded` plus `earlier` and
-  `undated` (with `--since`, a message before it or with no time).
-  Subagent transcripts and, with `--since`, transcripts last written before
-  it are counted and not read. `gaps` names sources Vessa knows of and does
-  not read: opencode keeps its sessions in SQLite
+  `undated` (with `--since`, a message at or before it, or with no time).
+  Codex subagent transcripts and, with `--since`, transcripts last written
+  before it are counted and not read. `gaps` names sources Vessa knows of and
+  does not read. opencode keeps its sessions in SQLite
   (`~/.local/share/opencode/opencode.db`), and Vessa takes no SQLite
-  dependency, so a default run where that file exists is partial.
+  dependency, so a default run where that store was written in the window is
+  partial. SQLite writes through the store's `-wal` file, so the window looks
+  at the newer of the two; one written before `--since` holds nothing after
+  it, and is no gap.
 * Exit 4 means the list is partial: a source warning, a gap, or a session
   limitation, each printed to stderr. Transcripts are read in path order, a
-  Codex fork after the session it was forked from; messages in file order.
+  Codex fork after the sessions it was forked from; messages in file order.
+* A run that fails writes no partial document. One that fails before its
+  first message leaves stdout empty; one that fails after ends the document
+  with `"error"` in place of `sessions`, `coverage` and `warnings`, so its
+  messages are only those read before the failure. Either way it exits 1.
 
 ### What counts as a person's message
 
 Each rule names the user turns it excludes in `coverage.excluded`; a turn is
 counted under the first that applies. The rules are structural: what the
-record says about itself, or a harness text in its exact form, never a
-prefix, so a person who starts a message with "Caveat:", a path or a tag
-name is still a person. They come from Seula's reader, which was the most
-careful, with ohjaa intake's where they are stricter, and a few the archive
-called for:
+record says about itself, or a harness text in an exact form, either a whole
+text or the fixed sentence a harness always opens it with. They never match a
+mere prefix of a person's words, so a person who starts a message with
+"Caveat:", a path or a tag name is still a person. They come from Seula's
+reader, which was the most careful, with ohjaa intake's where they are
+stricter, and a few the archive called for:
 
 | Rule | Excludes | Why | From |
 | --- | --- | --- | --- |
-| `tool_result` | A Claude user turn holding any tool result, even with text beside it | Claude Code returns tool output, and answers to its question tool, as user turns | intake; Seula took the text beside a result |
 | `request_record` | A Claude record of another type that carries a user message (`api-request-blob`) | It copies a request's content, without uuid or time | the archive |
-| `subagent` | A sidechain record inside a main transcript | A subagent's prompt | intake |
 | `other_session` | A Claude record naming another session; also a limitation | Not this session's | Seula |
-| `meta` | Claude `isMeta` | Skill expansions, peer messages, safety and system notices | Seula |
-| `compaction` | Claude `isCompactSummary`, or the fixed first sentence of its continuation summary | A summary of earlier turns | Seula, intake |
-| `harness_origin` | Claude `origin.kind` other than `human`, or `promptSource: system` | Claude Code says the harness wrote it: task notifications, peers, coordinators | the archive; Seula's envelopes caught the same turns by their text |
+| `tool_result` | A Claude user turn holding a tool result, even with text beside it, unless a person wrote inside it (below) | Claude Code returns tool output as user turns | intake; Seula took the text beside a result |
+| `subagent` | In a Claude subagent's transcript, or as a sidechain record inside a main one, a turn whose origin is not a person | The prompts the parent agent wrote | intake |
+| `meta` | Claude `isMeta`, unless its origin is a person | Skill expansions, peer messages, safety and system notices | Seula |
+| `compaction` | Claude `isCompactSummary`, or a text opening with the fixed first sentence of its continuation summary | A summary of earlier turns | Seula, intake |
+| `harness_origin` | Claude `origin.kind` other than `human`, or `promptSource: system`; a queued command whose origin is not a person | Claude Code says the harness wrote it: task notifications, peers, coordinators | the archive; Seula's envelopes caught the same turns by their text |
 | `empty` | No text, as an image alone | Nothing to read | Seula |
 | `envelope` | A message that is wholly known harness elements (startup context, notifications, slash-command records, interruptions, Codex's review, skill and plugin elements), Codex's `# AGENTS.md instructions` heading over them, the verbatim interruption notices and local-command caveat, pi's bare `/command` | The harness wrote it into a user turn | Seula, whose element set followed intake's |
-| `harness_prompt` | A prompt opening with the fixed first sentence of Codex's `/init` or of toimija's launch prompt, inside or outside a repository | A program wrote it in a person's place; the task a launch prompt carries is not separated from it | the archive |
-| `question_reply` | A Codex message that is wholly `<send_user_message_question_reply>` | The answer to the agent's question tool, which Claude records as a tool result | the archive |
+| `harness_prompt` | A text opening with the fixed first sentence of Codex's `/init`, or of a toimija launch prompt that carries no task | A program wrote it in a person's place | the archive |
+| `question_reply` | A Codex reply to its question tool whose every answer is one of the options the question offered | Picking an offered option says nothing in the person's own words; Claude's picks are in its `tool_result` | the archive |
 | `fork_copy` | In a Codex fork, the longest run of turns after the copied parent header that matches the parent's transcript turn for turn; all of them, with a limitation, when the parent was not read | A fork copies its parent's transcript stamped with the fork time, so time cannot separate them | Seula |
 | `inherited` | In a fork (Codex, pi), a turn from before the fork started; one with no time, with a limitation | Its parent's history | Seula |
 | `headless` | Claude `sdk-*` entrypoints and `promptSource: sdk`, decided per turn; a `codex exec` file in which no turn was submitted interactively (a `user_message` event) | A program sent it: `claude -p`, an Agent SDK, `codex exec`. A session resumed by a script keeps its interactive turns | Seula |
-| `duplicate` | A message another copy of the session already gave: the same native id, else the same time and text | Read twice, said once | Seula, by id |
+| `duplicate` | A message another copy of the session already gave (the same native id, else the same time and text), and a queued message that later arrives as an ordinary one of the same text | Read twice, said once | Seula, by id |
 | `retry` | The person's previous message sent again before the agent answered it, because the agent failed or never replied | Re-sent, not said anew | the archive |
 
-Subagent transcripts are not read at all: Claude's `subagents/` transcripts
-and Codex sessions whose `source` names a subagent. Their user turns are the
-parent agent's prompts, not a person's.
+What a person wrote is listed wherever the record keeps it apart from the
+harness's words:
+
+* **Writing to a subagent.** Claude Code lets a person write to a running
+  subagent. It records the message in the subagent's transcript, marked meta,
+  with a person's origin (`origin.kind: human`); that origin wins over `meta`
+  and `subagent`. Claude subagent transcripts are read for these and listed
+  under the subagent, with its session as `parent`. Nothing in a Codex
+  subagent's transcript says a person wrote, so those are not read.
+* **Typed while the agent works.** Claude Code records such a message as a
+  `queued_command` attachment with a person's origin, and hands it to the
+  agent mid-turn. It is listed as `queued`, once: when it also arrives later
+  as an ordinary message, that one is listed instead.
+* **Answers to the agent's question.** An answer that is one of the offered
+  options is a pick, not the person's words. Claude Code's question tool
+  returns its options with the answers (`toolUseResult.questions`, picks of
+  several joined by ", "). Codex's reply names the `item_completed` that
+  asked (`questionItemId`), whose `questions` carry the options. Any other
+  answer is listed as `answer`, with its `question`, including an answer to
+  a question Vessa did not see asked.
+* **Rejecting a tool call.** Claude Code writes the reason after a fixed
+  sentence that ends "To tell you how to proceed, the user said:". The reason
+  is listed as `rejection`; a rejection with no reason stays a `tool_result`.
+* **A task in a launch prompt.** toimija's launch prompt is fixed framing,
+  then the session packet, then `\n\nTask: <task>`. The task is the text
+  after the last such line, listed as `task`. A packet line of that exact
+  form would end the task early; toimija's own packet renders none. The
+  transcript does not say who wrote the task: a person who ran `ohjaa run`,
+  or an agent that launched the session for one, so a reader decides by
+  `kind`.
 
 Intake's 1,500-character limit is not applied: it is a correction heuristic,
 and intake keeps it. Its prefix skip list is replaced by the exact forms above.
 
-On the local archive (2026-10-26) `messages` listed 5,511 messages, from 370
-transcripts, in 4.5 s and 126 MB. Seula's reader counted 5,797 typed human
-messages in the same files. Every message Vessa lists is one of them; the 286
-others are `request_record` 72, `harness_prompt` 150, `question_reply` 63
-and `retry` 1. Its other rules exclude the same turns Seula's did.
+On the local archive (2026-10-26) `messages` listed 5,607 messages: claude
+634, codex 4,669, pi 304, from 628 transcripts, 258 of them Claude
+subagents', in 5.3 s and 129 MB; with `--since 1d`, in 0.6 s. Seula's reader
+counted 5,797 typed human messages in the same folders earlier that day. Of
+those, Vessa excludes the `request_record` copies (72), the harness's own
+`/init` and launch prompts (150; from 28 launch prompts it lists the task),
+the question replies that only pick options (43 of 63; the other 20 give 20
+answers in the person's words) and one `retry`. It also lists what Seula did
+not read: 28 messages written to Claude subagents, 15 queued while the agent
+worked, 4 own answers to Claude's question tool and 1 rejection reason. 2,701
+of the Codex messages carry an id.
 
 ## Usage export
 
