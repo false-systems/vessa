@@ -11,7 +11,11 @@ use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Parser, Clone)]
-#[command(about = "Local agent usage and spending evidence. Estimates are not bills.")]
+#[command(
+    name = "vessa",
+    version,
+    about = "Local agent usage and spending evidence. Estimates are not bills."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,

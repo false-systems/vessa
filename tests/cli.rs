@@ -382,6 +382,18 @@ fn calendar_statistics_use_usage_time_utc_and_preserve_unknowns() {
 }
 
 #[test]
+fn version_says_which_vessa_this_is() {
+    for flag in ["--version", "-V"] {
+        let out = cli(&[flag]);
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            format!("vessa {}\n", env!("CARGO_PKG_VERSION"))
+        );
+    }
+}
+
+#[test]
 fn live_status_requires_identity_and_watch_is_bounded_when_requested() {
     assert!(!cli(&["status"]).status.success());
     let v = value(cli(&["status", "--input", "examples/pi.jsonl", "--json"]));
