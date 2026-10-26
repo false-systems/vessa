@@ -526,6 +526,22 @@ fn claude_statusline_always_prints_and_says_unknown_for_what_it_cannot_read() {
         "session estimate unknown · billed unknown · id[2J · demo]0;title\n\
          Last API call: input unknown · output unknown · cache read unknown · cache write 40\n"
     );
+    // Negative zero is zero; an amount no session could cost is unknown.
+    for (cost, shown) in [
+        ("-0.0", "$0.00"),
+        ("0", "$0.00"),
+        ("18446744073709.5", "$18446744073709.50"),
+        ("1e14", "unknown"),
+        ("1e308", "unknown"),
+    ] {
+        let input = format!(r#"{{"session_id":"demo","cost":{{"total_cost_usd":{cost}}}}}"#);
+        let out = statusline(input.into_bytes());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            text.starts_with(&format!("session estimate {shown} · ")),
+            "{cost}: {text}"
+        );
+    }
     for input in [
         br#"{"cost":{"total_cost_usd":"4.45"}}"#.to_vec(),
         br#"{"session_id":null,"model":null,"cost":7,"context_window":[]}"#.to_vec(),
@@ -1486,12 +1502,12 @@ fn a_report_counts_sessions_with_their_subagents_apart() {
     };
     // Two transcripts: one session and its subagent.
     let (said, page) = report(&[dir.to_str().unwrap()]);
-    assert!(said.ends_with(" · 1 sessions · 1 subagents\n"), "{said}");
-    assert!(page.contains("<p>1 sessions · 1 subagents · 0 source warnings</p>"));
+    assert!(said.ends_with(" · 1 session · 1 subagent\n"), "{said}");
+    assert!(page.contains("<p>1 session · 1 subagent · 0 source warnings</p>"));
     // A subagent read alone still counts its session, as stats count it.
     let (said, page) = report(&["examples/claude-subagent.jsonl"]);
-    assert!(said.ends_with(" · 1 sessions · 1 subagents\n"), "{said}");
-    assert!(page.contains("<p>1 sessions · 1 subagents · 0 source warnings</p>"));
+    assert!(said.ends_with(" · 1 session · 1 subagent\n"), "{said}");
+    assert!(page.contains("<p>1 session · 1 subagent · 0 source warnings</p>"));
     // Without subagents, sessions alone.
     let (said, page) = report(&["examples/codex.jsonl", "examples/pi.jsonl"]);
     assert!(said.ends_with(" · 2 sessions\n"), "{said}");
@@ -1522,10 +1538,7 @@ fn stats_count_top_level_sessions_and_subagents_separately() {
     ]);
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(
-        text.contains("claude · 1 sessions · 1 subagents ·"),
-        "{text}"
-    );
+    assert!(text.contains("claude · 1 session · 1 subagent ·"), "{text}");
     // A subagent read without its main transcript still counts one session.
     let v = value(cli(&[
         "stats",
@@ -1727,10 +1740,7 @@ fn codex_subagents_count_with_their_root_session() {
     assert_eq!(v["buckets"][0]["subagents"], 2);
     assert_eq!(v["buckets"][0]["entries"][0]["output_tokens"], 130);
     let text = String::from_utf8(cli(&["stats", "--input", input]).stdout).unwrap();
-    assert!(
-        text.contains("codex · 1 sessions · 2 subagents ·"),
-        "{text}"
-    );
+    assert!(text.contains("codex · 1 session · 2 subagents ·"), "{text}");
 
     // The export keeps each thread's own totals and their parents, and
     // names the subagents with the session they count to.
@@ -2371,7 +2381,7 @@ fn messages_lists_what_a_person_typed_with_the_reply_it_follows() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.starts_with("claude claude-demo · 2026-09-30T09:00:00Z · /demo/widget · "));
     assert!(text.contains("\n  Please run the existing local checks before finishing.\n"));
-    assert!(text.contains("3 messages from 1 sessions (0 headless)"));
+    assert!(text.contains("3 messages from 1 session (0 headless)"));
 }
 
 #[test]

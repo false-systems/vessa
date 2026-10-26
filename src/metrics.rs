@@ -108,10 +108,13 @@ pub fn claude_statusline(input: &serde_json::Value) -> String {
         .as_str()
         .or_else(|| input["model"]["id"].as_str())
         .map_or_else(|| "unknown model".into(), clean);
+    // An amount Vessa could not hold in USD millionths, as it holds every
+    // other estimate, is no session's cost. `abs` makes -0.0 zero, the only
+    // negative number the filter lets through.
     let estimate = input["cost"]["total_cost_usd"]
         .as_f64()
-        .filter(|cost| cost.is_finite() && *cost >= 0.0)
-        .map_or_else(|| "unknown".into(), |cost| format!("${cost:.2}"));
+        .filter(|cost| cost.is_finite() && *cost >= 0.0 && cost * 1_000_000.0 < u64::MAX as f64)
+        .map_or_else(|| "unknown".into(), |cost| format!("${:.2}", cost.abs()));
     let usage = &input["context_window"]["current_usage"];
     let tokens = |key: &str| {
         usage[key]

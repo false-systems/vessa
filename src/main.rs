@@ -278,17 +278,17 @@ fn run_once(cli: Cli) -> Result<i32> {
                 println!("Calendar usage · UTC · selected local records · estimates are not bills");
                 for b in buckets {
                     println!(
-                        "{} {} · {} sessions{} · known estimate subtotal={} · {} unpriced records",
+                        "{} {} · {}{} · known estimate subtotal={} · {}",
                         b.period,
                         b.agent,
-                        b.sessions,
+                        render::many(b.sessions, "session"),
                         if b.subagents > 0 {
-                            format!(" · {} subagents", b.subagents)
+                            format!(" · {}", render::many(b.subagents, "subagent"))
                         } else {
                             String::new()
                         },
                         render::dollars(Some(b.known_estimated_usd_micros)),
-                        b.unpriced_records
+                        render::many(b.unpriced_records, "unpriced record")
                     );
                     for e in b.entries {
                         println!("  {}", render::usage_line(&e));
@@ -701,9 +701,12 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
             .join(", ");
         writeln!(
             out,
-            "{} messages from {} sessions ({} headless) · {} other user turns not listed{} · {} Codex subagent transcripts not read",
-            c.human,
-            listing.sessions.iter().filter(|s| s.messages > 0).count(),
+            "{} from {} ({} headless) · {} other user turns not listed{} · {} Codex subagent transcripts not read",
+            render::many(c.human, "message"),
+            render::many(
+                listing.sessions.iter().filter(|s| s.messages > 0).count(),
+                "session"
+            ),
             listing.sessions.iter().filter(|s| s.headless).count(),
             c.excluded.values().sum::<usize>(),
             if rules.is_empty() { String::new() } else { format!(": {rules}") },

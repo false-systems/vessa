@@ -201,9 +201,10 @@ pub fn count(sessions: &[Session]) -> (usize, usize) {
 
 /// "N sessions", with " · M subagents" when there are any.
 pub fn counted(sessions: &[Session]) -> String {
+    use crate::render::many;
     match count(sessions) {
-        (n, 0) => format!("{n} sessions"),
-        (n, m) => format!("{n} sessions · {m} subagents"),
+        (n, 0) => many(n, "session"),
+        (n, m) => format!("{} · {}", many(n, "session"), many(m, "subagent")),
     }
 }
 
