@@ -2807,6 +2807,10 @@ fn a_launch_task_is_what_the_person_typed_without_the_briefing() {
         ),
         // The launcher's alerts come before the framing.
         launch_prompt(true, Some("check the gate"), Some(&briefing)),
+        // Before ohjaa passed its briefing apart, it was the task: alone, or
+        // after the typed task and a blank line.
+        launch_prompt(false, Some(&briefing), None),
+        launch_prompt(false, Some(&format!("ship it\n\n{briefing}")), None),
     ];
     let rows: Vec<Value> = prompts
         .iter()
@@ -2827,7 +2831,8 @@ fn a_launch_task_is_what_the_person_typed_without_the_briefing() {
             "fix the parser",
             "tidy the docs",
             "Rename the parser.\n\nKeep the old name as an alias.",
-            "check the gate"
+            "check the gate",
+            "ship it"
         ]
     );
     assert!(v["messages"]
@@ -2835,6 +2840,6 @@ fn a_launch_task_is_what_the_person_typed_without_the_briefing() {
         .unwrap()
         .iter()
         .all(|m| m["kind"] == "task"));
-    assert_eq!(excluded(&v)["harness_prompt"], 3);
+    assert_eq!(excluded(&v)["harness_prompt"], 4);
     std::fs::remove_file(path).unwrap();
 }

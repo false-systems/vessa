@@ -1545,16 +1545,14 @@ fn list(
                 Some("envelope")
             } else if said && text.starts_with(INIT) {
                 Some("harness_prompt")
-            } else if said && LAUNCH.iter().any(|p| text.starts_with(p)) {
-                // A launch prompt ends with the task a person typed, after
-                // the packet, as `\n\nTask: <task>`.
-                match text.rsplit_once("\n\nTask: ").map(|(_, task)| task.trim()) {
-                    Some(task) if !task.is_empty() => {
-                        text = task.to_owned();
+            } else if said && launched(&text) {
+                match launch_task(&text) {
+                    Some(task) => {
+                        text = task;
                         kind = "task";
                         None
                     }
-                    _ => Some("harness_prompt"),
+                    None => Some("harness_prompt"),
                 }
             } else {
                 None
@@ -1742,6 +1740,62 @@ const LAUNCH: [&str; 2] = [
     "Your toimija session packet is below. It is your workset contract:",
     "You are in a toimija session outside any Git repository (",
 ];
+/// The heading of the alerts toimija puts in front of a launch prompt.
+const ALERTS: &str = "## Before anything else (from the launcher)\n";
+/// How each part of ohjaa's briefing opens, as ohjaa writes it: the unproven
+/// branch flag, validation, still-running, orphaned and warned sessions,
+/// Knowledge (whose preamble also opens scoped knowledge), the last session
+/// here, how the session works, sibling worktrees, and the system perimeter.
+/// toimija appends the briefing after the task, so the first of these after
+/// a blank line ends the task.
+const BRIEFING: [&str; 10] = [
+    "FLAG: ",
+    "Validation here (sykli's word, asked at launch;",
+    "STILL RUNNING: session ",
+    "ORPHANED: session ",
+    "WARNING from ",
+    "Knowledge (ohjaa, knowledge-node.v1):",
+    "Last session here (",
+    "How this session works (ohjaa):",
+    "Sessions in the other worktrees of this clone at launch",
+    "System perimeter (derived by ohjaa at launch;",
+];
+
+/// Whether `text` is a toimija launch prompt: its fixed opening, after the
+/// launcher's alerts when there are any.
+fn launched(text: &str) -> bool {
+    let body = match text.strip_prefix(ALERTS) {
+        // The alerts end where the launch prompt's opening begins a line.
+        Some(alerts) => LAUNCH
+            .iter()
+            .filter_map(|p| alerts.find(&format!("\n{p}")).map(|at| &alerts[at + 1..]))
+            .next()
+            .unwrap_or(alerts),
+        None => text,
+    };
+    LAUNCH.iter().any(|p| body.starts_with(p))
+}
+
+/// The task a person typed into a launch prompt. toimija writes the packet,
+/// then `\nTask: <task>\n`, then `\n<briefing>\n`; before ohjaa 7ba9a68 the
+/// task line held `<task>\n\n<briefing>`, or the briefing alone. The task is
+/// what lies between the last `Task:` line and the first part of ohjaa's
+/// briefing. None when nothing typed is left.
+fn launch_task(text: &str) -> Option<String> {
+    let end = BRIEFING
+        .iter()
+        .filter_map(|opening| text.find(&format!("\n\n{opening}")))
+        .min()
+        .unwrap_or(text.len());
+    let (_, task) = text[..end].rsplit_once("\n\nTask: ")?;
+    // Before ohjaa passed its briefing apart (7ba9a68), the briefing was the
+    // task itself when no task was typed: `Task: <briefing>`.
+    if BRIEFING.iter().any(|opening| task.starts_with(opening)) {
+        return None;
+    }
+    let task = task.trim();
+    (!task.is_empty()).then(|| task.to_owned())
+}
 
 /// Text a harness wrote into a user turn, matched in its exact form: a whole
 /// sequence of known elements, a verbatim notice, Codex's AGENTS.md heading

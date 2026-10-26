@@ -373,25 +373,34 @@ harness's words:
 * **Rejecting a tool call.** Claude Code writes the reason after a fixed
   sentence that ends "To tell you how to proceed, the user said:". The reason
   is listed as `rejection`; a rejection with no reason stays a `tool_result`.
-* **A task in a launch prompt.** toimija's launch prompt is fixed framing,
-  then the session packet, then `\n\nTask: <task>`. The task is the text
-  after the last such line, listed as `task`. A packet line of that exact
-  form would end the task early; toimija's own packet renders none. The
-  transcript does not say who wrote the task: a person who ran `ohjaa run`,
-  or an agent that launched the session for one, so a reader decides by
-  `kind`.
+* **A task in a launch prompt.** toimija composes the launch prompt as the
+  launcher's alerts, if any (`## Before anything else (from the launcher)`),
+  the fixed framing and the session packet, then `\nTask: <task>\n`, then
+  ohjaa's briefing as `\n<briefing>\n`. The briefing is parts joined by a
+  newline, each opening with a sentence ohjaa always writes: `FLAG: `,
+  `Validation here (sykli's word, …`, `STILL RUNNING: session `, `ORPHANED:
+  session `, `WARNING from `, `Knowledge (ohjaa, knowledge-node.v1):`, `Last
+  session here (`, `How this session works (ohjaa):`, `Sessions in the other
+  worktrees of this clone at launch`, `System perimeter (derived by ohjaa at
+  launch; …`. The task is the text between the last `Task:` line and the
+  first of these after a blank line, listed as `task`; a launch prompt with
+  no typed words left is a `harness_prompt`. A task containing a blank line
+  followed by one of those sentences would end early. The transcript does
+  not say who wrote the task: a person who ran `ohjaa run`, or an agent that
+  launched the session for one.
 
 Intake's 1,500-character limit is not applied: it is a correction heuristic,
 and intake keeps it. Its prefix skip list is replaced by the exact forms above.
 
-On the local archive (2026-10-26) `messages` listed 5,607 messages: claude
-634, codex 4,669, pi 304, from 628 transcripts, 258 of them Claude
+On the local archive (2026-10-26) `messages` listed 5,583 messages: claude
+630, codex 4,649, pi 304, from 628 transcripts, 258 of them Claude
 subagents', in 5.3 s and 129 MB; with `--since 1d`, in 0.6 s. Seula's reader
 counted 5,797 typed human messages in the same folders earlier that day. Of
 those, Vessa excludes the `request_record` copies (72), the harness's own
-`/init` and launch prompts (150; from 28 launch prompts it lists the task),
-the question replies that only pick options (43 of 63; the other 20 give 20
-answers in the person's words) and one `retry`. It also lists what Seula did
+`/init` and launch prompts (150; from 4 of them it lists the typed task, and
+24 hold only ohjaa's briefing), the question replies that only pick options
+(43 of 63; the other 20 give 20 answers in the person's words) and one
+`retry`. It also lists what Seula did
 not read: 28 messages written to Claude subagents, 15 queued while the agent
 worked, 4 own answers to Claude's question tool and 1 rejection reason. 2,701
 of the Codex messages carry an id.
