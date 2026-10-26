@@ -15,10 +15,10 @@ pub enum Period {
 pub struct Bucket {
     pub period: String,
     pub agent: String,
-    /// Top-level sessions with usage in the period. A Claude subagent's
-    /// usage counts its session, not a session of its own.
+    /// Top-level sessions with usage in the period. A subagent's usage
+    /// (Claude or Codex) counts its session, not a session of its own.
     pub sessions: usize,
-    /// Claude subagents with usage in the period, counted apart.
+    /// Subagents with usage in the period, counted apart.
     pub subagents: usize,
     pub entries: Vec<Entry>,
     pub known_estimated_usd_micros: u64,

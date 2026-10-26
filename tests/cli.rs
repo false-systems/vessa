@@ -1556,6 +1556,146 @@ fn a_subagent_whose_requests_are_all_counted_with_its_session_is_not_unknown() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// A Codex thread's transcript: its `session_meta` with `meta` added, the
+/// model, and one cumulative token counter with its last request.
+fn codex_thread(dir: &std::path::Path, id: &str, meta: Value, total: [u64; 3], last: [u64; 3]) {
+    let mut payload = serde_json::json!({"id":id,"timestamp":"2026-09-30T10:00:00Z","cwd":"/demo/widget","originator":"codex-tui","model_provider":"openai","source":"cli"});
+    payload
+        .as_object_mut()
+        .unwrap()
+        .extend(meta.as_object().unwrap().clone());
+    let usage = |[input, cached, output]: [u64; 3]| serde_json::json!({"input_tokens":input,"cached_input_tokens":cached,"output_tokens":output});
+    write_lines(
+        &dir.join(format!("{id}.jsonl")),
+        &[
+            serde_json::json!({"timestamp":"2026-09-30T10:00:00Z","type":"session_meta","payload":payload}),
+            serde_json::json!({"type":"turn_context","payload":{"model":"demo-codex"}}),
+            serde_json::json!({"timestamp":"2026-09-30T10:05:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":usage(total),"last_token_usage":usage(last)}}}),
+        ],
+    );
+}
+
+#[test]
+fn codex_subagents_count_with_their_root_session() {
+    // A Codex session, a subagent it spawned, and a review thread that
+    // subagent spawned. Each child names its root session in `session_id`.
+    let dir = temp("codex-family");
+    std::fs::create_dir_all(&dir).unwrap();
+    codex_thread(
+        &dir,
+        "codex-root",
+        serde_json::json!({"session_id":"codex-root","thread_source":"user"}),
+        [1000, 400, 100],
+        [1000, 400, 100],
+    );
+    let child = |dir: &std::path::Path| {
+        codex_thread(
+            dir,
+            "codex-child",
+            serde_json::json!({"session_id":"codex-root","parent_thread_id":"codex-root","thread_source":"subagent","source":{"subagent":{"thread_spawn":{"parent_thread_id":"codex-root","depth":1}}},"forked_from_id":"codex-root"}),
+            [5000, 1000, 300],
+            [200, 50, 20],
+        );
+        codex_thread(
+            dir,
+            "codex-review",
+            serde_json::json!({"session_id":"codex-root","parent_thread_id":"codex-child","thread_source":"guardian_review","source":{"subagent":{"other":"guardian"}}}),
+            [3000, 0, 100],
+            [100, 0, 10],
+        );
+    };
+    child(&dir);
+    let input = dir.to_str().unwrap();
+
+    // Statistics count one session, with its two subagents apart.
+    let v = value(cli(&["stats", "--input", input, "--json"]));
+    assert_eq!(v["buckets"].as_array().unwrap().len(), 1);
+    assert_eq!(v["buckets"][0]["sessions"], 1);
+    assert_eq!(v["buckets"][0]["subagents"], 2);
+    assert_eq!(v["buckets"][0]["entries"][0]["output_tokens"], 130);
+    let text = String::from_utf8(cli(&["stats", "--input", input]).stdout).unwrap();
+    assert!(
+        text.contains("codex · 1 sessions · 2 subagents ·"),
+        "{text}"
+    );
+
+    // The export keeps each thread's own totals and their parents, and
+    // names the subagents with the session they count to.
+    let v = value(cli(&["usage", "--input", input, "--json"]));
+    let session = |id: &str| {
+        v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    let root = session("codex-root");
+    assert_eq!(
+        root["subagents"],
+        serde_json::json!(["codex-child", "codex-review"])
+    );
+    assert_eq!(root["totals"][0]["input_tokens"], 600);
+    let with = &root["totals_with_subagents"][0];
+    assert_eq!(
+        (
+            &with["input_tokens"],
+            &with["cache_read_tokens"],
+            &with["output_tokens"]
+        ),
+        (&850.into(), &450.into(), &130.into())
+    );
+    assert_eq!(session("codex-child")["parent"], "codex-root");
+    assert_eq!(session("codex-child")["totals"][0]["input_tokens"], 150);
+    assert_eq!(session("codex-child")["subagents"], serde_json::json!([]));
+    assert_eq!(
+        session("codex-review")["parent"],
+        "parent identity unavailable (subagent source)"
+    );
+
+    // A receipt and status for the session total it with its subagents.
+    let v = value(cli(&[
+        "receipt",
+        "--input",
+        input,
+        "--session",
+        "codex-root",
+    ]));
+    assert_eq!(v["session_id"], "codex-root");
+    assert_eq!(v["entries"][0]["output_tokens"], 130);
+    assert!(v["limitations"].as_array().unwrap().iter().any(|l| {
+        l.as_str()
+            .unwrap()
+            .contains("2 Codex subagents of this session")
+    }));
+    let text =
+        String::from_utf8(cli(&["status", "--input", input, "--session", "codex-root"]).stdout)
+            .unwrap();
+    assert!(text.contains("· totals include 2 subagents"), "{text}");
+    // A subagent asked for by its own id is shown alone, and says whose.
+    let out = cli(&["status", "--input", input, "--session", "codex-review"]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("· subagent of codex-root"), "{text}");
+    // Selecting the session selects its subagents, which messages count.
+    let (v, _) = messages(&["--input", input, "--session", "codex-root"]);
+    assert_eq!(v["coverage"]["subagent_transcripts"], 2);
+
+    // Its subagents alone are not the session, but still count one.
+    let alone = temp("codex-subagents-alone");
+    std::fs::create_dir_all(&alone).unwrap();
+    child(&alone);
+    let input = alone.to_str().unwrap();
+    let out = cli(&["receipt", "--input", input, "--session", "codex-root"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only 2 of its subagents"));
+    let v = value(cli(&["stats", "--input", input, "--json"]));
+    assert_eq!(v["buckets"][0]["sessions"], 1);
+    assert_eq!(v["buckets"][0]["subagents"], 2);
+    std::fs::remove_dir_all(dir).unwrap();
+    std::fs::remove_dir_all(alone).unwrap();
+}
+
 /// A session header's fields: `vessa-session-headers.v1` has these and no
 /// others, each as `vessa-usage.v1` has it.
 const HEADER: [&str; 8] = [

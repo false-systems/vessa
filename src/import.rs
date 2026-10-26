@@ -409,6 +409,10 @@ struct Opening {
     cwd: String,
     originator: Option<String>,
     subagent_source: bool,
+    /// The session a Codex thread belongs to: `session_id`, which a child
+    /// thread shares with the session at its root; else, as older Codex
+    /// writes, the thread it was spawned or forked from.
+    root: Option<String>,
 }
 
 impl Opening {
@@ -425,6 +429,11 @@ impl Opening {
             cwd: string(meta, "cwd"),
             originator: meta["originator"].as_str().map(str::to_owned),
             subagent_source: !meta["source"]["subagent"].is_null(),
+            root: meta["session_id"]
+                .as_str()
+                .or_else(|| meta["parent_thread_id"].as_str())
+                .or_else(|| meta["forked_from_id"].as_str())
+                .map(str::to_owned),
         }
     }
 }
@@ -525,6 +534,12 @@ impl Scan {
         if agent == "codex" && opening.subagent_source && parent.is_none() {
             parent = Some("parent identity unavailable (subagent source)".into());
         }
+        // A Codex subagent, or any thread another spawned, counts to the
+        // session at its root, as a Claude subagent counts to its session.
+        let root = (agent == "codex" && opening.subagent_source)
+            .then_some(opening.root)
+            .flatten()
+            .filter(|root| *root != id);
         // Current Claude Code transcripts open with records (`last-prompt`,
         // `mode`) that carry the session id but no time and no folder: those
         // come from the first record that has them.
@@ -547,6 +562,7 @@ impl Scan {
             launched: Vec::new(),
             counted_elsewhere: 0,
             synthetic: Default::default(),
+            root,
             subagent: (agent == "claude" && self.sidechain)
                 || (agent == "codex" && opening.subagent_source),
         })

@@ -68,6 +68,19 @@ usage is its session's usage:
 
 A request is still counted once, however many transcripts hold it.
 
+### Codex subagents
+
+Codex writes each subagent, and each other thread a session spawns (such as a
+review), to a transcript of its own, under its own thread id. Its
+`session_meta` says it is a subagent (`source.subagent`) and names the session
+at its root (`session_id`; older Codex writes only the thread it came from,
+`parent_thread_id` or `forked_from_id`). Vessa keeps the thread id and its
+`parent`, and counts it to that root session by the rules above: `--session`
+selects the session with its subagents, `status` and `receipt` total them
+(the receipt names them in `limitations`), `stats` counts the session once and
+its subagents apart, and the usage export names them in `subagents`. A thread
+whose `session_meta` names no other session stands alone.
+
 ### Session headers
 
 `sessions --headers` lists each session's header alone: what its transcript
@@ -440,7 +453,7 @@ exports without this additive field still contain the original usage records.
 known to hold no usage; it is 0 for other agents.
 
 `totals` stays each transcript's own, so summing it across sessions counts
-every request once. Each session also names its Claude subagents in
+every request once. Each session also names its Claude and Codex subagents in
 `subagents` and sums itself with them in `totals_with_subagents`: the total to
 show for one session. Without subagents the list is empty and the two totals
 are equal. Subagents remain sessions of their own in the export.
@@ -461,7 +474,7 @@ vessa report --input /path/to/session.jsonl --input /tmp/ohjaa.json --output /tm
 ```
 
 `receipt` requires exactly one native session and emits `agent-usage.v1`.
-A Claude session's receipt includes its subagents and names them in
+A Claude or Codex session's receipt includes its subagents and names them in
 `limitations`. The wrapper attaches it to an explicit wrapper session.
 Exported work, handover, knowledge and outcome evidence appears alongside the
 usage only when that explicit native-session association exists. Directory

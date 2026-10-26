@@ -66,6 +66,10 @@ pub struct Session {
     /// usage export counts them as `synthetic_records`.
     #[serde(skip)]
     pub synthetic: std::collections::BTreeSet<String>,
+    /// The session a Codex subagent counts to: the root its `session_meta`
+    /// names. None for every other session.
+    #[serde(skip)]
+    pub root: Option<String>,
     /// Another agent started it: a Claude sidechain, or a Codex session
     /// whose `source` names a subagent. Its user turns are that agent's
     /// prompts, not a person's.
@@ -102,10 +106,14 @@ impl Session {
         }
     }
 
-    /// The session a Claude subagent belongs to. Claude Code writes each
-    /// subagent to its own transcript under the parent's session id; Vessa
-    /// names it `parent/agentId`.
+    /// The session a subagent belongs to. Claude Code writes each subagent
+    /// to its own transcript under the parent's session id; Vessa names it
+    /// `parent/agentId`. A Codex subagent, or another thread a session
+    /// spawned, keeps its own thread id and names its root session.
     pub fn subagent_of(&self) -> Option<&str> {
+        if self.agent == "codex" {
+            return self.root.as_deref();
+        }
         let parent = self.parent.as_deref()?;
         (self.agent == "claude" && self.id.strip_prefix(parent)?.starts_with('/')).then_some(parent)
     }
@@ -256,7 +264,12 @@ pub fn receipt(family: &Family) -> Result<serde_json::Value> {
     if !family.subagents.is_empty() {
         let n = family.subagents.len();
         limitations.push(format!(
-            "Entries include {n} Claude {} of this session, each read from its own transcript: {}",
+            "Entries include {n} {} {} of this session, each read from its own transcript: {}",
+            if session.agent == "codex" {
+                "Codex"
+            } else {
+                "Claude"
+            },
             if n == 1 { "subagent" } else { "subagents" },
             family
                 .subagents

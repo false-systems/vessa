@@ -157,7 +157,7 @@ fn run_once(cli: Cli) -> Result<i32> {
         report.sessions.retain(|s| s.agent == agent);
     }
     if let Some(id) = cli.session {
-        // A Claude session's subagents are part of it: its id selects them too.
+        // A session's subagents are part of it: its id selects them too.
         report
             .sessions
             .retain(|s| s.id == id || s.subagent_of() == Some(id.as_str()));
@@ -215,7 +215,8 @@ fn run_once(cli: Cli) -> Result<i32> {
                 )?;
             } else {
                 let n = family.subagents.len();
-                let scope = if s.agent != "claude" {
+                // pi writes no subagents.
+                let scope = if s.agent == "pi" {
                     String::new()
                 } else if let Some(parent) = s.subagent_of() {
                     format!(" · subagent of {parent}")
