@@ -2422,6 +2422,8 @@ fn a_persons_own_answers_rejections_and_tasks_are_listed_and_picks_are_not() {
                 ],
             ),
             codex_question("q2", &[("Anything else?", None)]),
+            // An answer worded like the message before it is still an answer.
+            codex_turn("user", 3, "Name the error type."),
             codex_turn(
                 "user",
                 4,
@@ -2443,10 +2445,15 @@ fn a_persons_own_answers_rejections_and_tasks_are_listed_and_picks_are_not() {
     assert_eq!(code, Some(0));
     assert_eq!(
         texts(&v),
-        ["Neither; regenerate them.", "Name the error type."]
+        [
+            "Name the error type.",
+            "Neither; regenerate them.",
+            "Name the error type."
+        ]
     );
-    let answer = &v["messages"][0];
+    let answer = &v["messages"][1];
     assert_eq!(answer["kind"], "answer");
+    assert_eq!(v["messages"][2]["kind"], "answer");
     assert_eq!(answer["question"], "Keep the fixtures?");
     assert_eq!(answer["reply"]["text"], "Which parser should I keep?");
     assert_eq!(excluded(&v)["question_reply"], 1);
@@ -2728,4 +2735,106 @@ fn since_is_exclusive_like_intakes_window_and_errors_leave_no_partial_json() {
     ]);
     assert_eq!(out.status.code(), Some(1));
     assert!(out.stdout.is_empty());
+}
+
+/// A launch prompt as toimija composes it for `ohjaa run`: the launcher's
+/// alerts, if any, then the fixed framing and the packet, then `Task:` with
+/// the task, if any, then ohjaa's briefing, if any.
+fn launch_prompt(alerts: bool, task: Option<&str>, briefing: Option<&str>) -> String {
+    let mut prompt = String::from(
+        "Your toimija session packet is below. It is your workset contract: work from it, \
+         and declare any expansion (`toimija intent \"<why>\" --scope <path>`) before reading \
+         outside it.\nLive packet (re-read after HEAD changes): /demo/widget/.toimija/current.md\n\n\
+         # Toimija Context\n- branch: main\n- dirty: false",
+    );
+    prompt.push('\n');
+    if let Some(task) = task {
+        prompt.push_str(&format!("\nTask: {task}\n"));
+    }
+    if let Some(briefing) = briefing {
+        prompt.push_str(&format!("\n{briefing}\n"));
+    }
+    if alerts {
+        prompt.insert_str(
+            0,
+            "## Before anything else (from the launcher)\nThe gate on main is unproven.\n\n",
+        );
+    }
+    prompt
+}
+
+/// ohjaa's briefing: its parts joined by a newline, each opening as ohjaa
+/// writes it.
+fn ohjaa_briefing(knowledge: bool) -> String {
+    let mut parts = Vec::new();
+    if knowledge {
+        parts.push(
+            "Knowledge (ohjaa, knowledge-node.v1): what the people you work for know and\n\
+             have decided, as of the date on each entry. Follow it.\n\n\
+             Ours: decided by the team, binding everywhere:\n- [rule] Rust only.\n"
+                .to_owned(),
+        );
+    }
+    parts.push(format!(
+        "How this session works (ohjaa):\nIntent: demo.\nIf no concrete task is assigned, \
+         acknowledge and wait.\n{}",
+        "1. Before your first change, read back what you know.\n".repeat(80)
+    ));
+    parts.push(
+        "System perimeter (derived by ohjaa at launch; re-derive with\n`ohjaa system`, \
+         session observations via `ohjaa fleet`):\n\nRepositories:\n- widget — demo\n"
+            .to_owned(),
+    );
+    parts.join("\n")
+}
+
+#[test]
+fn a_launch_task_is_what_the_person_typed_without_the_briefing() {
+    let briefing = ohjaa_briefing(true);
+    let prompts = [
+        // The briefing alone, with no task or an empty one.
+        launch_prompt(false, None, Some(&briefing)),
+        launch_prompt(false, Some(""), Some(&briefing)),
+        launch_prompt(false, None, None),
+        // A short task, alone and before a long briefing.
+        launch_prompt(false, Some("fix the parser"), None),
+        launch_prompt(false, Some("tidy the docs"), Some(&briefing)),
+        // A task of several paragraphs keeps them, up to the briefing.
+        launch_prompt(
+            false,
+            Some("Rename the parser.\n\nKeep the old name as an alias."),
+            Some(&ohjaa_briefing(false)),
+        ),
+        // The launcher's alerts come before the framing.
+        launch_prompt(true, Some("check the gate"), Some(&briefing)),
+    ];
+    let rows: Vec<Value> = prompts
+        .iter()
+        .enumerate()
+        .flat_map(|(i, prompt)| {
+            [
+                claude_user(&format!("l{i}"), i as u32 * 2, prompt.clone().into()),
+                claude_reply(&format!("a{i}"), i as u32 * 2, "Ready."),
+            ]
+        })
+        .collect();
+    let path = transcript("launch-tasks.jsonl", &rows);
+    let (v, code) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        texts(&v),
+        [
+            "fix the parser",
+            "tidy the docs",
+            "Rename the parser.\n\nKeep the old name as an alias.",
+            "check the gate"
+        ]
+    );
+    assert!(v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["kind"] == "task"));
+    assert_eq!(excluded(&v)["harness_prompt"], 3);
+    std::fs::remove_file(path).unwrap();
 }
