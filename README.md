@@ -38,6 +38,29 @@ mistaken for a live balance. `--watch SECONDS` refreshes in the foreground;
 Ctrl-C stops it. `--samples N` bounds a watch for checks. Watch also works with
 `usage` and `stats`; each JSON refresh is a separate JSON document.
 
+### Claude subagents
+
+Claude Code writes each subagent to its own transcript, in
+`<session>/subagents/agent-<id>.jsonl` beside the session's own. Vessa names a
+subagent `<session>/<agentId>`, with the session as its `parent`. A subagent's
+usage is its session's usage:
+
+* `--session ID` selects the session and its subagents; a subagent's own id
+  selects it alone. A transcript given with `--input` brings its
+  `subagents/` directory along.
+* `status` and `receipt` total the session with its subagents. Status says how
+  many it included and shows each one; its JSON `entries` are that total, with
+  `main_entries` and a `subagents` breakdown beside them. Command windows stay
+  the main transcript's.
+* The receipt says which subagents it includes in `limitations`, since
+  `agent-usage.v1` has no field for them.
+* A transcript that says it launched a subagent whose transcript was not read
+  is partial (exit 4): that usage is unknown, not zero.
+* `stats` counts sessions, not transcripts: a subagent's usage counts its
+  session, and subagents are counted apart in `subagents`.
+
+A request is still counted once, however many transcripts hold it.
+
 Status, HTML reports and usage JSON also show **command and change insights**.
 A command is a recorded user message and the usage up to the next user message;
 message bodies and tool arguments/output are never retained. Injected context
@@ -173,6 +196,12 @@ records and grouped by provider/model. Consumers can display these beside work
 evidence without implementing accounting. Unknown categories remain null; older
 exports without this additive field still contain the original usage records.
 
+`totals` stays each transcript's own, so summing it across sessions counts
+every request once. Each session also names its Claude subagents in
+`subagents` and sums itself with them in `totals_with_subagents`: the total to
+show for one session. Without subagents the list is empty and the two totals
+are equal. Subagents remain sessions of their own in the export.
+
 Seula joins by agent and native session ID only, never directory or time.
 Whole-session spending does not establish spending caused by a conversation
 pattern. Incomplete source coverage remains visible in the export and exit code.
@@ -189,7 +218,8 @@ vessa report --input /path/to/session.jsonl --input /tmp/ohjaa.json --output /tm
 ```
 
 `receipt` requires exactly one native session and emits `agent-usage.v1`.
-Ohjaa attaches it to an explicit wrapper session. Exported work, handover,
+A Claude session's receipt includes its subagents and names them in
+`limitations`. Ohjaa attaches it to an explicit wrapper session. Exported work, handover,
 knowledge and outcome evidence appears alongside the usage only when
 that explicit native-session association exists. Directory and time-window
 guesses never establish identity. Unmatched wrapper records are reported.

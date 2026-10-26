@@ -17,6 +17,19 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
         if let Err(error) = discover(path, &mut files) {
             report.warnings.push(format!("{}: {error}", path.display()));
         }
+        // Claude Code keeps a session's subagent transcripts beside it, in
+        // `<session>/subagents/`. They are that session's usage, so a
+        // transcript selected on its own brings them along.
+        let subagents = path.with_extension("").join("subagents");
+        if path.extension().is_some_and(|s| s == "jsonl")
+            && std::fs::symlink_metadata(&subagents).is_ok()
+        {
+            if let Err(error) = discover(&subagents, &mut files) {
+                report
+                    .warnings
+                    .push(format!("{}: {error}", subagents.display()));
+            }
+        }
     }
     files.sort();
     files.dedup();
@@ -42,6 +55,7 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             old.usage.extend(session.usage);
             old.work.extend(session.work);
             old.limitations.extend(session.limitations);
+            old.launched.extend(session.launched);
         } else {
             merged.insert(key, session);
         }
@@ -118,6 +132,26 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
             } else {
                 seen.insert(key, (index, kept[index].len(), session.id.clone()));
                 kept[index].push(item);
+            }
+        }
+    }
+    // A launched subagent writes its own transcript. One that was not read
+    // leaves the session's usage incomplete, never silently smaller.
+    let read: std::collections::HashSet<_> = report
+        .sessions
+        .iter()
+        .filter(|s| s.agent == "claude")
+        .map(|s| s.id.clone())
+        .collect();
+    for session in report.sessions.iter_mut().filter(|s| s.agent == "claude") {
+        let top = session.subagent_of().unwrap_or(&session.id).to_owned();
+        let mut named = std::collections::HashSet::new();
+        for (agent, line) in std::mem::take(&mut session.launched) {
+            let id = format!("{top}/{agent}");
+            if !read.contains(&id) && named.insert(id.clone()) {
+                session.limitations.push(format!(
+                    "line {line}: subagent {id} was launched, but its transcript was not read; its usage is unknown, not zero"
+                ));
             }
         }
     }
@@ -348,6 +382,7 @@ fn parse_file(path: &Path) -> Result<Parsed> {
         limitations,
         ohjaa: Vec::new(),
         work: Vec::new(),
+        launched: Vec::new(),
     };
     let mut model = "unknown".to_owned();
     // Codex is OpenAI's agent; its session_meta names the provider when it
@@ -442,6 +477,10 @@ fn claude(v: &Value, line: usize, s: &mut Session) -> Result<()> {
             v["sessionId"] == s.id || s.parent.as_ref().is_some_and(|p| v["sessionId"] == *p),
             "mixed native session IDs"
         );
+    }
+    // Launching a subagent returns a tool result naming its agent id.
+    if let Some(agent) = v["toolUseResult"]["agentId"].as_str() {
+        s.launched.push((agent.to_owned(), line));
     }
     let m = &v["message"];
     if v["type"] == "assistant" && m["usage"].is_object() {

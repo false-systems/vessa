@@ -1091,6 +1091,18 @@ fn claude_status_totals_include_subagents_with_a_breakdown() {
     let out = cli(&["status", "--input", "examples/claude.jsonl"]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("no subagent transcripts read"));
+    // A subagent asked for by its own id is shown alone, and says whose it is.
+    let out = cli(&[
+        "status",
+        "--input",
+        dir.to_str().unwrap(),
+        "--session",
+        "claude-demo/subagent-demo",
+    ]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("subagent of claude-demo"), "{text}");
+    assert!(text.contains("in=6 out=1375"), "{text}");
     std::fs::remove_dir_all(dir).unwrap();
 }
 

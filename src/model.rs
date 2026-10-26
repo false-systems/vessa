@@ -53,6 +53,85 @@ pub struct Session {
     /// `codex-tui`, or `codex_exec` for `codex exec`. Null when unknown.
     #[serde(default)]
     pub originator: Option<String>,
+    /// Subagents a Claude transcript says it launched, by native agent id,
+    /// with the line that says so. Checked against the transcripts read.
+    #[serde(skip)]
+    pub launched: Vec<(String, usize)>,
+}
+
+impl Session {
+    /// The session a Claude subagent belongs to. Claude Code writes each
+    /// subagent to its own transcript under the parent's session id; Vessa
+    /// names it `parent/agentId`.
+    pub fn subagent_of(&self) -> Option<&str> {
+        let parent = self.parent.as_deref()?;
+        (self.agent == "claude" && self.id.strip_prefix(parent)?.starts_with('/')).then_some(parent)
+    }
+}
+
+/// One session with the subagent sessions read with it. A subagent whose
+/// session was not read stands alone.
+pub struct Family<'a> {
+    pub main: &'a Session,
+    pub subagents: Vec<&'a Session>,
+}
+
+impl Family<'_> {
+    pub fn usage(&self) -> impl Iterator<Item = &Usage> {
+        std::iter::once(self.main)
+            .chain(self.subagents.iter().copied())
+            .flat_map(|s| &s.usage)
+    }
+    /// Deduplicated totals of the session and its subagents.
+    pub fn totals(&self) -> Result<Vec<Entry>> {
+        aggregate_usage(self.usage())
+    }
+    /// The session's limitations, then each subagent's, named.
+    pub fn limitations(&self) -> Vec<String> {
+        let mut all = self.main.limitations.clone();
+        for s in &self.subagents {
+            all.extend(
+                s.limitations
+                    .iter()
+                    .map(|l| format!("subagent {}: {l}", s.id)),
+            );
+        }
+        all
+    }
+}
+
+/// Groups sessions with their subagents, in the order the sessions come.
+pub fn families(sessions: &[Session]) -> Vec<Family<'_>> {
+    let parents: std::collections::HashSet<_> = sessions
+        .iter()
+        .filter(|s| s.subagent_of().is_none())
+        .map(|s| (s.agent.as_str(), s.id.as_str()))
+        .collect();
+    let mut families: Vec<Family> = sessions
+        .iter()
+        .filter(|s| {
+            s.subagent_of()
+                .is_none_or(|p| !parents.contains(&(s.agent.as_str(), p)))
+        })
+        .map(|main| Family {
+            main,
+            subagents: Vec::new(),
+        })
+        .collect();
+    let index: BTreeMap<_, _> = families
+        .iter()
+        .enumerate()
+        .map(|(i, f)| ((f.main.agent.as_str(), f.main.id.as_str()), i))
+        .collect();
+    for s in sessions {
+        if let Some(&i) = s
+            .subagent_of()
+            .and_then(|p| index.get(&(s.agent.as_str(), p)))
+        {
+            families[i].subagents.push(s);
+        }
+    }
+    families
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -121,14 +200,35 @@ fn add_amount(a: &Option<Amount>, b: &Option<Amount>) -> Result<Option<Amount>> 
     }
 }
 
-pub fn receipt(session: &Session) -> Result<serde_json::Value> {
+/// The receipt for one session, its subagents included. `agent-usage.v1`
+/// has no field for them, and ohjaa refuses one it does not know, so the
+/// receipt says it in `limitations`.
+pub fn receipt(family: &Family) -> Result<serde_json::Value> {
+    let session = family.main;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis();
+    let mut limitations = vec![
+        "Local transcript snapshot; billing and unlogged requests are not verified".to_owned(),
+    ];
+    if !family.subagents.is_empty() {
+        let n = family.subagents.len();
+        limitations.push(format!(
+            "Entries include {n} Claude {} of this session, each read from its own transcript: {}",
+            if n == 1 { "subagent" } else { "subagents" },
+            family
+                .subagents
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    limitations.extend(family.limitations());
     Ok(serde_json::json!({
         "schema": "agent-usage.v1", "agent": session.agent, "session_id": session.id,
         "source": session.source, "observed_at_ms": now, "complete": false,
-        "limitations": std::iter::once("Local transcript snapshot; billing and unlogged requests are not verified".to_owned()).chain(session.limitations.clone()).collect::<Vec<_>>(),
-        "entries": aggregate(session)?
+        "limitations": limitations,
+        "entries": family.totals()?
     }))
 }
