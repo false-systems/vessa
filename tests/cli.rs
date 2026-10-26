@@ -1562,36 +1562,135 @@ fn session_headers_are_the_full_listings_headers() {
     std::fs::remove_file(export).unwrap();
 }
 
+/// `sessions --json` for `args`, with its exit status, partial or not.
+fn listing(args: &[&str]) -> (Value, Option<i32>) {
+    let output = cli(args);
+    let v = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("{args:?}: {e}: {}", String::from_utf8_lossy(&output.stderr)));
+    (v, output.status.code())
+}
+
 #[test]
-fn session_headers_read_only_a_transcripts_opening_records() {
-    // Past its header, a transcript is not read: a damaged tail, which the
-    // full listing reports instead of the session, does not reach it.
-    let path = temp("damaged-tail.jsonl");
-    let mut bytes = include_bytes!("../examples/codex.jsonl").to_vec();
-    bytes.extend(b"{\"type\":\"event_msg\",\"payload\":\"\xff\xfe\"}\n");
-    std::fs::write(&path, bytes).unwrap();
-    let input = path.to_str().unwrap();
-    let full = cli(&["sessions", "--json", "--input", input]);
-    assert_eq!(full.status.code(), Some(4));
-    let v: Value = serde_json::from_slice(&full.stdout).unwrap();
-    assert!(v["sessions"].as_array().unwrap().is_empty(), "{v}");
-    let v = value(cli(&["sessions", "--json", "--headers", "--input", input]));
-    assert_eq!(v["sessions"][0]["id"], "codex-demo");
-    assert_eq!(v["warnings"], serde_json::json!([]));
-    // Usage is not read, so neither is anything usage would need.
+fn session_headers_differ_from_the_full_listing_only_where_documented() {
+    // The header reader stops at a transcript's header, trusting how the
+    // agents write. Where a file breaks that, the modes differ, as the
+    // README says, and these pin how.
+    let dir = temp("header-differences");
+    std::fs::create_dir_all(&dir).unwrap();
+    let opening = |id: &str| {
+        format!(
+            r#"{{"type":"user","uuid":"o1","isSidechain":false,"sessionId":"{id}","cwd":"/demo/widget","entrypoint":"cli","timestamp":"2026-09-30T09:00:00Z","message":{{"role":"user","content":"a"}}}}"#
+        )
+    };
+    let write = |name: &str, rows: &[&str]| {
+        let path = dir.join(name);
+        std::fs::write(&path, rows.join("\n") + "\n").unwrap();
+        path.to_str().unwrap().to_owned()
+    };
+    let both = |input: &str| {
+        let (full, _) = listing(&["sessions", "--json", "--input", input]);
+        let (headers, code) = listing(&["sessions", "--json", "--headers", "--input", input]);
+        (full, headers, code)
+    };
+    // A Claude transcript that says it is no sidechain, then that it is one:
+    // the full listing makes it a subagent of itself, headers keep the first.
+    let flip = write(
+        "flip.jsonl",
+        &[
+            &opening("claude-flip"),
+            r#"{"type":"user","uuid":"o2","isSidechain":true,"agentId":"late","sessionId":"claude-flip","message":{"role":"user","content":"b"}}"#,
+        ],
+    );
+    let (full, headers, code) = both(&flip);
+    assert_eq!(full["sessions"][0]["id"], "claude-flip/late");
+    assert_eq!(full["sessions"][0]["parent"], "claude-flip");
+    assert_eq!(headers["sessions"][0]["id"], "claude-flip");
+    assert!(headers["sessions"][0]["parent"].is_null());
+    assert_eq!(code, Some(0));
+    // A file holding two agents' records: the full listing takes the higher
+    // ranked (Codex, then pi), headers the first.
+    for (name, later, agent, id) in [
+        (
+            "then-codex.jsonl",
+            r#"{"type":"session_meta","payload":{"id":"codex-mixed","cwd":"/demo/widget","timestamp":"2026-09-30T10:00:00Z"}}"#,
+            "codex",
+            "codex-mixed",
+        ),
+        (
+            "then-pi.jsonl",
+            r#"{"type":"session","version":3,"id":"pi-mixed","timestamp":"2026-09-30T11:00:00Z","cwd":"/demo/widget"}"#,
+            "pi",
+            "pi-mixed",
+        ),
+    ] {
+        let mixed = write(name, &[&opening("claude-mixed"), later]);
+        let (full, headers, _) = both(&mixed);
+        assert_eq!(full["sessions"][0]["agent"], agent, "{name}");
+        assert_eq!(full["sessions"][0]["id"], id, "{name}");
+        assert_eq!(headers["sessions"][0]["agent"], "claude", "{name}");
+        assert_eq!(headers["sessions"][0]["id"], "claude-mixed", "{name}");
+    }
+    // Damage after the header: the full listing drops the transcript with a
+    // warning, headers list it, since they never read that far.
+    let damaged = |name: &str, opening: &str| {
+        let path = dir.join(name);
+        let mut bytes = opening.as_bytes().to_vec();
+        bytes.extend(b"\n{\"type\":\"user\",\"sessionId\":\"x\",\"note\":\"\xff\xfe\"}\n");
+        std::fs::write(&path, bytes).unwrap();
+        path.to_str().unwrap().to_owned()
+    };
+    let tail = damaged("damaged-tail.jsonl", &opening("claude-damaged"));
+    let (full, headers, code) = both(&tail);
+    assert!(full["sessions"].as_array().unwrap().is_empty(), "{full}");
+    assert_eq!(full["warnings"].as_array().unwrap().len(), 2, "{full}");
+    assert_eq!(headers["sessions"][0]["id"], "claude-damaged");
+    assert_eq!(headers["warnings"], serde_json::json!([]));
+    assert_eq!(code, Some(0));
+    // So of two copies of one session, a damaged first copy gives the
+    // header; the full listing has only the second.
+    let copies = dir.join("copies");
+    std::fs::create_dir_all(&copies).unwrap();
+    std::fs::rename(
+        damaged("a.jsonl", &opening("claude-copied")),
+        copies.join("a.jsonl"),
+    )
+    .unwrap();
+    std::fs::write(
+        copies.join("b.jsonl"),
+        opening("claude-copied")
+            .replace("/demo/widget", "/demo/other")
+            .replace("09:00:00", "09:30:00"),
+    )
+    .unwrap();
+    let (full, headers, _) = both(copies.to_str().unwrap());
+    assert_eq!(full["sessions"][0]["cwd"], "/demo/other");
+    assert_eq!(full["sessions"][0]["started_at"], "2026-09-30T09:30:00Z");
+    assert_eq!(full["warnings"].as_array().unwrap().len(), 1, "{full}");
+    assert_eq!(headers["sessions"][0]["cwd"], "/demo/widget");
+    assert_eq!(headers["sessions"][0]["started_at"], "2026-09-30T09:00:00Z");
+    assert_eq!(headers["warnings"], serde_json::json!([]));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn session_headers_print_a_line_each_and_refuse_rates_wherever_given() {
     let text = cli(&["sessions", "--headers", "--input", "examples/pi.jsonl"]);
     assert_eq!(
         String::from_utf8(text.stdout).unwrap(),
         "pi pi-demo · started 2026-09-30T11:00:00Z · /demo/widget\n"
     );
-    let rates = cli(&[
-        "sessions",
-        "--headers",
-        "--rates",
-        "examples/rates.json",
-        "--input",
-        "examples/pi.jsonl",
-    ]);
-    assert!(!rates.status.success());
-    std::fs::remove_file(path).unwrap();
+    // Headers read no usage to price; a rate card would only add notices
+    // that a caller takes for gaps.
+    for args in [
+        vec!["sessions", "--headers", "--rates", "examples/rates.json"],
+        vec!["--rates", "examples/rates.json", "sessions", "--headers"],
+    ] {
+        let mut argv = args.clone();
+        argv.extend(["--json", "--input", "examples/pi.jsonl"]);
+        let output = cli(&argv);
+        assert!(!output.status.success(), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--rates"), "{args:?}: {stderr}");
+    }
 }
