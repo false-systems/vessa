@@ -416,6 +416,55 @@ fn calendar_statistics_use_usage_time_utc_and_preserve_unknowns() {
 }
 
 #[test]
+fn stats_say_how_many_records_were_priced_and_no_estimate_when_none() {
+    let line = |args: &[&str]| {
+        let mut argv = vec!["stats", "--input", "examples/claude.jsonl"];
+        argv.extend(args);
+        let out = cli(&argv);
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let text = line(&["--rates", "examples/rates.json"]);
+    assert!(
+        text.contains("2026-09 claude · 1 session · 1 of 1 usage records priced · known estimate subtotal=$0.008715\n"),
+        "{text}"
+    );
+    // Nothing priced is no estimate, not $0.
+    let text = line(&[]);
+    assert!(
+        text.contains("2026-09 claude · 1 session · 0 of 1 usage records priced · no estimate\n"),
+        "{text}"
+    );
+    assert!(!text.contains("$0.000000"), "{text}");
+    let v = value(cli(&[
+        "stats",
+        "--input",
+        "examples/claude.jsonl",
+        "--json",
+    ]));
+    assert_eq!(v["buckets"][0]["priced_records"], 0);
+    assert_eq!(v["buckets"][0]["unpriced_records"], 1);
+    // The report says the same, in its overview, ranking and statistics.
+    let html = temp("no-estimate.html");
+    let out = cli(&[
+        "report",
+        "--input",
+        "examples/claude.jsonl",
+        "--output",
+        html.to_str().unwrap(),
+    ]);
+    assert!(out.status.success());
+    let page = std::fs::read_to_string(&html).unwrap();
+    assert!(page.contains("<strong>No estimate</strong>"), "{page}");
+    assert!(
+        page.contains("<td>0 of 1</td><td>no estimate</td>"),
+        "{page}"
+    );
+    assert!(!page.contains("$0.000000"), "{page}");
+    std::fs::remove_file(html).unwrap();
+}
+
+#[test]
 fn version_says_which_vessa_this_is() {
     for flag in ["--version", "-V"] {
         let out = cli(&[flag]);
@@ -565,6 +614,54 @@ fn claude_statusline_always_prints_and_says_unknown_for_what_it_cannot_read() {
 }
 
 #[test]
+fn text_for_a_terminal_carries_no_bidi_or_control_characters() {
+    // Bidirectional controls reorder what a terminal shows (U+202E, U+2066
+    // and their kin) without being control characters to `char`.
+    let bidi = ['\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{200F}'];
+    let input = serde_json::json!({"session_id":"demo\u{202E}di","model":{"display_name":"De\u{2066}mo\u{2069}\u{200F}"},"cost":{"total_cost_usd":0.5}});
+    let out = statusline(input.to_string().into_bytes());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.starts_with("session estimate $0.50 · billed unknown · Demo · demodi\n"),
+        "{text:?}"
+    );
+    // A message and the place it was said, in the plain form.
+    let mut row = claude_user("b1", 0, "Fix the \u{202E}parser\u{202C} now.".into());
+    row["cwd"] = "/demo/\u{2066}widget\u{1b}[2J".into();
+    let path = transcript("bidi.jsonl", &[row]);
+    let out = cli(&["messages", "--input", path.to_str().unwrap()]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains(" · /demo/widget[2J · "), "{text:?}");
+    assert!(text.contains("\n  Fix the parser now.\n"), "{text:?}");
+    for c in bidi.iter().chain(&['\u{202C}', '\u{1b}']) {
+        assert!(!text.contains(*c), "{c:?} in {text:?}");
+    }
+    std::fs::remove_file(path).unwrap();
+    // The session list, and the limitations every command prints on stderr,
+    // which can name models: two snapshots of one request that disagree.
+    let snapshot = |model: &str, input: u64| serde_json::json!({"type":"assistant","uuid":format!("s{input}"),"requestId":"req_011Cbidi","sessionId":"claude-bidi","cwd":"/demo/\u{202E}widget\u{1b}[2J","timestamp":"2026-09-30T09:01:00Z","message":{"id":"msg_011Cbidi","role":"assistant","model":model,"content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":input,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}});
+    let path = transcript(
+        "bidi-limitation.jsonl",
+        &[
+            snapshot("demo\u{2066}-a", 1),
+            snapshot("demo\u{1b}[31m-b", 2),
+        ],
+    );
+    for command in ["sessions", "usage", "stats", "status"] {
+        let out = cli(&[command, "--input", path.to_str().unwrap()]);
+        assert_eq!(out.status.code(), Some(4), "{command}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("conflicting usage"), "{command}: {stderr}");
+        for c in bidi.iter().chain(&['\u{1b}']) {
+            assert!(!stdout.contains(*c), "{command}: {c:?} in {stdout:?}");
+            assert!(!stderr.contains(*c), "{command}: {c:?} in {stderr:?}");
+        }
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn native_directory_metadata_is_not_misread_as_an_export() {
     let dir = temp("native-dir");
     std::fs::create_dir(&dir).unwrap();
@@ -652,11 +749,51 @@ fn command_elapsed_time_is_said_in_plain_words() {
     );
     assert!(
         text.contains(
-            "Command 2 · line 4 · usage records=0 tools=0 recorded changes=0 · elapsed unknown\n"
+            "Command 2 · line 4 · usage records=0 tools=0 recorded changes=0 · elapsed unknown (no usage was recorded in it)\n"
         ),
         "{text}"
     );
     assert!(!text.contains("unknowns") && !text.contains("observed elapsed"));
+
+    // Each other reason the time is unknown is said, in the same words.
+    let usage = |uuid: &str, at: Option<&str>| {
+        let mut row = serde_json::json!({"type":"assistant","uuid":uuid,"requestId":format!("req_011C{uuid}"),"sessionId":"claude-elapsed","message":{"id":format!("msg_011C{uuid}"),"role":"assistant","model":"demo-model","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}});
+        if let Some(at) = at {
+            row["timestamp"] = at.into();
+        }
+        row
+    };
+    let command = |uuid: &str, at: Option<&str>| {
+        let mut row = serde_json::json!({"type":"user","uuid":uuid,"sessionId":"claude-elapsed","cwd":"/demo/widget","message":{"role":"user","content":"Go on."}});
+        if let Some(at) = at {
+            row["timestamp"] = at.into();
+        }
+        row
+    };
+    let path = transcript(
+        "elapsed-reasons.jsonl",
+        &[
+            command("c1", None),
+            usage("r1", Some("2026-09-30T09:01:00Z")),
+            command("c2", Some("2026-09-30T09:02:00Z")),
+            usage("r2", None),
+            command("c3", Some("2026-09-30T09:05:00Z")),
+            usage("r3", Some("2026-09-30T09:04:00Z")),
+        ],
+    );
+    let out = cli(&["status", "--input", path.to_str().unwrap()]);
+    let text = String::from_utf8(out.stdout).unwrap();
+    for (n, line, why) in [
+        (1, 1, "the command has no timestamp"),
+        (2, 3, "none of its usage records has a timestamp"),
+        (3, 5, "its last usage record is timestamped before it"),
+    ] {
+        let said = format!(
+            "Command {n} · line {line} · usage records=1 tools=0 recorded changes=0 · elapsed unknown ({why})\n"
+        );
+        assert!(text.contains(&said), "{said}{text}");
+    }
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -1394,6 +1531,27 @@ fn claude_status_totals_include_subagents_with_a_breakdown() {
     assert_eq!(v["entries"][0]["input_tokens"], 1206);
     assert_eq!(v["entries"][0]["output_tokens"], 1675);
     assert_eq!(v["main_entries"][0]["output_tokens"], 300);
+    // `entries` is the session with its subagents (since vessa#4), and
+    // `main_entries` its own transcript: each count is theirs summed.
+    for key in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    ] {
+        let sum = v["main_entries"][0][key].as_u64().unwrap()
+            + v["subagents"][0]["entries"][0][key].as_u64().unwrap();
+        assert_eq!(v["entries"][0][key], sum, "{key}");
+    }
+    // Without subagents, the two are one.
+    let alone = value(cli(&[
+        "status",
+        "--input",
+        "examples/claude.jsonl",
+        "--json",
+    ]));
+    assert_eq!(alone["entries"], alone["main_entries"]);
+    assert_eq!(alone["subagents"], serde_json::json!([]));
     let subagents = v["subagents"].as_array().unwrap();
     assert_eq!(subagents.len(), 1);
     assert_eq!(subagents[0]["id"], "claude-demo/subagent-demo");
@@ -1559,6 +1717,15 @@ fn a_session_whose_main_transcript_was_not_read_is_not_found() {
     // must not answer with the subagent as if it were the session.
     let dir = claude_family("family-no-main", true);
     std::fs::remove_file(dir.join("claude-demo.jsonl")).unwrap();
+    // Claude Code also writes `api-request` records into a subagent's
+    // transcript, which say nothing about being a sidechain.
+    let sub = dir.join("claude-demo/subagents/agent-subagent-demo.jsonl");
+    let mut rows = std::fs::read_to_string(&sub).unwrap();
+    rows.push_str(
+        r#"{"type":"api-request","sessionId":"claude-demo","timestamp":"2026-09-30T09:10:01Z"}"#,
+    );
+    rows.push('\n');
+    std::fs::write(&sub, rows).unwrap();
     for command in ["receipt", "status"] {
         let output = cli(&[
             command,
@@ -1589,13 +1756,17 @@ fn a_session_whose_main_transcript_was_not_read_is_not_found() {
     std::fs::remove_dir_all(dir).unwrap();
 
     // A main transcript holding a sidechain record is read as a subagent
-    // transcript; its session id alone still does not select it.
+    // transcript; its session id alone still does not select it. Its own
+    // records say they are no sidechain, as Claude Code's main transcripts
+    // do; Claude Code's `api-request` records, in subagent transcripts too,
+    // say neither.
     let path = temp("main-with-sidechain.jsonl");
     std::fs::write(
         &path,
         format!(
             "{}{}\n",
-            include_str!("../examples/claude.jsonl"),
+            include_str!("../examples/claude.jsonl")
+                .replace(r#""sessionId":"#, r#""isSidechain":false,"sessionId":"#),
             r#"{"type":"user","uuid":"x1","isSidechain":true,"agentId":"stray","sessionId":"claude-demo","timestamp":"2026-09-30T09:04:00Z","message":{"role":"user","content":"Look."}}"#
         ),
     )
@@ -1607,11 +1778,14 @@ fn a_session_whose_main_transcript_was_not_read_is_not_found() {
         "--session",
         "claude-demo",
     ]);
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    // It was read: the error says it was taken for a subagent, and why.
+    assert!(
+        !stderr.contains("main transcript was not read")
+            && stderr.contains("was read as its subagent claude-demo/stray")
+            && stderr.contains("sidechain"),
+        "{stderr}"
     );
     std::fs::remove_file(path).unwrap();
 }
@@ -2208,6 +2382,19 @@ fn session_headers_differ_from_the_full_listing_only_where_documented() {
         assert_eq!(headers["sessions"][0]["agent"], "claude", "{name}");
         assert_eq!(headers["sessions"][0]["id"], "claude-mixed", "{name}");
     }
+    // A pi header, then a Codex one: the same ranking, the same difference.
+    let pi_codex = write(
+        "pi-then-codex.jsonl",
+        &[
+            r#"{"type":"session","version":3,"id":"pi-first","timestamp":"2026-09-30T11:00:00Z","cwd":"/demo/widget"}"#,
+            r#"{"type":"session_meta","payload":{"id":"codex-later","cwd":"/demo/widget","timestamp":"2026-09-30T10:00:00Z"}}"#,
+        ],
+    );
+    let (full, headers, _) = both(&pi_codex);
+    assert_eq!(full["sessions"][0]["agent"], "codex", "{full}");
+    assert_eq!(full["sessions"][0]["id"], "codex-later", "{full}");
+    assert_eq!(headers["sessions"][0]["agent"], "pi", "{headers}");
+    assert_eq!(headers["sessions"][0]["id"], "pi-first", "{headers}");
     // Damage after the header: the full listing drops the transcript with a
     // warning, headers list it, since they never read that far.
     let damaged = |name: &str, opening: &str| {
@@ -2274,6 +2461,712 @@ fn session_headers_print_a_line_each_and_refuse_rates_wherever_given() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("--rates"), "{args:?}: {stderr}");
     }
+    // Without --headers, sessions reads usage, so a rate card is accepted in
+    // either position.
+    for args in [
+        vec!["sessions", "--rates", "examples/rates.json"],
+        vec!["--rates", "examples/rates.json", "sessions"],
+    ] {
+        let mut argv = args.clone();
+        argv.extend(["--json", "--input", "examples/claude.jsonl"]);
+        let v = value(cli(&argv));
+        assert_eq!(
+            v["sessions"][0]["totals"][0]["estimated_usd_micros"], 8715,
+            "{args:?}"
+        );
+    }
+}
+
+/// A Claude session with `n` subagents, each with requests of its own.
+fn claude_family_of(name: &str, n: usize) -> PathBuf {
+    let dir = temp(name);
+    std::fs::create_dir_all(dir.join("claude-demo/subagents")).unwrap();
+    let mut main = include_str!("../examples/claude.jsonl").to_owned();
+    for i in 1..=n {
+        let agent = format!("agent{i:02}");
+        main.push_str(&LAUNCH.replace("subagent-demo", &agent));
+        main.push('\n');
+        std::fs::write(
+            dir.join(format!("claude-demo/subagents/agent-{agent}.jsonl")),
+            include_str!("../examples/claude-subagent.jsonl")
+                .replace("subagent-demo", &agent)
+                .replace("CdemoSub", &format!("CdemoSub{i:02}x")),
+        )
+        .unwrap();
+    }
+    std::fs::write(dir.join("claude-demo.jsonl"), main).unwrap();
+    dir
+}
+
+#[test]
+fn a_receipt_names_ten_subagents_and_counts_the_rest() {
+    // A session with many subagents: the receipt says how many it includes
+    // and names the first ten, rather than a list of every id.
+    let dir = claude_family_of("family-many", 12);
+    let output = cli(&["receipt", "--input", dir.to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(v["entries"][0]["output_tokens"], 300 + 12 * 1375);
+    let said: Vec<&str> = v["limitations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l.as_str().unwrap())
+        .filter(|l| l.contains("Claude subagents"))
+        .collect();
+    assert_eq!(said.len(), 1, "{v}");
+    let said = said[0];
+    assert!(
+        said.starts_with("Entries include 12 Claude subagents of this session"),
+        "{said}"
+    );
+    for i in 1..=10 {
+        assert!(said.contains(&format!("claude-demo/agent{i:02}")), "{said}");
+    }
+    for i in 11..=12 {
+        assert!(!said.contains(&format!("agent{i:02}")), "{said}");
+    }
+    assert!(said.contains("the first 10 in id order"), "{said}");
+    assert!(said.contains("2 more are not named here"), "{said}");
+    assert!(
+        said.contains("vessa status --session claude-demo"),
+        "{said}"
+    );
+    assert!(said.len() < 1_000, "{} characters", said.len());
+    // Ten or fewer are each named, as before.
+    std::fs::remove_dir_all(dir).unwrap();
+    let dir = claude_family_of("family-ten", 10);
+    let v = value(cli(&["receipt", "--input", dir.to_str().unwrap()]));
+    let all = v["limitations"].to_string();
+    assert!(all.contains("Entries include 10 Claude subagents"), "{all}");
+    assert!(
+        all.contains("claude-demo/agent10") && !all.contains("more are not named"),
+        "{all}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_launch_copied_from_another_session_is_not_a_missing_subagent() {
+    // A transcript can carry another session's history, launch records too,
+    // under its own session id. The subagent such a record names ran in the
+    // session whose transcripts hold it and the same launch record: it is not
+    // missing in the copy, and the history both hold is that session's,
+    // whichever of the two ids sorts first.
+    for (old_id, new_id) in [
+        ("claude-a-old", "claude-b-new"),
+        ("claude-z-old", "claude-b-new"),
+    ] {
+        let dir = temp(&format!("copied-launch-{old_id}"));
+        std::fs::create_dir_all(dir.join(format!("{old_id}/subagents"))).unwrap();
+        let old = include_str!("../examples/claude.jsonl").replace("claude-demo", old_id);
+        let launch = LAUNCH.replace("claude-demo", old_id);
+        std::fs::write(
+            dir.join(format!("{old_id}.jsonl")),
+            format!("{old}{launch}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("{old_id}/subagents/agent-subagent-demo.jsonl")),
+            include_str!("../examples/claude-subagent.jsonl").replace("claude-demo", old_id),
+        )
+        .unwrap();
+        let own = r#"{"type":"assistant","uuid":"n1","requestId":"req_011CnewRequest","sessionId":"NEW","timestamp":"2026-09-30T10:00:00Z","message":{"id":"msg_011CnewMessage","role":"assistant","model":"demo-model","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":10,"output_tokens":20,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+        let new = dir.join(format!("{new_id}.jsonl"));
+        std::fs::write(
+            &new,
+            format!("{old}{launch}\n{own}\n")
+                .replace(old_id, new_id)
+                .replace("NEW", new_id),
+        )
+        .unwrap();
+        let output = cli(&["usage", "--input", dir.to_str().unwrap(), "--json"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(0), "{old_id}: {stderr}");
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let session = |id: &str| {
+            v["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            session(new_id)["limitations"],
+            serde_json::json!([]),
+            "{old_id}"
+        );
+        assert_eq!(
+            session(new_id)["subagents"],
+            serde_json::json!([]),
+            "{old_id}"
+        );
+        assert_eq!(
+            session(old_id)["subagents"],
+            serde_json::json!([format!("{old_id}/subagent-demo")])
+        );
+        // Each receipt: the copy its own request, the original all of its own.
+        for (id, output_tokens) in [(new_id, 20), (old_id, 300 + 1375)] {
+            let output = cli(&["receipt", "--input", dir.to_str().unwrap(), "--session", id]);
+            assert_eq!(output.status.code(), Some(0), "{old_id}: {id}");
+            let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                v["entries"][0]["output_tokens"], output_tokens,
+                "{old_id}: {id}"
+            );
+        }
+        // Read alone, the copy cannot show where its subagent ran: partial.
+        let output = cli(&["receipt", "--input", new.to_str().unwrap()]);
+        assert_eq!(output.status.code(), Some(4));
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            v["limitations"]
+                .to_string()
+                .contains(&format!("subagent {new_id}/subagent-demo was launched")),
+            "{v}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn a_launch_proves_a_copy_only_by_the_same_record() {
+    // P launches subagent-demo, and its transcript was not read. Another
+    // session's subagent of the same id is not P's, unless that session
+    // holds the very launch record P holds.
+    let missing = "subagent claude-p/subagent-demo was launched, but its transcript was not read";
+    let q_main = || {
+        include_str!("../examples/claude.jsonl")
+            .replace("claude-demo", "claude-q")
+            .replace("CdemoRequest1", "CqRequest1")
+            .replace("CdemoMessage1", "CqMessage1")
+    };
+    for (case, q) in [
+        // Q launched its own subagent of that id: another launch record.
+        (
+            "own launch",
+            Some(format!(
+                "{}{}\n",
+                q_main(),
+                LAUNCH
+                    .replace("claude-demo", "claude-q")
+                    .replace("\"u4\"", "\"q4\"")
+                    .replace("task1", "taskq")
+            )),
+        ),
+        // Q's transcript says nothing of launching it.
+        ("no launch", Some(q_main())),
+        // Q's own transcript was not read at all.
+        ("not read", None),
+    ] {
+        let dir = temp("launch-collision");
+        std::fs::create_dir_all(dir.join("claude-q/subagents")).unwrap();
+        std::fs::write(
+            dir.join("claude-p.jsonl"),
+            format!("{}{LAUNCH}\n", include_str!("../examples/claude.jsonl"))
+                .replace("claude-demo", "claude-p"),
+        )
+        .unwrap();
+        if let Some(q) = q {
+            std::fs::write(dir.join("claude-q.jsonl"), q).unwrap();
+        }
+        std::fs::write(
+            dir.join("claude-q/subagents/agent-subagent-demo.jsonl"),
+            include_str!("../examples/claude-subagent.jsonl").replace("claude-demo", "claude-q"),
+        )
+        .unwrap();
+        let output = cli(&[
+            "receipt",
+            "--input",
+            dir.to_str().unwrap(),
+            "--session",
+            "claude-p",
+        ]);
+        assert_eq!(output.status.code(), Some(4), "{case}");
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(
+            v["limitations"].to_string().contains(missing),
+            "{case}: {v}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    // Two sessions hold the same launch record, and the subagent's
+    // transcript was read under neither: which one ran it is unknown. Both
+    // stay partial, and each names the other.
+    let dir = temp("launch-twins");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = format!("{}{LAUNCH}\n", include_str!("../examples/claude.jsonl"));
+    std::fs::write(
+        dir.join("claude-p.jsonl"),
+        p.replace("claude-demo", "claude-p"),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("claude-q.jsonl"),
+        p.replace("claude-demo", "claude-q"),
+    )
+    .unwrap();
+    let output = cli(&["usage", "--input", dir.to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    for (id, other) in [("claude-p", "claude-q"), ("claude-q", "claude-p")] {
+        let said = v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap()["limitations"]
+            .to_string();
+        assert!(
+            said.contains(&format!("subagent {id}/subagent-demo was launched"))
+                && said.contains(&format!("{other} holds the same launch record")),
+            "{id}: {said}"
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_subagent_whose_requests_another_session_counted_is_not_silently_dropped() {
+    // Session Q holds request x; so does P1's subagent, and nothing else.
+    // Counted once, with Q, x is not in P1's total, and P1's receipt says so.
+    let dir = temp("counted-outside");
+    std::fs::create_dir_all(dir.join("claude-p1/subagents")).unwrap();
+    let request = |session: &str, sidechain: bool| {
+        let mut row = serde_json::json!({"type":"assistant","uuid":"x1","requestId":"req_011Cshared","sessionId":session,"cwd":"/demo/widget","timestamp":"2026-09-30T09:20:00Z","message":{"id":"msg_011Cshared","role":"assistant","model":"demo-model","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":1,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}});
+        if sidechain {
+            row["isSidechain"] = true.into();
+            row["agentId"] = "sub-x".into();
+        }
+        row
+    };
+    write_lines(&dir.join("claude-q.jsonl"), &[request("claude-q", false)]);
+    std::fs::write(
+        dir.join("claude-p1.jsonl"),
+        format!(
+            "{}{}\n",
+            include_str!("../examples/claude.jsonl"),
+            LAUNCH.replace("subagent-demo", "sub-x")
+        )
+        .replace("claude-demo", "claude-p1"),
+    )
+    .unwrap();
+    write_lines(
+        &dir.join("claude-p1/subagents/agent-sub-x.jsonl"),
+        &[request("claude-p1", true)],
+    );
+    let output = cli(&[
+        "receipt",
+        "--input",
+        dir.to_str().unwrap(),
+        "--session",
+        "claude-p1",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(4), "{stderr}");
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(v["entries"][0]["output_tokens"], 300);
+    let all = v["limitations"].to_string();
+    assert!(
+        all.contains("subagent claude-p1/sub-x: No usage of its own: its 1 request was counted with another session (claude-q)"),
+        "{all}"
+    );
+    // With a request of its own besides, the one Q counted is still left
+    // out of P1's total, and still said.
+    let mut own = request("claude-p1", true);
+    own["requestId"] = "req_011Cown".into();
+    own["message"]["id"] = "msg_011Cown".into();
+    own["message"]["usage"]["output_tokens"] = 7.into();
+    write_lines(
+        &dir.join("claude-p1/subagents/agent-sub-x.jsonl"),
+        &[own, request("claude-p1", true)],
+    );
+    let output = cli(&[
+        "receipt",
+        "--input",
+        dir.to_str().unwrap(),
+        "--session",
+        "claude-p1",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(v["entries"][0]["output_tokens"], 300 + 7);
+    let all = v["limitations"].to_string();
+    assert!(
+        all.contains("subagent claude-p1/sub-x: 1 of its 2 requests was counted with another session (claude-q), so this session's total leaves it out"),
+        "{all}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_report_ranks_each_session_with_its_subagents() {
+    let dir = claude_family("family-ranking", true);
+    let html = temp("ranking.html");
+    let out = cli(&[
+        "report",
+        "--input",
+        dir.to_str().unwrap(),
+        "--rates",
+        "examples/rates.json",
+        "--output",
+        html.to_str().unwrap(),
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let page = std::fs::read_to_string(&html).unwrap();
+    let ranking = page
+        .split("<h3>Sessions by known estimate subtotal</h3>")
+        .nth(1)
+        .unwrap()
+        .split("</table>")
+        .next()
+        .unwrap();
+    // One row: the session, its subagent's spending included.
+    assert_eq!(
+        ranking.matches("<tr><th scope=\"row\">").count(),
+        1,
+        "{ranking}"
+    );
+    assert!(
+        ranking.contains("claude · claude-demo</a> · 1 subagent</th><td>$0.030409</td><td>0</td>"),
+        "{ranking}"
+    );
+    std::fs::remove_file(html).unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_report_counts_rate_card_notices_apart_from_source_warnings() {
+    let html = temp("notices.html");
+    let out = cli(&[
+        "report",
+        "--input",
+        "examples/claude.jsonl",
+        "--rates",
+        "examples/rates.json",
+        "--output",
+        html.to_str().unwrap(),
+    ]);
+    assert!(out.status.success());
+    let page = std::fs::read_to_string(&html).unwrap();
+    // The OpenAI card priced nothing: a notice, not a gap in the evidence.
+    assert!(
+        page.contains("<p>1 session · 0 source warnings · 1 rate-card notice</p>"),
+        "{page}"
+    );
+    std::fs::remove_file(html).unwrap();
+}
+
+/// A Claude request at 09:MM on 2026-09-30 with these token counts.
+fn claude_usage(n: u32, input: u64, output: u64, read: u64, write: u64) -> Value {
+    serde_json::json!({"type":"assistant","uuid":format!("p{n}"),"requestId":format!("req_011Cprice{n}"),"sessionId":"claude-priced","cwd":"/demo/widget","timestamp":format!("2026-09-30T09:{n:02}:00Z"),"message":{"id":format!("msg_011Cprice{n}"),"role":"assistant","model":"demo-model","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":input,"output_tokens":output,"cache_read_input_tokens":read,"cache_creation_input_tokens":write}}})
+}
+
+#[test]
+fn a_rate_card_leaves_an_unknown_price_unknown_and_can_bound_the_prompt() {
+    let mut later = claude_usage(5, 1_000, 100, 0, 0);
+    later["timestamp"] = "2026-10-15T09:00:00Z".into();
+    let path = transcript(
+        "priced.jsonl",
+        &[
+            claude_usage(1, 1_000, 100, 0, 0),
+            claude_usage(2, 1_000, 100, 0, 500),
+            claude_usage(3, 300_000, 100, 0, 0),
+            claude_usage(4, 275_000, 100, 0, 0),
+            later,
+        ],
+    );
+    let card = |input: u64, output: u64, bound: (&str, u64)| {
+        let mut card = serde_json::json!({"provider":"anthropic","model":"demo-model","effective_from":"2026-09-01T00:00:00Z","effective_until":"2026-10-01T00:00:00Z","source":"SYNTHETIC TEST RATE, not a real provider price","input":input,"output":output,"cache_read":100_000,"cache_write":null,"notes":"An estimate, not a bill."});
+        card[bound.0] = bound.1.into();
+        card
+    };
+    let rates = temp("bounded-rates.json");
+    std::fs::write(
+        &rates,
+        serde_json::to_vec(&[
+            card(1_000_000, 2_000_000, ("prompt_up_to", 272_000)),
+            card(2_000_000, 3_000_000, ("prompt_over", 278_528)),
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let output = cli(&[
+        "usage",
+        "--input",
+        path.to_str().unwrap(),
+        "--rates",
+        rates.to_str().unwrap(),
+        "--json",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // Pricing notices never make the usage evidence partial.
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let usage = v["sessions"][0]["usage"].as_array().unwrap();
+    let entry = |n: usize| &usage[n - 1]["entry"];
+    // Short prompt, no cache writes: priced by the first card.
+    assert_eq!(entry(1)["estimated_usd_micros"], 1_000 + 200);
+    // Cache writes at an unknown price: unknown, and said why.
+    assert!(entry(2)["estimated_usd_micros"].is_null(), "{}", entry(2));
+    let why = entry(2)["estimate_basis"].as_str().unwrap();
+    assert!(
+        why.contains("cache-write price unknown") && why.contains("500"),
+        "{why}"
+    );
+    // A long prompt: the second card's rates.
+    assert_eq!(entry(3)["estimated_usd_micros"], 600_000 + 300);
+    // Between the two bounds no card applies.
+    assert!(entry(4)["estimated_usd_micros"].is_null());
+    let why = entry(4)["estimate_basis"].as_str().unwrap();
+    assert!(why.contains("275000"), "{why}");
+    // Outside every card's dates: unpriced, and said why.
+    assert!(entry(5)["estimated_usd_micros"].is_null());
+    let why = entry(5)["estimate_basis"].as_str().unwrap();
+    assert!(
+        why.contains("no anthropic/demo-model rate card covers its date"),
+        "{why}"
+    );
+    // The first card says what it left unpriced, and the model what no card
+    // covered: by date and by prompt size, each counted once.
+    let warnings: Vec<&str> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect();
+    assert_eq!(warnings.len(), 3, "{warnings:?}");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("priced 1 of the 2 usage records it covers")
+                && w.contains("cache-write")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.contains(&"anthropic/demo-model: 1 usage record is dated outside every rate card for it, so it stays unpriced"),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.contains(&"anthropic/demo-model: 1 usage record has a prompt size that no rate card for its date covers, so it stays unpriced"),
+        "{warnings:?}"
+    );
+    // A long-context card where no prompt was long says nothing of its own;
+    // the record no card's range covers is counted for its model, and a
+    // card dated where no record is still gets a notice.
+    let mut undated = card(1_000_000, 2_000_000, ("prompt_up_to", 272_000));
+    undated["effective_from"] = "2026-08-01T00:00:00Z".into();
+    undated["effective_until"] = "2026-09-01T00:00:00Z".into();
+    std::fs::write(
+        &rates,
+        serde_json::to_vec(&[
+            card(2_000_000, 3_000_000, ("prompt_over", 278_528)),
+            undated,
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let short = transcript("short.jsonl", &[claude_usage(1, 1_000, 100, 0, 0)]);
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        short.to_str().unwrap(),
+        "--rates",
+        rates.to_str().unwrap(),
+        "--json",
+    ]));
+    let warnings: Vec<&str> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect();
+    assert_eq!(warnings.len(), 2, "{warnings:?}");
+    assert!(
+        warnings.iter().any(|w| w.contains("priced no usage records: no selected anthropic/demo-model record (1 record) is dated in its interval")),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("anthropic/demo-model: 1 usage record has a prompt size")),
+        "{warnings:?}"
+    );
+    std::fs::remove_file(short).unwrap();
+    // A record that carries its source's own estimate, such as pi's, keeps
+    // it where a card cannot price it, under its own basis.
+    std::fs::write(
+        &rates,
+        serde_json::to_vec(&[serde_json::json!({"provider":"zai","model":"demo-glm","effective_from":"2026-09-01T00:00:00Z","effective_until":"2026-10-01T00:00:00Z","source":"SYNTHETIC TEST RATE, not a real provider price","input":1_000_000,"output":2_000_000,"cache_read":null,"cache_write":0})])
+        .unwrap(),
+    )
+    .unwrap();
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        "examples/pi.jsonl",
+        "--rates",
+        rates.to_str().unwrap(),
+        "--json",
+    ]));
+    let usage = v["sessions"][0]["usage"].as_array().unwrap();
+    // The reply read 400 cached tokens, at a price the card leaves unknown.
+    assert_eq!(usage[0]["entry"]["estimated_usd_micros"], 2_000);
+    assert_eq!(
+        usage[0]["entry"]["estimate_basis"],
+        "pi recorded model rates; not provider billing"
+    );
+    // The compaction read none: priced by the card, 20 and 10 tokens.
+    assert_eq!(usage[1]["entry"]["estimated_usd_micros"], 20 + 20);
+    let notice = v["warnings"][0].as_str().unwrap();
+    assert!(
+        notice.contains("priced 1 of the 2 usage records it covers")
+            && notice.contains("keeps the estimate its source recorded"),
+        "{notice}"
+    );
+    // Every category must be given; null is how a card says unknown.
+    let mut missing = card(1_000_000, 2_000_000, ("prompt_up_to", 272_000));
+    missing.as_object_mut().unwrap().remove("cache_write");
+    // And a prompt range must hold a prompt.
+    let mut empty = card(1_000_000, 2_000_000, ("prompt_up_to", 1_000));
+    empty["prompt_over"] = 300_000.into();
+    for (card, says) in [(missing, "cache_write"), (empty, "prompt_over")] {
+        std::fs::write(&rates, serde_json::to_vec(&[card]).unwrap()).unwrap();
+        let output = cli(&[
+            "usage",
+            "--input",
+            path.to_str().unwrap(),
+            "--rates",
+            rates.to_str().unwrap(),
+        ]);
+        assert_eq!(output.status.code(), Some(1), "{says}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(says),
+            "{says}"
+        );
+    }
+    std::fs::remove_file(rates).unwrap();
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn the_dated_rate_card_is_sourced_and_says_it_is_no_bill() {
+    let card = concat!(env!("CARGO_MANIFEST_DIR"), "/rates/2026-10-27.json");
+    let cards: Vec<Value> =
+        serde_json::from_str(&std::fs::read_to_string(card).expect(card)).unwrap();
+    let mut models = std::collections::BTreeSet::new();
+    for card in &cards {
+        let source = card["source"].as_str().unwrap();
+        assert!(source.contains("https://"), "{card}");
+        assert!(source.contains("read 2026-10-27"), "{card}");
+        assert!(
+            card["notes"]
+                .as_str()
+                .unwrap()
+                .contains("An estimate, not a bill"),
+            "{card}"
+        );
+        // Dated: valid no later than when the prices were read.
+        assert!(card["effective_until"].as_str().unwrap() <= "2026-10-27T21:00:00Z");
+        // A price the pricing page no longer shows names where it was read.
+        if card["effective_until"] != "2026-10-27T21:00:00Z" {
+            assert!(
+                source.contains("https://platform.claude.com/docs/en/release-notes/overview"),
+                "{card}"
+            );
+        }
+        models.insert(format!(
+            "{}/{}",
+            card["provider"].as_str().unwrap(),
+            card["model"].as_str().unwrap()
+        ));
+    }
+    for model in [
+        "anthropic/claude-opus-5-5",
+        "anthropic/claude-sonnet-5-5",
+        "anthropic/claude-opus-4-8",
+        "openai/gpt-5.5",
+        "openai/gpt-5.6-sol",
+        "openai/gpt-5.6-terra",
+        "openai/gpt-5.6-luna",
+        "openai/gpt-6-astra",
+        "openai/gpt-6.1-sol",
+    ] {
+        assert!(models.contains(model), "{model}: {models:?}");
+    }
+    // A Codex session on gpt-6.1-sol: one short request, one long.
+    let path = temp("card-codex.jsonl");
+    let total = |input: u64, cached: u64, output: u64| serde_json::json!({"input_tokens":input,"cached_input_tokens":cached,"cache_write_input_tokens":0,"output_tokens":output});
+    write_lines(
+        &path,
+        &[
+            serde_json::json!({"type":"session_meta","payload":{"id":"codex-card","cwd":"/demo/widget","model_provider":"openai","source":"cli","timestamp":"2026-10-20T10:00:00Z"}}),
+            serde_json::json!({"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}),
+            serde_json::json!({"timestamp":"2026-10-20T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":total(200_000, 100_000, 10_000)}}}),
+            serde_json::json!({"timestamp":"2026-10-20T10:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":total(600_000, 400_000, 20_000)}}}),
+        ],
+    );
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        path.to_str().unwrap(),
+        "--rates",
+        "rates/2026-10-27.json",
+        "--json",
+    ]));
+    let usage = v["sessions"][0]["usage"].as_array().unwrap();
+    // $2, $0.10 and $10 per million up to 272K input tokens.
+    assert_eq!(
+        usage[0]["entry"]["estimated_usd_micros"],
+        200_000 + 10_000 + 100_000
+    );
+    // $4, $0.20 and $15 per million above it.
+    assert_eq!(
+        usage[1]["entry"]["estimated_usd_micros"],
+        400_000 + 60_000 + 150_000
+    );
+    std::fs::remove_file(path).unwrap();
+    // A Claude session on claude-opus-5-5: $4, $0.20 and $20 per million;
+    // cache writes are priced by how long they are kept, which a transcript
+    // count does not say, so a request that wrote to the cache is unknown.
+    let path = transcript(
+        "card-claude.jsonl",
+        &[
+            claude_usage(1, 1_000, 2_000, 50_000, 0),
+            claude_usage(2, 1_000, 2_000, 50_000, 400),
+        ]
+        .map(|mut row| {
+            row["message"]["model"] = "claude-opus-5-5".into();
+            row["timestamp"] = row["timestamp"]
+                .as_str()
+                .unwrap()
+                .replace("2026-09-30", "2026-10-20")
+                .into();
+            row
+        }),
+    );
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        path.to_str().unwrap(),
+        "--rates",
+        "rates/2026-10-27.json",
+        "--json",
+    ]));
+    let usage = v["sessions"][0]["usage"].as_array().unwrap();
+    assert_eq!(
+        usage[0]["entry"]["estimated_usd_micros"],
+        4_000 + 40_000 + 10_000
+    );
+    assert!(usage[1]["entry"]["estimated_usd_micros"].is_null());
+    std::fs::remove_file(path).unwrap();
 }
 
 // ---- messages ---------------------------------------------------------------
@@ -3407,6 +4300,32 @@ fn a_launch_task_is_what_the_person_typed_without_the_briefing() {
         .iter()
         .all(|m| m["kind"] == "task"));
     assert_eq!(excluded(&v)["harness_prompt"], 4);
+}
+
+#[test]
+fn every_opening_of_an_older_briefing_ends_the_task() {
+    // Before its sentinel, ohjaa's briefing was known only by how each of
+    // its parts opens. Each opening, after a blank line, ends the task.
+    let openings = [
+        "FLAG: main of acme/widget is unproven.",
+        "Validation here (sykli's word, asked at launch; demo):",
+        "STILL RUNNING: session oh-demo-1",
+        "ORPHANED: session oh-demo-2",
+        "WARNING from oh-demo-3",
+        "Knowledge (ohjaa, knowledge-node.v1): what the people you work for know.",
+        "Last session here (oh-demo-4):",
+        "How this session works (ohjaa):\nIntent: demo.",
+        "Sessions in the other worktrees of this clone at launch: none",
+        "System perimeter (derived by ohjaa at launch; demo):",
+    ];
+    let tasks: Vec<String> = (0..openings.len()).map(|i| format!("task {i}")).collect();
+    let prompts: Vec<String> = openings
+        .iter()
+        .zip(&tasks)
+        .map(|(part, task)| launch_prompt(false, Some(task), Some(part)))
+        .collect();
+    let v = launches("older-briefings.jsonl", &prompts);
+    assert_eq!(texts(&v), tasks);
 }
 
 /// ohjaa's `BRIEFING_SENTINEL` (false-systems/ohjaa, src/main.rs, since

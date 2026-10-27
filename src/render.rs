@@ -2,6 +2,23 @@ use crate::model::{aggregate, Entry, Report};
 use anyhow::{Context, Result};
 use std::fmt::Write;
 
+/// Whether `c` may reach a terminal from imported text: no control
+/// character, and none of the bidirectional formatting characters (U+061C,
+/// U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069), which reorder what is
+/// shown without being control characters to `char`.
+pub fn shown(c: char) -> bool {
+    !c.is_control()
+        && !matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// `text` with only what [`shown`] lets through.
+pub fn for_terminal(text: &str) -> String {
+    text.chars().filter(|c| shown(*c)).collect()
+}
+
 /// `n` with its noun, singular for one: "1 session", "2 sessions".
 pub fn many(n: usize, noun: &str) -> String {
     if n == 1 {
@@ -19,11 +36,12 @@ pub fn dollars(n: Option<u64>) -> String {
         |n| format!("${}.{:06}", n / 1_000_000, n % 1_000_000),
     )
 }
+/// One entry on one line, for a terminal: its imported names are cleaned.
 pub fn usage_line(e: &Entry) -> String {
     format!(
         "{}/{} in={} out={} cache-read={} cache-write={} estimated={} billed={} credits={}",
-        e.provider,
-        e.model,
+        for_terminal(&e.provider),
+        for_terminal(&e.model),
         number(e.input_tokens),
         number(e.output_tokens),
         number(e.cache_read_tokens),
@@ -45,6 +63,15 @@ pub fn escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+/// A known estimate subtotal of `priced` records: "no estimate" when none
+/// is priced, never $0.
+fn subtotal(known: u64, priced: usize) -> String {
+    match priced {
+        0 => "no estimate".into(),
+        _ => dollars(Some(known)),
+    }
 }
 
 fn spending<'a>(mut entries: impl Iterator<Item = &'a Entry>) -> Result<(u64, usize)> {
@@ -78,30 +105,62 @@ fn overview(out: &mut String, report: &Report) -> Result<()> {
             .flat_map(|s| s.usage.iter().map(|u| &u.entry)),
     )?;
     let records: usize = report.sessions.iter().map(|s| s.usage.len()).sum();
-    let _ = write!(out, "<section aria-labelledby=\"overview\"><h2 id=\"overview\">Where the spending goes</h2><p><strong>{}</strong> known estimate subtotal · <strong>{}/{records}</strong> usage records priced · <strong>{unpriced}</strong> unpriced.</p><p>This is not a bill or a complete total when records are unpriced. No usage records means unknown consumption.</p>", dollars(Some(known)), records - unpriced);
-    let mut ranked = report
-        .sessions
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            spending(s.usage.iter().map(|u| &u.entry))
-                .map(|(known, unpriced)| (i, s, known, unpriced))
+    let headline = match records - unpriced {
+        0 => "<strong>No estimate</strong>: no usage record is priced".to_owned(),
+        _ => format!(
+            "<strong>{}</strong> known estimate subtotal",
+            dollars(Some(known))
+        ),
+    };
+    let _ = write!(out, "<section aria-labelledby=\"overview\"><h2 id=\"overview\">Where the spending goes</h2><p>{headline} · <strong>{}/{records}</strong> usage records priced · <strong>{unpriced}</strong> unpriced.</p><p>This is not a bill or a complete total when records are unpriced. No usage records means unknown consumption.</p>", records - unpriced);
+    // A session is ranked with its subagents' spending, as `stats` counts
+    // them; a subagent whose session was not read stands alone.
+    let mut ranked = crate::model::families(&report.sessions)
+        .into_iter()
+        .map(|f| {
+            let i = report
+                .sessions
+                .iter()
+                .position(|s| std::ptr::eq(s, f.main))
+                .context("a family's session is in the report")?;
+            let records = f.usage().count();
+            spending(f.usage().map(|u| &u.entry)).map(|(known, unpriced)| {
+                let shown = subtotal(known, records - unpriced);
+                (i, f.main, f.subagents.len(), known, shown, unpriced)
+            })
         })
         .collect::<Result<Vec<_>>>()?;
-    ranked.sort_by_key(|(_, _, known, _)| std::cmp::Reverse(*known));
-    out.push_str("<h3>Sessions by known estimate subtotal</h3><p>Unpriced sessions can cost more than their position suggests.</p><div class=\"scroll\"><table><thead><tr><th scope=\"col\">Session</th><th scope=\"col\">Known estimate subtotal</th><th scope=\"col\">Unpriced records</th><th scope=\"col\">Linked wrapper records</th></tr></thead><tbody>");
-    for (i, s, known, unpriced) in ranked {
-        let _ = write!(out, "<tr><th scope=\"row\"><a href=\"#s{i}\">{} · {}</a></th><td>{}</td><td>{unpriced}</td><td>{}</td></tr>", escape(&s.agent), escape(&s.id), dollars(Some(known)), s.ohjaa.len());
+    ranked.sort_by_key(|(_, _, _, known, _, _)| std::cmp::Reverse(*known));
+    out.push_str("<h3>Sessions by known estimate subtotal</h3><p>Each session with its subagents. Unpriced sessions can cost more than their position suggests.</p><div class=\"scroll\"><table><thead><tr><th scope=\"col\">Session</th><th scope=\"col\">Known estimate subtotal</th><th scope=\"col\">Unpriced records</th><th scope=\"col\">Linked wrapper records</th></tr></thead><tbody>");
+    for (i, s, subagents, _, shown, unpriced) in ranked {
+        let with = match subagents {
+            0 => String::new(),
+            n => format!(" · {}", many(n, "subagent")),
+        };
+        let _ = write!(out, "<tr><th scope=\"row\"><a href=\"#s{i}\">{} · {}</a>{with}</th><td>{shown}</td><td>{unpriced}</td><td>{}</td></tr>", escape(&s.agent), escape(&s.id), s.ohjaa.len());
     }
     out.push_str("</tbody></table></div><h3>What the token categories mean</h3><p>Uncached input is new input processing; cached input read is reused input processing, not free tokens. Cache writes and output have separate rates. Output already includes reasoning where the source counts it. These categories do not identify which file or instruction caused the usage.</p></section>");
     out.push_str("<section aria-labelledby=\"reduce\"><h2 id=\"reduce\">Reduce repeated work</h2><ol><li>Start each bounded task in its repository through one launching wrapper that hands the agent what is already known and the previous handover. Do not nest a second wrapper.</li><li>Use the working set and read order it delivers instead of scanning the repository again. Read additional files only for a concrete missing dependency; refresh when Git facts become stale.</li><li>Use recorded decisions and the handover instead of rediscovering accepted choices. Record remaining work at completion, not after every reply. Do not trim safety instructions or skip checks to save tokens.</li><li>Attach a Vessa receipt (<code>vessa receipt</code>) to the explicit wrapper session and include the wrapper's session export in this report. Compare similar tasks with the same model, rates and validation: uncached input, output, cache usage and completion evidence, not dollars alone.</li></ol><p><strong>Savings are not measured here.</strong> A linked wrapper record proves association, not that its briefing was used or that it saved tokens. A before/after comparison needs comparable task and outcome evidence; launch overhead alone is not net savings.</p></section>");
     Ok(())
 }
-pub fn html(report: &Report) -> Result<String> {
+/// The report. Of `report.warnings`, the first `source_warnings` are about
+/// the usage evidence; the rest are rate-card notices, which concern
+/// pricing only.
+pub fn html(report: &Report, source_warnings: usize) -> Result<String> {
     let mut out = String::from(
         r##"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"><title>Vessa · Usage and spending</title><style>body{margin:0;background:#f4f1e8;color:#172c28;font:16px/1.6 system-ui,sans-serif}main{max-width:1100px;margin:auto;padding:40px 24px}h1{font-size:48px;margin:0}a{color:#075c52}a:focus,summary:focus{outline:3px solid #bd5b2f}details{background:#fffdf8;border:1px solid #d7ded5;border-radius:12px;padding:18px;margin:12px 0}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:12px;border-bottom:1px solid #d7ded5;vertical-align:top}.scroll{overflow:auto}pre,code{white-space:pre-wrap;overflow-wrap:anywhere}summary{cursor:pointer;font-weight:650}.warning{border-left:4px solid #bd5b2f;padding-left:12px}small{color:#53645e}footer{margin-top:40px}</style><main><header><small>LOCAL · USAGE EVIDENCE</small><h1>Vessa</h1><p>What your agent sessions consumed.</p><nav><a href="#usage">Usage</a> · <a href="#sources">Sources</a></nav></header>"##,
     );
-    let _ = write!(out, "<p>{} · {}</p><p>Estimates are not bills. Unknown is not zero. Input excludes cached tokens.</p>", crate::model::counted(&report.sessions), many(report.warnings.len(), "source warning"));
+    let notices = report.warnings.len().saturating_sub(source_warnings);
+    let _ = write!(
+        out,
+        "<p>{} · {}{}</p><p>Estimates are not bills. Unknown is not zero. Input excludes cached tokens.</p>",
+        crate::model::counted(&report.sessions),
+        many(report.warnings.len() - notices, "source warning"),
+        match notices {
+            0 => String::new(),
+            n => format!(" · {}", many(n, "rate-card notice")),
+        }
+    );
     for warning in &report.warnings {
         let _ = write!(out, "<p class=\"warning\">{}</p>", escape(warning));
     }
@@ -135,16 +194,18 @@ pub fn html(report: &Report) -> Result<String> {
         ("Monthly", crate::metrics::Period::Month),
         ("Yearly", crate::metrics::Period::Year),
     ] {
-        let _ = write!(out, "<details><summary>{label} statistics</summary><div class=\"scroll\"><table><thead><tr><th>Period / agent</th><th>Sessions</th><th>Subagents</th><th>Known estimate subtotal</th><th>Unpriced records</th></tr></thead><tbody>");
+        let _ = write!(out, "<details><summary>{label} statistics</summary><div class=\"scroll\"><table><thead><tr><th>Period / agent</th><th>Sessions</th><th>Subagents</th><th>Priced records</th><th>Known estimate subtotal</th><th>Unpriced records</th></tr></thead><tbody>");
         for b in crate::metrics::history(report, period)? {
             let _ = write!(
                 out,
-                "<tr><td>{} / {}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{} / {}</td><td>{}</td><td>{}</td><td>{} of {}</td><td>{}</td><td>{}</td></tr>",
                 escape(&b.period),
                 escape(&b.agent),
                 b.sessions,
                 b.subagents,
-                dollars(Some(b.known_estimated_usd_micros)),
+                b.priced_records,
+                b.priced_records + b.unpriced_records,
+                subtotal(b.known_estimated_usd_micros, b.priced_records),
                 b.unpriced_records
             );
         }

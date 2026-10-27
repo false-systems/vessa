@@ -21,7 +21,10 @@ pub struct Bucket {
     /// Subagents with usage in the period, counted apart.
     pub subagents: usize,
     pub entries: Vec<Entry>,
+    /// The sum of the priced records' estimates: 0 when none is priced, so
+    /// read it with `priced_records`.
     pub known_estimated_usd_micros: u64,
+    pub priced_records: usize,
     pub unpriced_records: usize,
 }
 #[derive(Default)]
@@ -77,6 +80,10 @@ pub fn history(report: &Report, period: Period) -> Result<Vec<Bucket>> {
                 subagents: group.subagents.len(),
                 entries: model::aggregate_usage(usage.iter().copied())?,
                 known_estimated_usd_micros: known,
+                priced_records: usage
+                    .iter()
+                    .filter(|u| u.entry.estimated_usd_micros.is_some())
+                    .count(),
                 unpriced_records: usage
                     .iter()
                     .filter(|u| u.entry.estimated_usd_micros.is_none())
@@ -97,7 +104,7 @@ pub fn claude_statusline(input: &serde_json::Value) -> String {
     // Source strings are untrusted terminal content; never emit control codes.
     let clean = |s: &str| {
         s.chars()
-            .filter(|c| !c.is_control())
+            .filter(|c| crate::render::shown(*c))
             .take(100)
             .collect::<String>()
     };

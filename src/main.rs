@@ -165,13 +165,21 @@ fn run_once(cli: Cli) -> Result<i32> {
         // Never answer for a session with its subagents alone: its own usage
         // would be unknown, and a subagent is not the session.
         let subagents = report.sessions.iter().filter(|s| s.id != id).count();
+        // A main transcript some of whose records say they are a sidechain
+        // was read, but as one of its subagents.
+        let taken = report.sessions.iter().find(|s| s.partly_sidechain);
         ensure!(
             report.sessions.len() > subagents,
             "native session {id} not found{}",
-            if subagents > 0 {
-                format!("; its main transcript was not read, only {subagents} of its subagents")
-            } else {
-                String::new()
+            match taken {
+                Some(s) => format!(
+                    "; its transcript {} was read as its subagent {}, because some of its records say they are a sidechain and some that they are not",
+                    s.source, s.id
+                ),
+                None if subagents > 0 => format!(
+                    "; its main transcript was not read, only {subagents} of its subagents"
+                ),
+                None => String::new(),
             }
         );
     }
@@ -189,8 +197,10 @@ fn run_once(cli: Cli) -> Result<i32> {
         let rates: Vec<analysis::Rate> = serde_json::from_reader(std::fs::File::open(path)?)?;
         analysis::apply_rates(&mut report, &rates)?;
     }
+    // Imported names are untrusted terminal content, on stderr too.
+    use render::for_terminal as clean;
     for warning in &report.warnings {
-        eprintln!("vessa: {warning}");
+        eprintln!("vessa: {}", clean(warning));
     }
     match cli.command {
         Cmd::ClaudeStatusline | Cmd::Messages { .. } => unreachable!(),
@@ -229,10 +239,11 @@ fn run_once(cli: Cli) -> Result<i32> {
                     }
                 };
                 println!(
-                    "{} {} · last recorded {}{scope}",
-                    s.agent,
-                    s.id,
+                    "{} {} · last recorded {}{}",
+                    clean(&s.agent),
+                    clean(&s.id),
                     last_recorded.as_deref().unwrap_or("unknown"),
+                    clean(&scope),
                 );
                 let print = |indent: &str, entries: Vec<model::Entry>| {
                     if entries.is_empty() {
@@ -249,7 +260,7 @@ fn run_once(cli: Cli) -> Result<i32> {
                     for sub in &family.subagents {
                         println!(
                             "  subagent {} · last recorded {}",
-                            sub.id,
+                            clean(&sub.id),
                             last_recorded_at(sub.usage.iter())
                                 .as_deref()
                                 .unwrap_or("unknown")
@@ -278,17 +289,24 @@ fn run_once(cli: Cli) -> Result<i32> {
                 println!("Calendar usage · UTC · selected local records · estimates are not bills");
                 for b in buckets {
                     println!(
-                        "{} {} · {}{} · known estimate subtotal={} · {}",
+                        "{} {} · {}{} · {} of {} usage records priced · {}",
                         b.period,
-                        b.agent,
+                        clean(&b.agent),
                         render::many(b.sessions, "session"),
                         if b.subagents > 0 {
                             format!(" · {}", render::many(b.subagents, "subagent"))
                         } else {
                             String::new()
                         },
-                        render::dollars(Some(b.known_estimated_usd_micros)),
-                        render::many(b.unpriced_records, "unpriced record")
+                        b.priced_records,
+                        b.priced_records + b.unpriced_records,
+                        match b.priced_records {
+                            0 => "no estimate".to_owned(),
+                            _ => format!(
+                                "known estimate subtotal={}",
+                                render::dollars(Some(b.known_estimated_usd_micros))
+                            ),
+                        },
                     );
                     for e in b.entries {
                         println!("  {}", render::usage_line(&e));
@@ -297,7 +315,7 @@ fn run_once(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Report { output } => {
-            let html = render::html(&report)?;
+            let html = render::html(&report, source_warnings)?;
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -343,7 +361,7 @@ fn run_once(cli: Cli) -> Result<i32> {
             } else {
                 println!("Deduplicated agent totals · estimates are not bills");
                 for (agent, entries) in totals {
-                    println!("{agent}");
+                    println!("{}", clean(agent));
                     if entries.is_empty() {
                         println!("  usage unknown");
                     }
@@ -364,10 +382,10 @@ fn run_once(cli: Cli) -> Result<i32> {
                 for s in &report.sessions {
                     println!(
                         "{} {} · started {} · {}",
-                        s.agent,
-                        s.id,
-                        s.started_at.as_deref().unwrap_or("unknown"),
-                        s.cwd
+                        clean(&s.agent),
+                        clean(&s.id),
+                        clean(s.started_at.as_deref().unwrap_or("unknown")),
+                        clean(&s.cwd)
                     );
                 }
             }
@@ -408,21 +426,21 @@ fn run_once(cli: Cli) -> Result<i32> {
             for s in &report.sessions {
                 println!(
                     "{} {} · {} usage records{} · {}",
-                    s.agent,
-                    s.id,
+                    clean(&s.agent),
+                    clean(&s.id),
                     s.usage.len(),
                     match s.synthetic.len() {
                         0 => String::new(),
                         n => format!(" · {n} synthetic records (no usage)"),
                     },
-                    s.cwd
+                    clean(&s.cwd)
                 );
             }
         }
         Cmd::Usage { .. } => {
             println!("Estimates are not bills. Input excludes cached tokens. Unknown is not zero.");
             for s in &report.sessions {
-                println!("{} {}", s.agent, s.id);
+                println!("{} {}", clean(&s.agent), clean(&s.id));
                 let entries = model::aggregate(s)?;
                 if entries.is_empty() {
                     println!("  usage unknown");
@@ -435,7 +453,12 @@ fn run_once(cli: Cli) -> Result<i32> {
     }
     for s in &report.sessions {
         for limitation in &s.limitations {
-            eprintln!("vessa: {} {}: {limitation}", s.agent, s.id);
+            eprintln!(
+                "vessa: {} {}: {}",
+                clean(&s.agent),
+                clean(&s.id),
+                clean(limitation)
+            );
         }
     }
     if incomplete && headers {
@@ -631,20 +654,20 @@ fn plain(out: &mut impl Write, m: &model::Message) -> Result<()> {
     if m.reply.as_ref().is_some_and(|r| r.failed) {
         notes.push_str(" · after a failed reply");
     }
+    // Imported text is untrusted terminal content, where it was said too.
+    use render::for_terminal as clean;
     writeln!(
         out,
         "{} {} · {} · {} · {}:{}{notes}",
-        m.agent,
-        m.session,
-        m.at.as_deref().unwrap_or("undated"),
-        m.cwd,
-        m.source,
+        clean(&m.agent),
+        clean(&m.session),
+        clean(m.at.as_deref().unwrap_or("undated")),
+        clean(&m.cwd),
+        clean(&m.source),
         m.line,
     )?;
     for line in m.text.lines() {
-        // Imported text is untrusted terminal content.
-        let line: String = line.chars().filter(|c| !c.is_control()).collect();
-        writeln!(out, "  {line}")?;
+        writeln!(out, "  {}", clean(line))?;
     }
     Ok(())
 }
@@ -724,11 +747,12 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
     };
     drop(out);
     let c = &listing.coverage;
+    use render::for_terminal as clean;
     for warning in listing.warnings.iter().chain(&c.gaps) {
-        eprintln!("vessa: {warning}");
+        eprintln!("vessa: {}", clean(warning));
     }
     for limitation in &c.limitations {
-        eprintln!("vessa: {limitation}");
+        eprintln!("vessa: {}", clean(limitation));
     }
     let gaps = listing.warnings.len() + c.gaps.len();
     if gaps + c.limitations.len() > 0 {
@@ -767,7 +791,7 @@ fn main() {
     match run(Cli::parse()) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("vessa: {e:#}");
+            eprintln!("vessa: {}", render::for_terminal(&format!("{e:#}")));
             std::process::exit(1)
         }
     }
