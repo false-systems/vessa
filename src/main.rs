@@ -165,13 +165,21 @@ fn run_once(cli: Cli) -> Result<i32> {
         // Never answer for a session with its subagents alone: its own usage
         // would be unknown, and a subagent is not the session.
         let subagents = report.sessions.iter().filter(|s| s.id != id).count();
+        // A main transcript some of whose records say they are a sidechain
+        // was read, but as one of its subagents.
+        let taken = report.sessions.iter().find(|s| s.partly_sidechain);
         ensure!(
             report.sessions.len() > subagents,
             "native session {id} not found{}",
-            if subagents > 0 {
-                format!("; its main transcript was not read, only {subagents} of its subagents")
-            } else {
-                String::new()
+            match taken {
+                Some(s) => format!(
+                    "; its transcript {} was read as its subagent {}, because some of its records say they are a sidechain and some do not",
+                    s.source, s.id
+                ),
+                None if subagents > 0 => format!(
+                    "; its main transcript was not read, only {subagents} of its subagents"
+                ),
+                None => String::new(),
             }
         );
     }
@@ -228,11 +236,14 @@ fn run_once(cli: Cli) -> Result<i32> {
                         n => format!(" · totals include {n} subagents"),
                     }
                 };
+                // Imported names are untrusted terminal content.
+                use render::for_terminal as clean;
                 println!(
-                    "{} {} · last recorded {}{scope}",
-                    s.agent,
-                    s.id,
+                    "{} {} · last recorded {}{}",
+                    clean(&s.agent),
+                    clean(&s.id),
                     last_recorded.as_deref().unwrap_or("unknown"),
+                    clean(&scope),
                 );
                 let print = |indent: &str, entries: Vec<model::Entry>| {
                     if entries.is_empty() {
@@ -249,7 +260,7 @@ fn run_once(cli: Cli) -> Result<i32> {
                     for sub in &family.subagents {
                         println!(
                             "  subagent {} · last recorded {}",
-                            sub.id,
+                            clean(&sub.id),
                             last_recorded_at(sub.usage.iter())
                                 .as_deref()
                                 .unwrap_or("unknown")
@@ -297,7 +308,7 @@ fn run_once(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Report { output } => {
-            let html = render::html(&report)?;
+            let html = render::html(&report, source_warnings)?;
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -631,20 +642,20 @@ fn plain(out: &mut impl Write, m: &model::Message) -> Result<()> {
     if m.reply.as_ref().is_some_and(|r| r.failed) {
         notes.push_str(" · after a failed reply");
     }
+    // Imported text is untrusted terminal content, where it was said too.
+    use render::for_terminal as clean;
     writeln!(
         out,
         "{} {} · {} · {} · {}:{}{notes}",
-        m.agent,
-        m.session,
-        m.at.as_deref().unwrap_or("undated"),
-        m.cwd,
-        m.source,
+        clean(&m.agent),
+        clean(&m.session),
+        clean(m.at.as_deref().unwrap_or("undated")),
+        clean(&m.cwd),
+        clean(&m.source),
         m.line,
     )?;
     for line in m.text.lines() {
-        // Imported text is untrusted terminal content.
-        let line: String = line.chars().filter(|c| !c.is_control()).collect();
-        writeln!(out, "  {line}")?;
+        writeln!(out, "  {}", clean(line))?;
     }
     Ok(())
 }

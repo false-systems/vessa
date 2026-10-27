@@ -75,6 +75,11 @@ pub struct Session {
     /// prompts, not a person's.
     #[serde(skip)]
     pub subagent: bool,
+    /// A Claude transcript some of whose records say they are a sidechain
+    /// and some do not: read as a subagent's, though it may be its
+    /// session's own.
+    #[serde(skip)]
+    pub partly_sidechain: bool,
 }
 
 /// What a session's transcript says about itself, without its usage: one
@@ -274,9 +279,13 @@ fn add_amount(a: &Option<Amount>, b: &Option<Amount>) -> Result<Option<Amount>> 
     }
 }
 
+/// How many subagents a receipt names. A session can have dozens, and their
+/// ids would make one limitation thousands of characters long.
+const NAMED_SUBAGENTS: usize = 10;
+
 /// The receipt for one session, its subagents included. `agent-usage.v1`
 /// has no field for them, and ohjaa refuses one it does not know, so the
-/// receipt says it in `limitations`.
+/// receipt says it in `limitations`: how many, and the first ten by id.
 pub fn receipt(family: &Family) -> Result<serde_json::Value> {
     let session = family.main;
     let now = std::time::SystemTime::now()
@@ -287,20 +296,34 @@ pub fn receipt(family: &Family) -> Result<serde_json::Value> {
     ];
     if !family.subagents.is_empty() {
         let n = family.subagents.len();
+        // Sessions come in id order, so a session's subagents do too.
+        let ids = |count: usize| {
+            family
+                .subagents
+                .iter()
+                .take(count)
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let named = if n <= NAMED_SUBAGENTS {
+            format!(": {}", ids(n))
+        } else {
+            format!(
+                "; the first {NAMED_SUBAGENTS} in id order: {}; {} more are not named here, and `vessa status --session {}` lists every one",
+                ids(NAMED_SUBAGENTS),
+                n - NAMED_SUBAGENTS,
+                session.id
+            )
+        };
         limitations.push(format!(
-            "Entries include {n} {} {} of this session, each read from its own transcript: {}",
+            "Entries include {n} {} {} of this session, each read from its own transcript{named}",
             if session.agent == "codex" {
                 "Codex"
             } else {
                 "Claude"
             },
             if n == 1 { "subagent" } else { "subagents" },
-            family
-                .subagents
-                .iter()
-                .map(|s| s.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
         ));
     }
     limitations.extend(family.limitations());

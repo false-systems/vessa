@@ -2710,6 +2710,39 @@ fn a_rate_card_leaves_an_unknown_price_unknown_and_can_bound_the_prompt() {
             && notice.contains("cache-write"),
         "{notice}"
     );
+    // A long-context card where no prompt was long matched as it should: no
+    // notice, while a card dated where no record is still gets one.
+    let mut undated = card(1_000_000, 2_000_000, ("prompt_up_to", 272_000));
+    undated["effective_from"] = "2026-08-01T00:00:00Z".into();
+    undated["effective_until"] = "2026-09-01T00:00:00Z".into();
+    std::fs::write(
+        &rates,
+        serde_json::to_vec(&[
+            card(2_000_000, 3_000_000, ("prompt_over", 278_528)),
+            undated,
+        ])
+        .unwrap(),
+    )
+    .unwrap();
+    let short = transcript("short.jsonl", &[claude_usage(1, 1_000, 100, 0, 0)]);
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        short.to_str().unwrap(),
+        "--rates",
+        rates.to_str().unwrap(),
+        "--json",
+    ]));
+    let warnings = v["warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(
+        warnings[0]
+            .as_str()
+            .unwrap()
+            .contains("priced no usage records: no selected anthropic/demo-model record (1 record) is dated in its interval"),
+        "{warnings:?}"
+    );
+    std::fs::remove_file(short).unwrap();
     // Every category must be given; null is how a card says unknown.
     let mut missing = card(1_000_000, 2_000_000, ("prompt_up_to", 272_000));
     missing.as_object_mut().unwrap().remove("cache_write");

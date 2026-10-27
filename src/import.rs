@@ -167,6 +167,16 @@ fn deduplicate(report: &mut Report) {
     // Requests a session holds that an earlier session already counted.
     let mut elsewhere: Vec<std::collections::HashSet<String>> =
         report.sessions.iter().map(|_| Default::default()).collect();
+    // Of those, the ones counted outside its own session and subagents, by
+    // the session that counted them: its own total leaves them out.
+    let mut outside: Vec<BTreeMap<String, usize>> =
+        report.sessions.iter().map(|_| Default::default()).collect();
+    // The session each one counts to, itself or the one it is a subagent of.
+    let family: Vec<(String, String)> = report
+        .sessions
+        .iter()
+        .map(|s| (s.agent.clone(), s.subagent_of().unwrap_or(&s.id).to_owned()))
+        .collect();
     for (index, session) in report.sessions.iter_mut().enumerate() {
         for item in session.usage.drain(..) {
             let started = session
@@ -189,8 +199,11 @@ fn deduplicate(report: &mut Report) {
             };
             let key = (session.agent.clone(), event_id);
             if let Some((owner, slot, owner_id)) = seen.get(&key) {
-                if *owner != index {
-                    elsewhere[index].insert(item.id.clone());
+                if *owner != index
+                    && elsewhere[index].insert(item.id.clone())
+                    && family[*owner] != family[index]
+                {
+                    *outside[index].entry(owner_id.clone()).or_default() += 1;
                 }
                 let old = &mut kept[*owner][*slot];
                 if extends(&old.entry, &item.entry) {
@@ -223,29 +236,60 @@ fn deduplicate(report: &mut Report) {
         .filter(|s| s.agent == "claude")
         .map(|s| s.id.clone())
         .collect();
+    // The agent ids of the Claude subagents read, whichever session they
+    // belong to. A launch record copied into another session's transcript
+    // names a subagent that ran in the session it came from: read there, its
+    // usage is that session's, and nothing of it is missing.
+    let agents: std::collections::HashSet<_> = report
+        .sessions
+        .iter()
+        .filter(|s| s.agent == "claude")
+        .filter_map(|s| {
+            let parent = s.subagent_of()?;
+            s.id.strip_prefix(parent)?.strip_prefix('/')
+        })
+        .map(str::to_owned)
+        .collect();
     for session in report.sessions.iter_mut().filter(|s| s.agent == "claude") {
         let top = session.subagent_of().unwrap_or(&session.id).to_owned();
         let mut named = std::collections::HashSet::new();
         for (agent, line) in std::mem::take(&mut session.launched) {
             let id = format!("{top}/{agent}");
-            if !read.contains(&id) && named.insert(id.clone()) {
+            if !read.contains(&id) && !agents.contains(&agent) && named.insert(id.clone()) {
                 session.limitations.push(format!(
                     "line {line}: subagent {id} was launched, but its transcript was not read; its usage is unknown, not zero"
                 ));
             }
         }
     }
-    for ((session, usage), elsewhere) in report.sessions.iter_mut().zip(kept).zip(elsewhere) {
+    for (((session, usage), elsewhere), outside) in report
+        .sessions
+        .iter_mut()
+        .zip(kept)
+        .zip(elsewhere)
+        .zip(outside)
+    {
         session.usage = usage;
         session.counted_elsewhere = elsewhere.len();
-        // A subagent whose every request its session already holds has had
-        // its usage counted there; it is not unknown. Nor is a session whose
-        // only answers were synthetic: what it recorded holds no usage.
-        let counted = session.subagent_of().is_some() && session.counted_elsewhere > 0;
+        // A subagent whose every request its session (or another of its
+        // subagents) already holds has had its usage counted there; it is
+        // not unknown. Nor is a session whose only answers were synthetic:
+        // what it recorded holds no usage.
+        let within = elsewhere.len() - outside.values().sum::<usize>();
+        let counted = session.subagent_of().is_some() && within > 0;
         if session.usage.is_empty() && !counted && session.synthetic.is_empty() {
-            session
-                .limitations
-                .push("No usage records found; consumption is unknown, not zero".into());
+            session.limitations.push(if outside.is_empty() {
+                "No usage records found; consumption is unknown, not zero".into()
+            } else {
+                // Its requests were counted once, with another session, so
+                // the total of the session it belongs to leaves them out.
+                format!(
+                    "No usage of its own: its {} counted with {}, another session, so this session's total leaves {}",
+                    if elsewhere.len() == 1 { "request was" } else { "requests were" },
+                    outside.keys().cloned().collect::<Vec<_>>().join(", "),
+                    if elsewhere.len() == 1 { "it out" } else { "them out" },
+                )
+            });
         }
         session.limitations.sort();
         session.limitations.dedup();
@@ -441,6 +485,8 @@ struct Scan {
     /// Whether any record is a Claude sidechain, and whether any says.
     sidechain: bool,
     sidechain_said: bool,
+    /// Whether any Claude record does not say it is a sidechain.
+    not_sidechain: bool,
 }
 
 /// The header facts of one record that opens a session.
@@ -506,6 +552,7 @@ impl Scan {
         }
         self.sidechain |= v["isSidechain"] == true;
         self.sidechain_said |= v["isSidechain"].is_boolean();
+        self.not_sidechain |= v["sessionId"].is_string() && v["isSidechain"] != true;
     }
 
     /// The agent the records so far say wrote the file, with the record that
@@ -607,6 +654,7 @@ impl Scan {
             root,
             subagent: (agent == "claude" && self.sidechain)
                 || (agent == "codex" && opening.subagent_source),
+            partly_sidechain: agent == "claude" && self.sidechain && self.not_sidechain,
         })
     }
 }
@@ -1826,6 +1874,10 @@ const ALERTS: &str = "## Before anything else (from the launcher)\n";
 /// branch flag, validation, still-running, orphaned and warned sessions,
 /// Knowledge (whose preamble also opens scoped knowledge), the last session
 /// here, how the session works, sibling worktrees, and the system perimeter.
+/// In false-systems/ohjaa (main at d08e2d4, 2026-10-27) they are written by
+/// `src/mark.rs`, `src/integrated.rs`, `src/sessions.rs` (still running,
+/// orphaned, warned, last session), `src/knowledge.rs`, `src/main.rs` (how
+/// the session works, sibling worktrees) and `src/system.rs`.
 /// toimija appends the briefing after the task, so in a prompt from an ohjaa
 /// before its sentinel the first of these after a blank line ends the task.
 const BRIEFING: [&str; 10] = [

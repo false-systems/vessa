@@ -131,6 +131,9 @@ pub struct Window {
     pub entries: Vec<Entry>,
     pub records: usize,
     pub elapsed_seconds: Option<i64>,
+    /// Why `elapsed_seconds` is unknown, in words; said in the text form.
+    #[serde(skip)]
+    pub elapsed_unknown: Option<&'static str>,
     pub tools: usize,
     pub failed_tools: usize,
     pub changes: Vec<Change>,
@@ -221,17 +224,21 @@ pub fn summarize(s: &Session) -> Result<Insights> {
                 previous_change = result.line + 1;
             }
         }
-        let elapsed = command
-            .at
-            .as_deref()
-            .and_then(parse_time)
-            .zip(
-                usage
-                    .iter()
-                    .filter_map(|(_, u)| u.at.as_deref().and_then(parse_time))
-                    .max(),
-            )
-            .and_then(|(start, end)| (end >= start).then_some((end - start).num_seconds()));
+        // From the command to its last usage record, or why that is unknown.
+        let start = command.at.as_deref().and_then(parse_time);
+        let end = usage
+            .iter()
+            .filter_map(|(_, u)| u.at.as_deref().and_then(parse_time))
+            .max();
+        let elapsed = match (start, end) {
+            (_, _) if usage.is_empty() => Err("no usage was recorded in it"),
+            (None, _) => Err("the command has no timestamp"),
+            (_, None) => Err("none of its usage records has a timestamp"),
+            (Some(start), Some(end)) if end < start => {
+                Err("its last usage record is timestamped before it")
+            }
+            (Some(start), Some(end)) => Ok((end - start).num_seconds()),
+        };
         let waste = if failures > 0 && !usage.is_empty() {
             usage.iter().try_fold(0u64, |sum, (_, u)| {
                 sum.checked_add(u.entry.estimated_usd_micros?)
@@ -244,7 +251,8 @@ pub fn summarize(s: &Session) -> Result<Insights> {
             line: command.line,
             entries: model::aggregate_usage(usage.iter().map(|(_, u)| *u))?,
             records: usage.len(),
-            elapsed_seconds: elapsed,
+            elapsed_seconds: elapsed.ok(),
+            elapsed_unknown: elapsed.err(),
             tools: tools.len(),
             failed_tools: failures,
             changes,
@@ -293,9 +301,10 @@ pub fn text(insights: &Insights) -> String {
             c.records,
             c.tools,
             c.changes.len(),
-            c.elapsed_seconds.map_or("unknown".into(), |s| format!(
-                "{s}s (to its last usage record)"
-            ))
+            c.elapsed_seconds.map_or_else(
+                || format!("unknown ({})", c.elapsed_unknown.unwrap_or("not recorded")),
+                |s| format!("{s}s (to its last usage record)")
+            )
         );
         entries(&mut out, &c.entries);
         for (j, change) in c.changes.iter().enumerate() {
@@ -324,6 +333,6 @@ pub fn text(insights: &Insights) -> String {
     out.push_str("Observed windows, not causal costs. Opaque edits remain unmeasured; failures may be useful work.\n");
     // All imported labels remain untrusted terminal content.
     out.chars()
-        .filter(|c| !c.is_control() || *c == '\n')
+        .filter(|c| crate::render::shown(*c) || *c == '\n')
         .collect()
 }

@@ -97,7 +97,7 @@ pub fn claude_statusline(input: &serde_json::Value) -> String {
     // Source strings are untrusted terminal content; never emit control codes.
     let clean = |s: &str| {
         s.chars()
-            .filter(|c| !c.is_control())
+            .filter(|c| crate::render::shown(*c))
             .take(100)
             .collect::<String>()
     };
