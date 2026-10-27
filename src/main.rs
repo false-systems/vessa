@@ -173,7 +173,7 @@ fn run_once(cli: Cli) -> Result<i32> {
             "native session {id} not found{}",
             match taken {
                 Some(s) => format!(
-                    "; its transcript {} was read as its subagent {}, because some of its records say they are a sidechain and some do not",
+                    "; its transcript {} was read as its subagent {}, because some of its records say they are a sidechain and some that they are not",
                     s.source, s.id
                 ),
                 None if subagents > 0 => format!(

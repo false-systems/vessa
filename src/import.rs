@@ -284,10 +284,11 @@ fn deduplicate(report: &mut Report) {
                 // Its requests were counted once, with another session, so
                 // the total of the session it belongs to leaves them out.
                 format!(
-                    "No usage of its own: its {} counted with {}, another session, so this session's total leaves {}",
-                    if elsewhere.len() == 1 { "request was" } else { "requests were" },
+                    "No usage of its own: its {} {} counted with another session ({}), so this session's total leaves {} out",
+                    crate::render::many(elsewhere.len(), "request"),
+                    if elsewhere.len() == 1 { "was" } else { "were" },
                     outside.keys().cloned().collect::<Vec<_>>().join(", "),
-                    if elsewhere.len() == 1 { "it out" } else { "them out" },
+                    if elsewhere.len() == 1 { "it" } else { "them" },
                 )
             });
         }
@@ -485,7 +486,9 @@ struct Scan {
     /// Whether any record is a Claude sidechain, and whether any says.
     sidechain: bool,
     sidechain_said: bool,
-    /// Whether any Claude record does not say it is a sidechain.
+    /// Whether any record says it is no sidechain. Records that say nothing
+    /// (Claude Code's `api-request` records, in subagent transcripts too)
+    /// do not count.
     not_sidechain: bool,
 }
 
@@ -552,7 +555,7 @@ impl Scan {
         }
         self.sidechain |= v["isSidechain"] == true;
         self.sidechain_said |= v["isSidechain"].is_boolean();
-        self.not_sidechain |= v["sessionId"].is_string() && v["isSidechain"] != true;
+        self.not_sidechain |= v["isSidechain"] == false;
     }
 
     /// The agent the records so far say wrote the file, with the record that

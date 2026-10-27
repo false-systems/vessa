@@ -54,8 +54,8 @@ usage is its session's usage:
 * `--session ID` selects the session and its subagents; a subagent's own id
   selects it alone. A session whose main transcript was not read is not
   found, even when its subagents were. A main transcript some of whose
-  records say they are a sidechain is read as a subagent's, and the error
-  says so. A transcript given with `--input` brings its `subagents/`
+  records say they are a sidechain, and others that they are not, is read as
+  a subagent's, and the error says so. A transcript given with `--input` brings its `subagents/`
   directory along.
 * A subagent whose requests its session already holds counts nothing twice
   and is not unknown: status says how many it shares. One whose requests only

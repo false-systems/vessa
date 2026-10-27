@@ -76,8 +76,8 @@ pub struct Session {
     #[serde(skip)]
     pub subagent: bool,
     /// A Claude transcript some of whose records say they are a sidechain
-    /// and some do not: read as a subagent's, though it may be its
-    /// session's own.
+    /// and some that they are not: read as a subagent's, though it may be
+    /// its session's own.
     #[serde(skip)]
     pub partly_sidechain: bool,
 }

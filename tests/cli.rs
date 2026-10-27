@@ -1646,6 +1646,15 @@ fn a_session_whose_main_transcript_was_not_read_is_not_found() {
     // must not answer with the subagent as if it were the session.
     let dir = claude_family("family-no-main", true);
     std::fs::remove_file(dir.join("claude-demo.jsonl")).unwrap();
+    // Claude Code also writes `api-request` records into a subagent's
+    // transcript, which say nothing about being a sidechain.
+    let sub = dir.join("claude-demo/subagents/agent-subagent-demo.jsonl");
+    let mut rows = std::fs::read_to_string(&sub).unwrap();
+    rows.push_str(
+        r#"{"type":"api-request","sessionId":"claude-demo","timestamp":"2026-09-30T09:10:01Z"}"#,
+    );
+    rows.push('\n');
+    std::fs::write(&sub, rows).unwrap();
     for command in ["receipt", "status"] {
         let output = cli(&[
             command,
@@ -1676,13 +1685,17 @@ fn a_session_whose_main_transcript_was_not_read_is_not_found() {
     std::fs::remove_dir_all(dir).unwrap();
 
     // A main transcript holding a sidechain record is read as a subagent
-    // transcript; its session id alone still does not select it.
+    // transcript; its session id alone still does not select it. Its own
+    // records say they are no sidechain, as Claude Code's main transcripts
+    // do; Claude Code's `api-request` records, in subagent transcripts too,
+    // say neither.
     let path = temp("main-with-sidechain.jsonl");
     std::fs::write(
         &path,
         format!(
             "{}{}\n",
-            include_str!("../examples/claude.jsonl"),
+            include_str!("../examples/claude.jsonl")
+                .replace(r#""sessionId":"#, r#""isSidechain":false,"sessionId":"#),
             r#"{"type":"user","uuid":"x1","isSidechain":true,"agentId":"stray","sessionId":"claude-demo","timestamp":"2026-09-30T09:04:00Z","message":{"role":"user","content":"Look."}}"#
         ),
     )
@@ -2573,7 +2586,7 @@ fn a_subagent_whose_requests_another_session_counted_is_not_silently_dropped() {
     assert_eq!(v["entries"][0]["output_tokens"], 300);
     let all = v["limitations"].to_string();
     assert!(
-        all.contains("subagent claude-p1/sub-x:") && all.contains("counted with claude-q"),
+        all.contains("subagent claude-p1/sub-x: No usage of its own: its 1 request was counted with another session (claude-q)"),
         "{all}"
     );
     std::fs::remove_dir_all(dir).unwrap();
