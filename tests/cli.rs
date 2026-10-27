@@ -4464,3 +4464,266 @@ fn only_the_first_whole_sentinel_line_ends_the_task() {
     );
     assert_eq!(texts(&v), ["tidy the docs", task]);
 }
+
+// ---- secrets ----------------------------------------------------------------
+
+/// Secret-shaped strings, put together at run time so that none sits in the
+/// source for a scanner to find. None is a real credential.
+fn fake(parts: &[&str]) -> String {
+    parts.concat()
+}
+/// An id and a secret joined by a dot, in the shape Z.ai issues its keys:
+/// `<32 hex>.<16 letters and digits>`.
+fn fake_zai() -> String {
+    fake(&[
+        "3f9a1c0b7e2d4f6a",
+        "8b1c3d5e7f9a0b2c",
+        ".",
+        "Xk9Qm2Lp7RtA4nWz",
+    ])
+}
+fn fake_github() -> String {
+    fake(&["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"])
+}
+fn fake_anthropic() -> String {
+    fake(&[
+        "s",
+        "k-ant-api03-",
+        "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5kL7",
+    ])
+}
+/// A signed evidence token in the shape habitat writes one: JSON in hex
+/// (`7b22` is `{"`), a dot, and a 64-byte signature in hex. Evidence, not a
+/// secret.
+fn evidence_token() -> String {
+    let payload: String =
+        br#"{"schema":"demo-evidence","claim":"ran"}"#.iter().map(|b| format!("{b:02x}")).collect();
+    format!("{payload}.{}", "5e0f".repeat(32))
+}
+
+#[test]
+fn messages_redact_secret_looking_tokens_by_default() {
+    let (zai, github, anthropic) = (fake_zai(), fake_github(), fake_anthropic());
+    let evidence = evidence_token();
+    // The access key id AWS's own documentation uses: no secret.
+    let example = "AKIAIOSFODNN7EXAMPLE";
+    let path = transcript(
+        "secrets.jsonl",
+        &[
+            claude_user(
+                "u1",
+                0,
+                format!("Use {zai} for the model, and {github}.").into(),
+            ),
+            claude_reply(
+                "a1",
+                0,
+                &format!("Set ANTHROPIC_API_KEY={anthropic} and retry."),
+            ),
+            claude_user(
+                "u2",
+                1,
+                format!("The evidence is {evidence}; the docs use {example}.").into(),
+            ),
+        ],
+    );
+    let input = path.to_str().unwrap();
+    let (v, code) = messages(&["--input", input]);
+    assert_eq!(code, Some(0));
+    assert_eq!(v["schema"], "vessa-messages.v1");
+    let kept = format!("The evidence is {evidence}; the docs use {example}.");
+    assert_eq!(
+        texts(&v),
+        [
+            "Use [redacted] for the model, and [redacted].",
+            kept.as_str()
+        ]
+    );
+    assert_eq!(
+        v["messages"][1]["reply"]["text"],
+        "Set ANTHROPIC_API_KEY=[redacted] and retry."
+    );
+    assert_eq!(v["redacted"], 3);
+    assert_eq!(
+        v["redacted_by_rule"],
+        serde_json::json!({"anthropic":1,"github":1,"id_and_secret":1})
+    );
+    let document = v.to_string();
+    for secret in [&zai, &github, &anthropic] {
+        assert!(!document.contains(secret.as_str()), "{document}");
+    }
+
+    // The plain form prints a message's words, scrubbed, and says on stderr
+    // how many tokens it redacted.
+    let out = cli(&["messages", "--input", input]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stdout.contains("\n  Use [redacted] for the model, and [redacted].\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains(&kept), "{stdout}");
+    for secret in [&zai, &github, &anthropic] {
+        assert!(!stdout.contains(secret.as_str()), "{stdout}");
+        assert!(!stderr.contains(secret.as_str()), "{stderr}");
+    }
+    assert_eq!(
+        stderr,
+        "vessa: 2 secret-looking tokens redacted (github 1, id_and_secret 1)\n"
+    );
+    // Nothing to redact, nothing said.
+    let out = cli(&["messages", "--input", "examples/claude.jsonl"]);
+    assert_eq!(String::from_utf8(out.stderr).unwrap(), "");
+    let (v, _) = messages(&["--input", "examples/claude.jsonl"]);
+    assert_eq!(v["redacted"], 0);
+    assert_eq!(v["redacted_by_rule"], serde_json::json!({}));
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn raw_prints_secrets_as_written_and_says_so() {
+    let (zai, github) = (fake_zai(), fake_github());
+    let said = format!("Use {zai} and {github}.");
+    let path = transcript("raw.jsonl", &[claude_user("u1", 0, said.clone().into())]);
+    let input = path.to_str().unwrap();
+    let notice = "vessa: --raw: secret-looking tokens are printed as written, not redacted\n";
+    let out = cli(&["messages", "--json", "--raw", "--input", input]);
+    assert_eq!(out.status.code(), Some(0));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(texts(&v), [said.as_str()]);
+    assert!(v["redacted"].is_null());
+    assert!(v["redacted_by_rule"].is_null());
+    assert_eq!(String::from_utf8(out.stderr).unwrap(), notice);
+    let out = cli(&["messages", "--raw", "--input", input]);
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains(&format!("\n  {said}\n")), "{stdout}");
+    assert_eq!(String::from_utf8(out.stderr).unwrap(), notice);
+    // Nothing else turns the scrub off: no other command takes --raw.
+    for command in ["sessions", "usage", "status", "receipt"] {
+        let out = cli(&[command, "--raw", "--input", input]);
+        assert_eq!(out.status.code(), Some(2), "{command}");
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn what_messages_says_of_its_sources_carries_no_secret() {
+    // A source that cannot be read is said by its path, here one whose name
+    // holds a key.
+    let key = fake_github();
+    let missing = temp(&format!("{key}.jsonl"));
+    let (v, code) = messages(&[
+        "--input",
+        "examples/claude.jsonl",
+        "--input",
+        missing.to_str().unwrap(),
+    ]);
+    assert_eq!(code, Some(4));
+    let warning = v["warnings"][0].as_str().unwrap();
+    assert!(warning.contains(REDACTED_TOKEN), "{warning}");
+    assert!(!v.to_string().contains(&key));
+    assert_eq!(v["redacted"], 1);
+    let out = cli(&[
+        "messages",
+        "--input",
+        "examples/claude.jsonl",
+        "--input",
+        missing.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!stderr.contains(&key), "{stderr}");
+    assert!(stderr.contains(REDACTED_TOKEN), "{stderr}");
+    // Why exit is 4 is still the last line.
+    assert!(
+        stderr
+            .lines()
+            .last()
+            .unwrap()
+            .starts_with("vessa: partial message list (exit 4)"),
+        "{stderr}"
+    );
+}
+
+const REDACTED_TOKEN: &str = "[redacted]";
+
+#[test]
+fn usage_commands_scrub_their_warnings_limitations_and_wrapper_records() {
+    let key = fake_github();
+    // A wrapper's session record holds what it was asked and what it
+    // handed over, in words; its export names an unreadable session.
+    let receipt = value(cli(&["receipt", "--input", "examples/pi.jsonl"]));
+    let export = temp("secret-export.json");
+    let wrappers = serde_json::json!({"schema":"ohjaa-sessions.v1","sessions":[{"id":"oh-fixture","agent":"pi","intent":"ship it","task":format!("Deploy with {key} tonight."),"usage":[receipt]}],"unreadable":[key]});
+    std::fs::write(&export, serde_json::to_vec(&wrappers).unwrap()).unwrap();
+    let html = temp("secret-report.html");
+    let out = cli(&[
+        "report",
+        "--input",
+        "examples/pi.jsonl",
+        "--input",
+        export.to_str().unwrap(),
+        "--output",
+        html.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    let report = std::fs::read_to_string(&html).unwrap();
+    assert!(!report.contains(&key), "{report}");
+    assert!(
+        report.contains("Deploy with [redacted] tonight."),
+        "{report}"
+    );
+    assert!(report.contains("could not read session &quot;[redacted]&quot;"));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!stderr.contains(&key), "{stderr}");
+    assert!(
+        stderr.contains("vessa: 2 secret-looking tokens redacted (github 2)\n"),
+        "{stderr}"
+    );
+    assert!(stderr
+        .lines()
+        .last()
+        .unwrap()
+        .starts_with("vessa: partial usage evidence (exit 4)"));
+    let out = cli(&[
+        "sessions",
+        "--input",
+        "examples/pi.jsonl",
+        "--input",
+        export.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(out.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        v["sessions"][0]["ohjaa"][0]["task"],
+        "Deploy with [redacted] tonight."
+    );
+    assert!(!v.to_string().contains(&key));
+    assert!(!String::from_utf8(out.stderr).unwrap().contains(&key));
+    std::fs::remove_file(html).unwrap();
+    std::fs::remove_file(export).unwrap();
+
+    // The limitations every command prints, which can name models: two
+    // snapshots of one request that disagree.
+    let snapshot = |model: &str, input: u64| serde_json::json!({"type":"assistant","uuid":format!("s{input}"),"requestId":"req_011Csecret","sessionId":"claude-secret","cwd":"/demo/widget","timestamp":"2026-09-30T09:01:00Z","message":{"id":"msg_011Csecret","role":"assistant","model":model,"content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":input,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}});
+    let path = transcript(
+        "secret-limitation.jsonl",
+        &[snapshot("demo-a", 1), snapshot(&key, 2)],
+    );
+    let out = cli(&["sessions", "--input", path.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(4));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("conflicting usage"), "{stderr}");
+    assert!(stderr.contains("model demo-a then [redacted]"), "{stderr}");
+    assert!(!stderr.contains(&key), "{stderr}");
+    let out = cli(&["sessions", "--input", path.to_str().unwrap(), "--json"]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let limitations = v["sessions"][0]["limitations"].to_string();
+    assert!(
+        limitations.contains("model demo-a then [redacted]"),
+        "{limitations}"
+    );
+    std::fs::remove_file(path).unwrap();
+}

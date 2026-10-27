@@ -3,6 +3,7 @@ mod import;
 mod metrics;
 mod model;
 mod render;
+mod scrub;
 mod work;
 
 use anyhow::{ensure, Context, Result};

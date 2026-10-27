@@ -361,7 +361,7 @@ pub fn receipt(family: &Family) -> Result<serde_json::Value> {
 
 /// One message a person typed into an agent session: a record of
 /// `vessa-messages.v1`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Message {
     pub agent: String,
     /// The native session id; a Claude subagent's is `<session>/<agentId>`.
