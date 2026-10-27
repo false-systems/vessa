@@ -177,7 +177,28 @@ fn deduplicate(report: &mut Report) {
         .iter()
         .map(|s| (s.agent.clone(), s.subagent_of().unwrap_or(&s.id).to_owned()))
         .collect();
-    for (index, session) in report.sessions.iter_mut().enumerate() {
+    // A session whose transcript holds another's launch records holds that
+    // session's history: the session it copies counts first, so the
+    // requests both hold are the original's whichever id sorts first.
+    // Otherwise the order stands: sessions first, then subagents.
+    let copies = copies(&report.sessions);
+    let mut memo = HashMap::new();
+    let depth: Vec<Option<usize>> = family
+        .iter()
+        .map(|(agent, top)| match agent.as_str() {
+            "claude" => copy_depth(top, &copies.of, &mut memo, &mut Vec::new()),
+            _ => Some(0),
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..report.sessions.len()).collect();
+    order.sort_by_key(|&i| (depth[i].unwrap_or(0), report.sessions[i].parent.is_some()));
+    for &index in &order {
+        let session = &mut report.sessions[index];
+        if depth[index].is_none() && session.subagent_of().is_none() {
+            session.limitations.push(
+                "its transcript and another session's hold copies of each other's launch records, so where the requests they share began is unknown; each is counted with the first session by id".into(),
+            );
+        }
         for item in session.usage.drain(..) {
             let started = session
                 .started_at
@@ -236,30 +257,33 @@ fn deduplicate(report: &mut Report) {
         .filter(|s| s.agent == "claude")
         .map(|s| s.id.clone())
         .collect();
-    // The agent ids of the Claude subagents read, whichever session they
-    // belong to. A launch record copied into another session's transcript
-    // names a subagent that ran in the session it came from: read there, its
-    // usage is that session's, and nothing of it is missing.
-    let agents: std::collections::HashSet<_> = report
-        .sessions
-        .iter()
-        .filter(|s| s.agent == "claude")
-        .filter_map(|s| {
-            let parent = s.subagent_of()?;
-            s.id.strip_prefix(parent)?.strip_prefix('/')
-        })
-        .map(str::to_owned)
-        .collect();
-    for session in report.sessions.iter_mut().filter(|s| s.agent == "claude") {
+    for (index, session) in report.sessions.iter_mut().enumerate() {
+        if session.agent != "claude" {
+            continue;
+        }
         let top = session.subagent_of().unwrap_or(&session.id).to_owned();
         let mut named = std::collections::HashSet::new();
-        for (agent, line) in std::mem::take(&mut session.launched) {
-            let id = format!("{top}/{agent}");
-            if !read.contains(&id) && !agents.contains(&agent) && named.insert(id.clone()) {
-                session.limitations.push(format!(
-                    "line {line}: subagent {id} was launched, but its transcript was not read; its usage is unknown, not zero"
+        for (n, launch) in std::mem::take(&mut session.launched).iter().enumerate() {
+            let id = format!("{top}/{}", launch.agent);
+            // A copy of another session's launch: its subagent is that one's.
+            if read.contains(&id)
+                || copies.cleared.contains(&(index, n))
+                || !named.insert(id.clone())
+            {
+                continue;
+            }
+            let mut said = format!(
+                "line {}: subagent {id} was launched, but its transcript was not read; its usage is unknown, not zero",
+                launch.line
+            );
+            if let Some(twins) = copies.twins.get(&(index, n)) {
+                said.push_str(&format!(
+                    "; {} {} the same launch record, and no transcript read shows which session ran it",
+                    twins.iter().cloned().collect::<Vec<_>>().join(", "),
+                    if twins.len() == 1 { "holds" } else { "hold" },
                 ));
             }
+            session.limitations.push(said);
         }
     }
     for (((session, usage), elsewhere), outside) in report
@@ -275,26 +299,132 @@ fn deduplicate(report: &mut Report) {
         // subagents) already holds has had its usage counted there; it is
         // not unknown. Nor is a session whose only answers were synthetic:
         // what it recorded holds no usage.
-        let within = elsewhere.len() - outside.values().sum::<usize>();
-        let counted = session.subagent_of().is_some() && within > 0;
-        if session.usage.is_empty() && !counted && session.synthetic.is_empty() {
+        let away: usize = outside.values().sum();
+        let within = elsewhere.len() - away;
+        let subagent = session.subagent_of().is_some();
+        let others = outside.keys().cloned().collect::<Vec<_>>().join(", ");
+        let them = |n: usize| if n == 1 { "it" } else { "them" };
+        if session.usage.is_empty() && !(subagent && within > 0) && session.synthetic.is_empty() {
             session.limitations.push(if outside.is_empty() {
                 "No usage records found; consumption is unknown, not zero".into()
             } else {
                 // Its requests were counted once, with another session, so
                 // the total of the session it belongs to leaves them out.
                 format!(
-                    "No usage of its own: its {} {} counted with another session ({}), so this session's total leaves {} out",
+                    "No usage of its own: its {} {} counted with another session ({others}), so this session's total leaves {} out",
                     crate::render::many(elsewhere.len(), "request"),
                     if elsewhere.len() == 1 { "was" } else { "were" },
-                    outside.keys().cloned().collect::<Vec<_>>().join(", "),
-                    if elsewhere.len() == 1 { "it" } else { "them" },
+                    them(elsewhere.len()),
                 )
             });
+        } else if subagent && away > 0 {
+            // Some of a subagent's requests, counted with an unrelated
+            // session, are missing from its own session's total too.
+            session.limitations.push(format!(
+                "{away} of its {} {} counted with another session ({others}), so this session's total leaves {} out",
+                crate::render::many(session.usage.len() + elsewhere.len(), "request"),
+                if away == 1 { "was" } else { "were" },
+                them(away),
+            ));
         }
         session.limitations.sort();
         session.limitations.dedup();
     }
+}
+
+/// Which Claude transcripts hold another session's launch records. A copy
+/// is proven by the record alone: the same record (its `uuid`, or the tool
+/// call it answers) in another session's transcripts, where the subagent it
+/// names was read as that session's. A subagent of the same id elsewhere
+/// proves nothing, and nor does a record whose subagent was read under none
+/// or several of the sessions that hold it: those launches stay missing.
+#[derive(Default)]
+struct Copies {
+    /// The sessions each session's transcripts copy launch records from.
+    of: HashMap<String, std::collections::BTreeSet<String>>,
+    /// Launches that are copies, by session index and launch position.
+    cleared: std::collections::HashSet<(usize, usize)>,
+    /// Launches whose record other sessions hold too, when none of them
+    /// shows it ran there.
+    twins: HashMap<(usize, usize), std::collections::BTreeSet<String>>,
+}
+
+fn copies(sessions: &[Session]) -> Copies {
+    let top = |s: &Session| s.subagent_of().unwrap_or(&s.id).to_owned();
+    // The sessions each subagent read ran in, by agent id.
+    let mut ran: HashMap<&str, std::collections::BTreeSet<String>> = HashMap::new();
+    for s in sessions.iter().filter(|s| s.agent == "claude") {
+        if let Some(parent) = s.subagent_of() {
+            if let Some(agent) = s.id.strip_prefix(parent).and_then(|r| r.strip_prefix('/')) {
+                ran.entry(agent).or_default().insert(parent.to_owned());
+            }
+        }
+    }
+    let launches: Vec<(usize, usize, String, &crate::model::Launch)> = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.agent == "claude")
+        .flat_map(|(i, s)| {
+            let family = top(s);
+            s.launched
+                .iter()
+                .enumerate()
+                .map(move |(n, l)| (i, n, family.clone(), l))
+        })
+        .collect();
+    let mut copies = Copies::default();
+    for (i, n, family, launch) in &launches {
+        let ran_in = |f: &String| {
+            ran.get(launch.agent.as_str())
+                .is_some_and(|r| r.contains(f))
+        };
+        if ran_in(family) {
+            continue;
+        }
+        let twins: std::collections::BTreeSet<String> = launches
+            .iter()
+            .filter(|(_, _, other, l)| other != family && l.same_record(launch))
+            .map(|(_, _, other, _)| other.clone())
+            .collect();
+        let origins: Vec<&String> = twins.iter().filter(|f| ran_in(f)).collect();
+        if let [origin] = origins[..] {
+            copies.cleared.insert((*i, *n));
+            copies
+                .of
+                .entry(family.clone())
+                .or_default()
+                .insert(origin.clone());
+        } else if !twins.is_empty() {
+            copies.twins.insert((*i, *n), twins);
+        }
+    }
+    copies
+}
+
+/// How many copies deep a session's history goes: 0 for one that copies no
+/// other, else one more than the deepest it copies. None in a loop.
+fn copy_depth(
+    family: &str,
+    of: &HashMap<String, std::collections::BTreeSet<String>>,
+    memo: &mut HashMap<String, Option<usize>>,
+    path: &mut Vec<String>,
+) -> Option<usize> {
+    if let Some(depth) = memo.get(family) {
+        return *depth;
+    }
+    if path.iter().any(|f| f == family) {
+        return None;
+    }
+    path.push(family.to_owned());
+    let mut depth = Some(0);
+    for origin in of.get(family).into_iter().flatten() {
+        depth = depth
+            .zip(copy_depth(origin, of, memo, path))
+            .map(|(d, o)| d.max(o + 1));
+    }
+    path.pop();
+    memo.insert(family.to_owned(), depth);
+    depth
 }
 
 /// Attaches each ohjaa wrapper record to the sessions it explicitly names,
@@ -781,7 +911,15 @@ fn claude(v: &Value, line: usize, s: &mut Session) -> Result<()> {
     }
     // Launching a subagent returns a tool result naming its agent id.
     if let Some(agent) = v["toolUseResult"]["agentId"].as_str() {
-        s.launched.push((agent.to_owned(), line));
+        let tool_use = v["message"]["content"]
+            .as_array()
+            .and_then(|content| content.iter().find_map(|c| c["tool_use_id"].as_str()));
+        s.launched.push(crate::model::Launch {
+            agent: agent.to_owned(),
+            line,
+            record: v["uuid"].as_str().map(str::to_owned),
+            tool_use: tool_use.map(str::to_owned),
+        });
     }
     let m = &v["message"];
     if v["type"] == "assistant" && m["usage"].is_object() {

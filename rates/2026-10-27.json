@@ -16,7 +16,7 @@
     "model": "claude-sonnet-5-5",
     "effective_from": "2026-09-27T10:00:00Z",
     "effective_until": "2026-10-06T10:00:00Z",
-    "source": "Anthropic Claude API pricing, https://platform.claude.com/docs/en/about-claude/pricing, read 2026-10-27",
+    "source": "Anthropic release notes, 2026-10-07 entry (cache reads $0.20 before it), https://platform.claude.com/docs/en/release-notes/overview, with Claude API pricing, https://platform.claude.com/docs/en/about-claude/pricing, read 2026-10-27",
     "input": 2000000,
     "output": 10000000,
     "cache_read": 200000,

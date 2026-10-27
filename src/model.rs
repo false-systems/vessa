@@ -53,10 +53,10 @@ pub struct Session {
     /// `codex-tui`, or `codex_exec` for `codex exec`. Null when unknown.
     #[serde(default)]
     pub originator: Option<String>,
-    /// Subagents a Claude transcript says it launched, by native agent id,
-    /// with the line that says so. Checked against the transcripts read.
+    /// Subagents a Claude transcript says it launched. Checked against the
+    /// transcripts read.
     #[serde(skip)]
-    pub launched: Vec<(String, usize)>,
+    pub launched: Vec<Launch>,
     /// Requests this transcript holds that an earlier session counted.
     #[serde(skip)]
     pub counted_elsewhere: usize,
@@ -80,6 +80,30 @@ pub struct Session {
     /// its session's own.
     #[serde(skip)]
     pub partly_sidechain: bool,
+}
+
+/// A Claude launch record: the tool result that says a subagent started.
+#[derive(Debug, Clone)]
+pub struct Launch {
+    /// The subagent's native agent id.
+    pub agent: String,
+    /// The line that says so.
+    pub line: usize,
+    /// The record's own `uuid`, and the tool call it answers: what a copy of
+    /// the record in another session's transcript carries too.
+    pub record: Option<String>,
+    pub tool_use: Option<String>,
+}
+
+impl Launch {
+    /// Whether `other` is this very record, in another transcript: the same
+    /// subagent, and the same record id or tool call. Two sessions that each
+    /// launch a subagent of one id write two records.
+    pub fn same_record(&self, other: &Launch) -> bool {
+        self.agent == other.agent
+            && ((self.record.is_some() && self.record == other.record)
+                || (self.tool_use.is_some() && self.tool_use == other.tool_use))
+    }
 }
 
 /// What a session's transcript says about itself, without its usage: one

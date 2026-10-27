@@ -74,6 +74,29 @@ struct Tally {
     /// unknown, and for token counts the record leaves unknown.
     unknown_price: [usize; 4],
     unknown_counts: usize,
+    /// Of the covered records it could not price, those that keep the
+    /// estimate their source recorded (pi's own cost).
+    kept: usize,
+}
+
+/// The records of a provider and model that some card names but none
+/// covers: dated outside every card for it (and of those, undated), or
+/// with a prompt size no card for its date covers. A record that keeps its
+/// source's own estimate is not among them.
+#[derive(Default)]
+struct Uncovered {
+    outside: usize,
+    undated: usize,
+    prompt: usize,
+}
+
+/// `n` records and the verb that follows, singular for one.
+fn records(n: usize, one: &str, many: &str) -> String {
+    format!(
+        "{} {}",
+        crate::render::many(n, "usage record"),
+        if n == 1 { one } else { many }
+    )
 }
 
 pub fn apply_rates(report: &mut Report, rates: &[Rate]) -> Result<()> {
@@ -86,10 +109,18 @@ pub fn apply_rates(report: &mut Report, rates: &[Rate]) -> Result<()> {
                 start < end && !r.source.trim().is_empty(),
                 "rate needs an ordered validity interval and source"
             );
+            ensure!(
+                r.prompt_over
+                    .zip(r.prompt_up_to)
+                    .is_none_or(|(over, up_to)| over < up_to),
+                "{}: prompt_over must be below prompt_up_to, or the card covers no prompt",
+                r.named()
+            );
             Ok((r, start, end))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut tally: Vec<Tally> = parsed.iter().map(|_| Tally::default()).collect();
+    let mut uncovered: std::collections::BTreeMap<(String, String), Uncovered> = Default::default();
     for session in &mut report.sessions {
         for usage in &mut session.usage {
             let at = usage
@@ -106,11 +137,13 @@ pub fn apply_rates(report: &mut Report, rates: &[Rate]) -> Result<()> {
             let prompt = [tokens[0], tokens[2], tokens[3]]
                 .into_iter()
                 .try_fold(0u64, |sum, n| sum.checked_add(n?));
+            let mut named = false;
             let mut dated = Vec::new();
             for (card, (r, start, end)) in parsed.iter().enumerate() {
                 if r.provider != e.provider || r.model != e.model {
                     continue;
                 }
+                named = true;
                 tally[card].model += 1;
                 if at.is_some_and(|at| at >= *start && at < *end) {
                     tally[card].dated += 1;
@@ -128,14 +161,33 @@ pub fn apply_rates(report: &mut Report, rates: &[Rate]) -> Result<()> {
                 e.provider,
                 e.model
             );
+            // A record that carries its source's own estimate keeps it, with
+            // its basis, wherever no card prices it.
+            let own = e.estimated_usd_micros.is_some();
             let Some(&card) = matching.first() else {
-                if let (false, Some(prompt)) = (dated.is_empty(), prompt) {
-                    // Cards for its date, but none for a prompt of its size.
-                    e.estimate_basis = Some(format!(
-                        "unpriced: no {}/{} rate card for its date covers a prompt of {prompt} tokens",
-                        e.provider, e.model
-                    ));
+                if !named || own {
+                    continue;
                 }
+                let gap = uncovered
+                    .entry((e.provider.clone(), e.model.clone()))
+                    .or_default();
+                let why = if dated.is_empty() {
+                    gap.outside += 1;
+                    gap.undated += usize::from(at.is_none());
+                    format!(
+                        "unpriced: no {}/{} rate card covers its date",
+                        e.provider, e.model
+                    )
+                } else {
+                    gap.prompt += 1;
+                    format!(
+                        "unpriced: no {}/{} rate card for its date covers a prompt of {} tokens",
+                        e.provider,
+                        e.model,
+                        prompt.map_or("unknown".into(), |p| p.to_string())
+                    )
+                };
+                e.estimate_basis = Some(why);
                 continue;
             };
             let (r, _, _) = &parsed[card];
@@ -144,6 +196,7 @@ pub fn apply_rates(report: &mut Report, rates: &[Rate]) -> Result<()> {
             // Unknown token categories prevent repricing.
             if tokens.iter().any(Option::is_none) {
                 t.unknown_counts += 1;
+                t.kept += usize::from(own);
                 continue;
             }
             let mut total = 0u128;
@@ -166,15 +219,18 @@ pub fn apply_rates(report: &mut Report, rates: &[Rate]) -> Result<()> {
                 }
             }
             if !unknown.is_empty() {
-                let join = |part: &dyn Fn(&(u64, &str)) -> String| {
-                    unknown.iter().map(part).collect::<Vec<_>>().join(" and ")
-                };
-                e.estimate_basis = Some(format!(
-                    "unpriced: {} leaves the {} price unknown, and this record has {} tokens",
-                    r.named(),
-                    join(&|(_, category)| category.to_string()),
-                    join(&|(n, category)| format!("{n} {category}")),
-                ));
+                t.kept += usize::from(own);
+                if !own {
+                    let join = |part: &dyn Fn(&(u64, &str)) -> String| {
+                        unknown.iter().map(part).collect::<Vec<_>>().join(" and ")
+                    };
+                    e.estimate_basis = Some(format!(
+                        "unpriced: {} leaves the {} price unknown, and this record has {} tokens",
+                        r.named(),
+                        join(&|(_, category)| category.to_string()),
+                        join(&|(n, category)| format!("{n} {category}")),
+                    ));
+                }
                 continue;
             }
             let micros = u64::try_from(
@@ -205,7 +261,7 @@ pub fn apply_rates(report: &mut Report, rates: &[Rate]) -> Result<()> {
     for ((r, _, _), t) in parsed.iter().zip(tally) {
         // A card whose provider, model and dates match records, none of a
         // prompt size it covers (a long-context card where no prompt was
-        // long), matches as it should and priced what there was: nothing.
+        // long), matches as it should; such records are counted below.
         if t.covered == 0 && t.dated == 0 {
             let why = if t.model == 0 {
                 format!("no selected record is {}/{}", r.provider, r.model)
@@ -241,12 +297,44 @@ pub fn apply_rates(report: &mut Report, rates: &[Rate]) -> Result<()> {
                     if t.unknown_counts == 1 { "has" } else { "have" }
                 ));
             }
+            match t.kept {
+                0 => {}
+                1 => why.push("1 keeps the estimate its source recorded".into()),
+                n => why.push(format!("{n} keep the estimate their source recorded")),
+            }
             report.warnings.push(format!(
                 "{} priced {} of the {} usage records it covers; of the others, {}",
                 r.named(),
                 t.priced,
                 t.covered,
                 why.join("; ")
+            ));
+        }
+    }
+    // Records of a model some card names, that no card covers: outside
+    // every card's dates (an earlier price, or later than the card was
+    // read), or in its dates with a prompt no card's range covers.
+    for ((provider, model), gap) in uncovered {
+        if gap.outside > 0 {
+            report.warnings.push(format!(
+                "{provider}/{model}: {} dated outside every rate card for it{}, so {} unpriced",
+                records(gap.outside, "is", "are"),
+                match gap.undated {
+                    0 => String::new(),
+                    n => format!(" ({n} of them undated)"),
+                },
+                if gap.outside == 1 {
+                    "it stays"
+                } else {
+                    "they stay"
+                },
+            ));
+        }
+        if gap.prompt > 0 {
+            report.warnings.push(format!(
+                "{provider}/{model}: {} a prompt size that no rate card for its date covers, so {} unpriced",
+                records(gap.prompt, "has", "have"),
+                if gap.prompt == 1 { "it stays" } else { "they stay" },
             ));
         }
     }

@@ -58,9 +58,10 @@ usage is its session's usage:
   a subagent's, and the error says so. A transcript given with `--input` brings its `subagents/`
   directory along.
 * A subagent whose requests its session already holds counts nothing twice
-  and is not unknown: status says how many it shares. One whose requests only
-  an unrelated session holds is partial: they were counted once, with that
-  session, and its own session's total leaves them out.
+  and is not unknown: status says how many it shares. One with requests that
+  an unrelated session holds too is partial, whether those are all of its
+  requests or some: they were counted once, with that session, and its own
+  session's total leaves them out.
 * `status` and `receipt` total the session with its subagents. Status says how
   many it included and shows each one; its JSON `entries` are that total, with
   `main_entries` and a `subagents` breakdown beside them (see
@@ -73,8 +74,16 @@ usage is its session's usage:
 * A transcript that says it launched a subagent whose transcript was not read
   is partial (exit 4): that usage is unknown, not zero. A launch record can
   also be a copy of another session's, carried in this one's transcript under
-  its id: when the subagent it names was read under another session, it ran
-  there, its usage is that session's, and nothing is missing.
+  its id. Only the record proves it: when another session's transcripts
+  hold the very same record (its `uuid`, or the tool call it answers) and
+  the subagent it names was read as that session's, it ran there, and
+  nothing is missing here. The transcript then holds that session's
+  history, so the session it copies is counted first and the requests both
+  hold are the original's, whichever id sorts first. A subagent of the same
+  id in another session proves nothing; nor does the same record held by
+  sessions none of which, or several of which, read the subagent. Those
+  launches stay partial, and the limitation names the other sessions that
+  hold the record.
 * `stats` counts sessions, not transcripts: a subagent's usage counts its
   session, and subagents are counted apart in `subagents`.
 
@@ -216,9 +225,12 @@ cargo run -- status --input examples/work.jsonl
 `stats --period day|week|month|year` groups usage events by their own timestamp,
 agent and model. Calendar periods are UTC; weeks use ISO week years. A session
 crossing a period boundary appears in both periods, with only that period's
-usage. Missing/invalid timestamps remain in an `undated` group. Unpriced usage
-is counted explicitly alongside a **known estimate subtotal**, not priced at
-zero. JSON emits `vessa-statistics.v1`; HTML reports include all four periods.
+usage. Missing/invalid timestamps remain in an `undated` group. Each group
+says how many of its usage records are priced: a **known estimate subtotal**
+of those, or "no estimate" when none is, never $0. Unpriced usage is counted,
+not priced at zero. JSON emits `vessa-statistics.v1`, whose
+`priced_records` (beside `unpriced_records`) says how many records
+`known_estimated_usd_micros` sums; HTML reports include all four periods.
 Default scans cover selected local transcript files, not every account/device.
 
 Claude Code can call the Rust binary directly in `~/.claude/settings.json`:
@@ -308,7 +320,10 @@ and require provider/model, an RFC3339 validity interval, and a source.
 * `prompt_over` and `prompt_up_to` (optional) limit a card to records whose
   prompt, their input, cache-read and cache-write tokens together, is larger
   than or at most that many tokens: a provider's long-context price is a card
-  of its own. A record no card's range covers stays unpriced.
+  of its own. A range that holds no prompt is refused. A record no card's
+  range covers stays unpriced.
+* A record that carries its source's own estimate (pi records its cost)
+  keeps it, with its basis, where no card prices it.
 * `notes` (optional) says what else the source says, or what the card leaves
   out. Vessa does not read it.
 * Unknown token counts prevent repricing. Overlapping applicable rates fail.
@@ -317,8 +332,12 @@ and require provider/model, an RFC3339 validity interval, and a source.
   one that leaves records it covers unpriced, with how many and why. A card
   whose records in its interval all have prompts outside its range, such as
   a long-context card where no prompt was long, says nothing: it matched.
-  These notices concern pricing only and do not make the output partial
-  (exit 4).
+  For each provider and model some card names, the records no card covers
+  are counted in a notice of their own: those dated outside every card for
+  it (an earlier price, or usage after the card was read), and those whose
+  prompt size no card for their date covers. Each such record's
+  `estimate_basis` says why. These notices concern pricing only and do not
+  make the output partial (exit 4).
 
 Keep plan multipliers, discounts and service tiers out of this simple API-rate
 estimate unless the supplied rate actually represents them.
@@ -343,7 +362,8 @@ vessa usage --rates rates/2026-10-27.json
   model's launch, or at its last price change, as the release notes or
   changelog date them; a change dated a day leaves that whole day unpriced,
   in any time zone, since the hour is not given. Earlier usage stays
-  unpriced. Re-read the pages and add cards; never stretch one.
+  unpriced, counted in a notice for its model. Re-read the pages and add
+  cards; never stretch one.
 * **Cache writes are unknown** for every model. Anthropic prices 5-minute and
   1-hour writes differently, OpenAI 30-minute and 12-hour writes, and a
   transcript's cache-write count does not say which. A Claude request that
@@ -608,9 +628,11 @@ usage.
 The HTML is a local, standalone report. Native links, disclosure controls and
 browser Find provide navigation without a server or frontend dependencies.
 All displayed source content is escaped, executable content is blocked by CSP, and
-new reports use mode 0600 on Unix. Text from transcripts printed to a
-terminal (the status line, `status`, `messages`) drops control characters and
-the bidirectional formatting characters that would reorder what is shown. Existing report paths are never overwritten.
+new reports use mode 0600 on Unix. Text from transcripts that a command
+prints for a terminal, on stdout or stderr (the status line, the text forms
+of every command, warnings and limitations), drops control characters and
+the bidirectional formatting characters that would reorder what is shown;
+JSON keeps the text as it was read. Existing report paths are never overwritten.
 Reports contain private usage and optional linked wrapper context: files under
 `reports/` are ignored by Git. JSON printed to stdout inherits the destination
 permissions you choose. No knowledge becomes current automatically.
