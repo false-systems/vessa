@@ -1,11 +1,35 @@
-//! Secret-looking tokens in what Vessa prints, redacted. Not yet written:
-//! every function returns its input unchanged.
+//! Secret-looking tokens in what Vessa prints of conversations, redacted.
+//!
+//! What people paste to agents, and what tools print back, includes
+//! credentials, and Vessa is the one reader of agent conversations: what it
+//! prints is what every agent that reads them through it sees. So a token
+//! that looks like a secret becomes `[redacted]` before it is printed. The
+//! original is never printed, logged or kept; only how many were redacted,
+//! by rule, is said. `vessa messages --raw` alone prints the words as
+//! written.
+//!
+//! The rules are ohjaa intake's, which scrubs the prompt it sends to its
+//! drafter (false-systems/ohjaa, `src/intake.rs`, the `// ---- secrets ----`
+//! section, main at 9cad209, 2026-10-28). They are copied, not shared,
+//! since repositories stand alone: known key prefixes, JWTs, PEM private
+//! key blocks, an id and a secret joined by a dot, a long token mixing
+//! capitals, lower case and digits, and a long mixed token right after a
+//! word that names a secret. Vessa names each rule, and adds two
+//! exceptions that are no secret: AWS's documented example keys, and signed
+//! evidence tokens, which are evidence and would be destroyed.
 
 use crate::model::{Message, Report};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const REDACTED: &str = "[redacted]";
+
+/// The access key pair AWS's documentation uses in its examples ("Managing
+/// access keys for IAM users"), and code and tests copy: no secret.
+const AWS_EXAMPLES: [&str; 2] = [
+    "AKIAIOSFODNN7EXAMPLE",
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+];
 
 /// How many tokens a scrub redacted, by rule.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -20,25 +44,342 @@ impl Redactions {
         &self.0
     }
 
+    /// `text` with every secret-looking token replaced by `[redacted]`.
     pub fn text(&mut self, text: &str) -> String {
-        text.to_owned()
+        let text = self.private_keys(text);
+        self.tokens(&text)
     }
 
-    pub fn lines<'a>(&mut self, _lines: impl IntoIterator<Item = &'a mut String>) {}
+    /// Each of `lines`, scrubbed in place.
+    pub fn lines<'a>(&mut self, lines: impl IntoIterator<Item = &'a mut String>) {
+        for line in lines {
+            *line = self.text(line);
+        }
+    }
 
-    pub fn value(&mut self, _value: &mut Value) {}
+    /// Every string in `value`, at any depth, scrubbed in place. Its keys
+    /// are names, and kept.
+    pub fn value(&mut self, value: &mut Value) {
+        match value {
+            Value::String(text) => *text = self.text(text),
+            Value::Array(items) => {
+                for item in items {
+                    self.value(item);
+                }
+            }
+            Value::Object(fields) => {
+                for field in fields.values_mut() {
+                    self.value(field);
+                }
+            }
+            _ => {}
+        }
+    }
 
+    /// `m` as it is printed: its words, the question it answers and the
+    /// reply it follows scrubbed. Where it was said is not words, and kept.
     pub fn message(&mut self, m: &Message) -> Message {
-        m.clone()
+        let mut m = m.clone();
+        m.text = self.text(&m.text);
+        if let Some(question) = &mut m.question {
+            *question = self.text(question);
+        }
+        if let Some(reply) = &mut m.reply {
+            reply.text = self.text(&reply.text);
+        }
+        m
     }
 
+    /// What is said on stderr when any token was redacted: how many, and
+    /// by which rule.
     pub fn said(&self) -> Option<String> {
-        None
+        let rules = self
+            .0
+            .iter()
+            .map(|(rule, n)| format!("{rule} {n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        (self.total() > 0).then(|| {
+            format!(
+                "{} redacted ({rules})",
+                crate::render::many(self.total(), "secret-looking token")
+            )
+        })
+    }
+
+    fn add(&mut self, rule: &'static str) {
+        *self.0.entry(rule).or_default() += 1;
+    }
+
+    /// PEM private key blocks, whole: to their end line, else to the end.
+    fn private_keys(&mut self, text: &str) -> String {
+        const BEGIN: &str = "-----BEGIN ";
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(begin) = rest.find(BEGIN) {
+            let Some(label) = rest[begin + BEGIN.len()..].find("-----") else {
+                break;
+            };
+            let header_end = begin + BEGIN.len() + label + "-----".len();
+            if !rest[begin..header_end].contains("PRIVATE KEY") {
+                out.push_str(&rest[..header_end]);
+                rest = &rest[header_end..];
+                continue;
+            }
+            out.push_str(&rest[..begin]);
+            out.push_str(REDACTED);
+            self.add("private_key");
+            let after = &rest[header_end..];
+            rest = after
+                .find("-----END ")
+                .and_then(|end| {
+                    let label = end + "-----END ".len();
+                    after[label..]
+                        .find("-----")
+                        .map(|close| &after[label + close + "-----".len()..])
+                })
+                .unwrap_or("");
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// Every run of token bytes that looks like a secret, on its own or
+    /// after the word before it.
+    fn tokens(&mut self, text: &str) -> String {
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let (mut copied, mut i) = (0, 0);
+        let mut previous: Option<(usize, usize)> = None;
+        while i < bytes.len() {
+            if !token_byte(bytes[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < bytes.len() && token_byte(bytes[i]) {
+                i += 1;
+            }
+            // Base64 padding is the token's, unless more of a token follows
+            // it (`key=value`).
+            let mut end = i;
+            while end < bytes.len() && bytes[end] == b'=' {
+                end += 1;
+            }
+            if end < bytes.len() && token_byte(bytes[end]) {
+                end = i;
+            }
+            i = end;
+            // A sentence's full stop is not the token's.
+            let mut stop = end;
+            while stop > start && bytes[stop - 1] == b'.' {
+                stop -= 1;
+            }
+            let run = &text[start..stop];
+            let after = previous.map(|(s, e)| (&text[s..e], &text[e..start]));
+            if let Some((len, rule)) = secret(run, after) {
+                out.push_str(&text[copied..start]);
+                out.push_str(REDACTED);
+                copied = start + len;
+                self.add(rule);
+            }
+            previous = Some((start, stop));
+        }
+        out.push_str(&text[copied..]);
+        out
     }
 }
 
-pub fn report(_report: &mut Report) -> Redactions {
-    Redactions::default()
+/// What a usage command prints of transcripts' and a wrapper's words,
+/// scrubbed in place: the report's warnings, each session's limitations,
+/// and the wrapper session records linked to it, which hold what a session
+/// was asked and handed over. Usage records carry no words.
+pub fn report(report: &mut Report) -> Redactions {
+    let mut found = Redactions::default();
+    found.lines(&mut report.warnings);
+    for session in &mut report.sessions {
+        found.lines(&mut session.limitations);
+        for record in &mut session.ohjaa {
+            found.value(record);
+        }
+    }
+    found
+}
+
+/// The bytes a token is made of (all ASCII, so a run of them always starts
+/// and ends on a character boundary).
+fn token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'/' | b'~')
+}
+
+/// How much of `run` is a secret, if any, and the rule that says so: a
+/// known key prefix, a JWT, a key of a vendor not named by its shape, or a
+/// long mixed token right after a word that names a secret (`after`: that
+/// word, and what stands between).
+fn secret(run: &str, after: Option<(&str, &str)>) -> Option<(usize, &'static str)> {
+    let head = &run[..run
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+        .unwrap_or(run.len())];
+    if AWS_EXAMPLES.contains(&run) || AWS_EXAMPLES.contains(&head) || signed_evidence(run) {
+        return None;
+    }
+    let base64url = |part: &str| {
+        part.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    let parts: Vec<&str> = run.split('.').collect();
+    if run.starts_with("eyJ")
+        && parts.len() == 3
+        && parts.iter().all(|p| p.len() >= 10 && base64url(p))
+    {
+        return Some((run.len(), "jwt"));
+    }
+    if let Some(rule) = known_prefix(head) {
+        return Some((head.len(), rule));
+    }
+    // A key of a vendor not named here, alone: an id and a secret joined by
+    // a dot, or a long token mixing capitals, lower case and digits.
+    if dotted_key(run) {
+        return Some((run.len(), "id_and_secret"));
+    }
+    if mixes_cases_and_digits(run) {
+        return Some((run.len(), "mixed_token"));
+    }
+    let (word, between) = after?;
+    let separated = (1..=4).contains(&between.len())
+        && between
+            .bytes()
+            .all(|b| matches!(b, b' ' | b'\t' | b':' | b'=' | b'"' | b'\''));
+    let mixed =
+        run.bytes().any(|b| b.is_ascii_digit()) && run.bytes().any(|b| b.is_ascii_alphabetic());
+    let distinct = run.bytes().collect::<BTreeSet<u8>>().len();
+    let long_and_mixed =
+        run.len() >= 16 && mixed && distinct >= 8 && !run.starts_with(['/', '~', '.']);
+    (separated && names_a_secret(word) && long_and_mixed).then_some((run.len(), "named_secret"))
+}
+
+/// The rule of a key that `head` (a run's leading letters, digits, `_` and
+/// `-`) opens with a vendor's prefix: OpenAI's `sk-` (`sk-proj-` among
+/// them) and Anthropic's `sk-ant-`; GitHub's `ghp_`, `gho_`, `ghu_`, `ghs_`,
+/// `ghr_` and `github_pat_`; Slack's `xoxb-`, `xoxp-`, `xoxa-` and
+/// `xoxs-`; AWS's `AKIA` and `ASIA` key ids; GitLab's `glpat-`; Google's
+/// `AIza`. Each needs a rest long enough to be a key.
+fn known_prefix(head: &str) -> Option<&'static str> {
+    let mixed = |s: &str| {
+        s.bytes().any(|b| b.is_ascii_digit()) && s.bytes().any(|b| b.is_ascii_alphabetic())
+    };
+    let alnum = |s: &str| s.bytes().all(|b| b.is_ascii_alphanumeric());
+    let aws = |s: &str| {
+        s.len() == 16
+            && s.bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    };
+    let prefixed = |prefix: &str, least: usize, ok: &dyn Fn(&str) -> bool| {
+        head.strip_prefix(prefix)
+            .is_some_and(|rest| rest.len() >= least && ok(rest))
+    };
+    if prefixed("sk-", 20, &mixed) {
+        return Some(if head.starts_with("sk-ant-") {
+            "anthropic"
+        } else {
+            "openai"
+        });
+    }
+    if ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"]
+        .iter()
+        .any(|p| prefixed(p, 30, &alnum))
+        || prefixed("github_pat_", 20, &mixed)
+    {
+        return Some("github");
+    }
+    if ["xoxb-", "xoxp-", "xoxa-", "xoxs-"]
+        .iter()
+        .any(|p| prefixed(p, 10, &mixed))
+    {
+        return Some("slack");
+    }
+    if prefixed("AKIA", 16, &aws) || prefixed("ASIA", 16, &aws) {
+        return Some("aws");
+    }
+    if prefixed("glpat-", 20, &mixed) {
+        return Some("gitlab");
+    }
+    if prefixed("AIza", 30, &|_| true) {
+        return Some("google");
+    }
+    None
+}
+
+/// `<hex, 24 or more>.<letters and digits, 12 or more>`: an id and a secret
+/// joined by a dot, as some providers issue keys (Z.ai's are `<32 hex>.<16
+/// letters and digits>`).
+fn dotted_key(run: &str) -> bool {
+    let parts: Vec<&str> = run.split('.').collect();
+    parts.windows(2).any(|pair| {
+        pair[0].len() >= 24
+            && pair[0].bytes().all(|b| b.is_ascii_hexdigit())
+            && pair[1].len() >= 12
+            && pair[1].bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+/// A signed evidence token: JSON in hex (`7b22` is `{"`), a dot, and a
+/// 64-byte Ed25519 signature in hex, as habitat writes its runtime evidence
+/// and proofs (`<payload hex>.<signature hex>`). It is shaped like an id and
+/// a secret, but it is evidence, and its signature is public: redacting it
+/// would destroy it.
+fn signed_evidence(run: &str) -> bool {
+    let hex = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
+    run.split_once('.').is_some_and(|(payload, signature)| {
+        payload.len() % 2 == 0
+            && payload
+                .get(..4)
+                .is_some_and(|open| open.eq_ignore_ascii_case("7b22"))
+            && hex(payload)
+            && signature.len() == 128
+            && hex(signature)
+    })
+}
+
+/// 32 or more characters with no space, two or more each of capitals, lower
+/// case letters and digits: what a key with no known prefix looks like. A
+/// hash or a UUID, in either case, is hex and is left alone. A path is
+/// judged by the pieces of its names (between `/`, `.`, `-` and `_`), so a
+/// long path, or a versioned or dated file name, made of short words is no
+/// key; a Codex rollout name has one capital besides. A long name with
+/// digits and capitals (`ProjectSettingsV2Controller3`) is redacted too.
+fn mixes_cases_and_digits(run: &str) -> bool {
+    let long_and_mixed = |part: &str| {
+        let count = |kind: fn(&u8) -> bool| part.bytes().filter(kind).count();
+        part.len() >= 32
+            && count(u8::is_ascii_uppercase) >= 2
+            && count(u8::is_ascii_lowercase) >= 2
+            && count(u8::is_ascii_digit) >= 2
+            && !part.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+    };
+    if run.starts_with(['/', '~', '.']) {
+        run.split(['/', '.', '-', '_']).any(long_and_mixed)
+    } else {
+        long_and_mixed(run)
+    }
+}
+
+/// `key`, `token`, `secret`, `password`, `passwd` or `bearer`, alone or
+/// ending a name (`api_key`, `GITHUB_TOKEN`, `apiKey`), never inside a word
+/// (`monkey`).
+fn names_a_secret(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    ["key", "token", "secret", "password", "passwd", "bearer"]
+        .iter()
+        .any(|name| {
+            lower.ends_with(name) && {
+                let cut = word.len() - name.len();
+                cut == 0
+                    || matches!(word.as_bytes()[cut - 1], b'_' | b'-' | b'.')
+                    || word.as_bytes()[cut].is_ascii_uppercase()
+                        && word.as_bytes()[cut - 1].is_ascii_lowercase()
+            }
+        })
 }
 
 #[cfg(test)]

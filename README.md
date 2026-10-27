@@ -414,7 +414,9 @@ so memory holds one transcript at a time:
 ],
 "sessions":[{"agent":"claude","id":"claude-demo","parent":null,"subagent":false,"started_at":"2026-09-30T09:00:00Z","cwd":"/demo/widget","source":"/path/to/claude-demo.jsonl","headless":false,"messages":3}],
 "coverage":{"transcripts":1,"subagent_transcripts":0,"unmodified_transcripts":0,"user_turns":3,"human":3,"excluded":{},"since":null,"earlier":0,"undated":0,"gaps":[],"limitations":[]},
-"warnings":[]}
+"warnings":[],
+"redacted":0,
+"redacted_by_rule":{}}
 ```
 
 * A message names its `agent` and native `session` (a Claude subagent's is
@@ -454,8 +456,52 @@ so memory holds one transcript at a time:
   Codex fork after the sessions it was forked from; messages in file order.
 * A run that fails writes no partial document. One that fails before its
   first message leaves stdout empty; one that fails after ends the document
-  with `"error"` in place of `sessions`, `coverage` and `warnings`, so its
-  messages are only those read before the failure. Either way it exits 1.
+  with `"error"` in place of `sessions`, `coverage` and `warnings` (and
+  before `redacted`), so its messages are only those read before the
+  failure. Either way it exits 1.
+
+### Secrets are redacted
+
+What people paste to agents, and what tools print back, includes
+credentials. Every secret-looking token in what `messages` prints becomes
+`[redacted]`: in a message's `text`, the `question` it answers and its
+`reply`, and in the warnings, gaps and limitations said of its sources. The
+original is never printed, logged or kept. `redacted` counts the tokens
+redacted, and `redacted_by_rule` counts them by rule. The plain form says the
+same on stderr when any were (`vessa: 2 secret-looking tokens redacted
+(github 1, id_and_secret 1)`), counting only the words it prints. A message
+is scrubbed as it is printed, after it is read, so the rules below that tell
+a person's messages apart see the words as written.
+
+`--raw` prints the words as written, and says so on stderr; `redacted` and
+`redacted_by_rule` are then null. Nothing else turns the scrub off.
+
+| Rule | Redacts |
+| --- | --- |
+| `anthropic` | `sk-ant-` keys |
+| `openai` | other `sk-` keys, `sk-proj-` among them |
+| `github` | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` and `github_pat_` tokens |
+| `slack` | `xoxb-`, `xoxp-`, `xoxa-` and `xoxs-` tokens |
+| `aws` | `AKIA` and `ASIA` key ids |
+| `gitlab` | `glpat-` tokens |
+| `google` | `AIza` API keys |
+| `jwt` | Three base64url parts, the first opening `eyJ` |
+| `private_key` | A PEM `PRIVATE KEY` block, to its end line, else to the end |
+| `id_and_secret` | `<hex, 24 or more>.<letters and digits, 12 or more>`: an id and a secret joined by a dot, as Z.ai issues its keys (`<32 hex>.<16>`) |
+| `mixed_token` | 32 or more characters with two or more each of capitals, lower case letters and digits, and not hex; a path is judged by the pieces of its names |
+| `named_secret` | 16 or more mixed letters and digits right after a word that names a secret: `key`, `token`, `secret`, `password`, `passwd` or `bearer`, alone or ending a name (`api_key`, `GITHUB_TOKEN`, `apiKey`) |
+
+The rules are ohjaa intake's, which scrubs the prompt it sends to its
+drafter (`src/intake.rs` in false-systems/ohjaa), copied, since repositories
+stand alone. Two things shaped like secrets are not redacted: AWS's
+documented example keys (`AKIAIOSFODNN7EXAMPLE` and its secret), and signed
+evidence tokens, hex-encoded JSON, a dot and a 64-byte signature in hex
+(`7b22…` is `{"`), as habitat signs its runtime evidence: redacting one would
+destroy it. A hash, a UUID and a path made of short words are left alone;
+`mixed_token` also takes a long name that mixes capitals and digits, a loss
+the scrub accepts. On the local archive (2026-10-28) a default run redacted
+49 tokens in 5,713 messages and their replies: 46 `mixed_token`, 2
+`named_secret` and 1 `id_and_secret`.
 
 ### What counts as a person's message
 
@@ -551,7 +597,11 @@ question tool and 1 rejection reason. 2,701 of the Codex messages carry an id.
 ## Usage export
 
 Usage exports, receipts and reports carry no message text; only `messages`
-prints any. No sibling crate or binary is needed.
+prints any. What they do print of transcripts' and a wrapper's words is
+scrubbed of secrets by the same rules, always: their warnings and
+limitations, and the wrapper session records in exports and reports, which
+hold what a session was asked and handed over. stderr says how many tokens
+were redacted, when any were. No sibling crate or binary is needed.
 
 ```sh
 vessa usage --input /path/to/session.jsonl --json > /tmp/usage.private.json
