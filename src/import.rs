@@ -1792,6 +1792,7 @@ fn list(
                 truncated: turn.truncated,
                 failed: turn.failed,
                 line: turn.line,
+                redacted: Default::default(),
             });
             continue;
         }

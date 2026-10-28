@@ -190,6 +190,26 @@ impl Redactions {
     }
 }
 
+/// The end of a text, as a message carries the reply it follows.
+#[derive(Debug, Default)]
+pub struct Tail {
+    pub text: String,
+    /// The text was longer.
+    pub truncated: bool,
+    /// What was redacted in the part kept.
+    pub redacted: Redactions,
+}
+
+/// The last `chars` characters of `text`. Not yet scrubbed: cut as written.
+pub fn tail(text: &str, chars: usize) -> Tail {
+    let count = text.chars().count();
+    Tail {
+        text: text.chars().skip(count.saturating_sub(chars)).collect(),
+        truncated: count > chars,
+        redacted: Redactions::default(),
+    }
+}
+
 /// What a usage command prints of transcripts' and a wrapper's words,
 /// scrubbed in place: the report's warnings, each session's limitations,
 /// and the wrapper session records linked to it, which hold what a session
@@ -409,14 +429,37 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// A signed evidence token in the shape habitat writes one: JSON in hex
-    /// (`7b22` is `{"`), a dot, and a 64-byte signature in hex.
-    fn evidence() -> String {
+    /// The JSON of an evidence export, as habitat writes one (its
+    /// `export_evidence`, keys in order), with `extra` among the claims of
+    /// its one envelope.
+    fn export(extra: &str) -> String {
         format!(
-            "{}.{}",
-            hex(br#"{"schema":"demo-evidence","claim":"ran"}"#),
-            "5e0f".repeat(32)
+            r#"{{"anomalies":[],"effects":[],"evidence":[{{"claim_type":"effect_attempted","lease_generation":1,"observation_grade":"executor_observed","operation_id":"op-demo","payload":{{"effect_id":"eff-demo"{extra}}},"source":"habitat","source_identity":"executor-demo","timestamp":1793000000000,"version":1}}],"exported_at":1793000000500,"lease_generation":1,"operation_id":"op-demo","results":[],"status":"active","version":1}}"#
         )
+    }
+
+    /// A 64-byte signature in hex.
+    fn signature() -> String {
+        "5e0f".repeat(32)
+    }
+
+    /// A signed evidence token in the shape habitat writes one: the export's
+    /// JSON in hex (`7b22` is `{"`), a dot, and its signature in hex.
+    fn evidence() -> String {
+        format!("{}.{}", hex(export("").as_bytes()), signature())
+    }
+
+    /// `n` hex digits that follow no pattern a rule knows.
+    fn noise(n: usize) -> String {
+        let mut state: u64 = 0x5eed_0f0f_a11c_e5e5;
+        (0..n)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                char::from(b"0123456789abcdef"[(state % 16) as usize])
+            })
+            .collect()
     }
 
     fn scrub(text: &str) -> (String, Redactions) {
@@ -638,6 +681,179 @@ mod tests {
     }
 
     #[test]
+    fn only_an_evidence_export_that_holds_no_secret_is_kept() {
+        let github = fake(&["gh", "p_", &BODY[..36]]);
+        // A grant proof is an authorization: whoever holds it may use one
+        // right until it expires (habitat-proof's `ProofClaims`, signed on
+        // the same wire).
+        let grant = r#"{"version":2,"habitat_id":"hab-demo","key_id":"5e0f5e0f5e0f5e0f","grant_id":"grant-demo","operation_id":"op-demo","resource_id":"res-demo","right":"execute","issued_at_ms":1793000000000,"expires_at_ms":1793000030000,"nonce":"0a1b2c3d4e5f60718293a4b5c6d7e8f9"}"#;
+        for (what, token) in [
+            (
+                "hex that is no JSON",
+                format!("7b22{}.{}", noise(60), signature()),
+            ),
+            (
+                "an export holding a key",
+                format!(
+                    "{}.{}",
+                    hex(export(&format!(r#","note":"{github}""#)).as_bytes()),
+                    signature()
+                ),
+            ),
+            (
+                "an id and a secret with 7b22 in front",
+                fake(&["7b22", &noise(28), ".", "Xk9Qm2Lp7RtA4nWz"]),
+            ),
+            (
+                "a grant proof",
+                format!("{}.{}", hex(grant.as_bytes()), signature()),
+            ),
+            (
+                "JSON that is no object",
+                format!("{}.{}", hex(br#"["evidence",1]"#), signature()),
+            ),
+            (
+                "an object that declares nothing",
+                format!("{}.{}", hex(br#"{"claim":"ran"}"#), signature()),
+            ),
+        ] {
+            let (scrubbed, found) = scrub(&format!("here: {token} done"));
+            assert_eq!(scrubbed, "here: [redacted] done", "{what}");
+            assert_eq!(found.by_rule(), &one("id_and_secret"), "{what}");
+        }
+    }
+
+    #[test]
+    fn a_base64_secret_that_opens_with_a_slash_is_no_path() {
+        // About 1 in 64 AWS secret access keys (40 base64 characters) opens
+        // with `/`; each of these does.
+        const BASE64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut state: u64 = 0x0b5e_55ed_c0ff_ee01;
+        for _ in 0..100 {
+            let secret: String = std::iter::once('/')
+                .chain((0..39).map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    char::from(BASE64[(state % 64) as usize])
+                }))
+                .collect();
+            let (scrubbed, found) = scrub(&format!("aws_secret_access_key = {secret}"));
+            assert_eq!(scrubbed, "aws_secret_access_key = [redacted]");
+            assert_eq!(found.total(), 1);
+        }
+        // A path after a word that names a secret is still a path: it names
+        // a file, or its names are words.
+        for text in [
+            "key ~/.ssh/id_ed25519_github_2026",
+            "private_key: /etc/vessa/Keys2/deploy2.pem",
+            "token: /Users/demo/Library/ScrubTokens2/main2",
+        ] {
+            assert_eq!(
+                scrub(text),
+                (text.to_owned(), Redactions::default()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_joined_to_another_by_a_slash_or_a_dot_is_redacted_too() {
+        let github = fake(&["gh", "p_", &BODY[..36]]);
+        let zai = zai();
+        for text in [
+            format!("{github}/{zai}"),
+            format!("{github}.{zai}"),
+            format!("AKIAIOSFODNN7EXAMPLE/{BODY}"),
+            format!("AKIAIOSFODNN7EXAMPLE.{zai}"),
+            format!("https://api.example.com/v1/keys/{zai}"),
+        ] {
+            let (scrubbed, found) = scrub(&text);
+            assert!(found.total() > 0, "{text}");
+            for secret in [github.as_str(), &zai, &zai[33..], BODY] {
+                assert!(!scrubbed.contains(secret), "{scrubbed}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_key_split_by_a_character_a_terminal_hides_is_judged_as_shown() {
+        // A terminal is shown the text without control and bidirectional
+        // formatting characters, so a key split by one shows whole.
+        let key = fake(&["gh", "p_", &BODY[..36]]);
+        let (a, b) = key.split_at(20);
+        for hidden in [
+            '\u{0}', '\u{7}', '\u{1b}', '\r', '\t', '\u{202E}', '\u{2066}',
+        ] {
+            let (scrubbed, found) = scrub(&format!("use {a}{hidden}{b} now"));
+            assert_eq!(scrubbed, "use [redacted] now", "{hidden:?}");
+            assert_eq!(found.by_rule(), &one("github"), "{hidden:?}");
+        }
+        // Outside a key, what a terminal hides is kept; a line break still
+        // ends a token, as it ends a line.
+        let text = "a\u{7}b and \u{202E}c\nAb3dE5gH7jK9mN1p\nQ3sT5vW7yZ9bC1dF3hJ5";
+        assert_eq!(scrub(text), (text.to_owned(), Redactions::default()));
+    }
+
+    #[test]
+    fn a_tail_is_cut_from_the_scrubbed_text_never_inside_a_marker_or_a_token() {
+        // Short enough: whole, and scrubbed.
+        let key = zai();
+        let cut = tail(&format!("use {key} now"), 600);
+        assert_eq!(
+            (cut.text.as_str(), cut.truncated, cut.redacted.by_rule()),
+            ("use [redacted] now", false, &one("id_and_secret"))
+        );
+        // Cut anywhere through a key: no piece of it is kept, and the tail
+        // counts the markers it keeps.
+        let text = format!("Set it to {key} and the rest of the reply follows.");
+        let scrubbed = scrub(&text).0;
+        let token = |b: u8| b.is_ascii_alphanumeric() || b"_-.+/~".contains(&b);
+        for chars in 1..=text.chars().count() {
+            let cut = tail(&text, chars);
+            assert!(cut.text.chars().count() <= chars, "{chars}: {}", cut.text);
+            assert!(scrubbed.ends_with(&cut.text), "{chars}: {}", cut.text);
+            assert_eq!(cut.truncated, cut.text.len() < scrubbed.len());
+            for piece in key.as_bytes().windows(4) {
+                let piece = std::str::from_utf8(piece).unwrap();
+                assert!(!cut.text.contains(piece), "{chars}: {}", cut.text);
+            }
+            let start = scrubbed.len() - cut.text.len();
+            let marker = scrubbed.find(REDACTED).unwrap();
+            assert!(
+                !(marker < start && start < marker + REDACTED.len()),
+                "{chars}: {}",
+                cut.text
+            );
+            let bytes = scrubbed.as_bytes();
+            assert!(
+                start == 0
+                    || start == bytes.len()
+                    || !(token(bytes[start - 1]) && token(bytes[start])),
+                "{chars}: {}",
+                cut.text
+            );
+            assert_eq!(
+                cut.redacted.total(),
+                usize::from(cut.text.contains(REDACTED)),
+                "{chars}: {}",
+                cut.text
+            );
+        }
+        // A cut inside a word starts at the next one; between words, the
+        // tail is exactly the last characters.
+        assert_eq!(tail("alpha beta gamma", 8).text, " gamma");
+        assert_eq!(tail("alpha beta gamma", 6).text, " gamma");
+        assert_eq!(tail("alpha beta gamma", 10).text, "beta gamma");
+        // The word that names a secret may be cut off: its secret was
+        // redacted before the cut.
+        let value = &BODY[..24];
+        let cut = tail(&format!("api_key={value} done"), 15);
+        assert_eq!(cut.text, "[redacted] done");
+        assert_eq!(cut.redacted.by_rule(), &one("named_secret"));
+    }
+
+    #[test]
     fn a_scrubbed_text_scrubs_to_itself() {
         let text = format!(
             "use {} and {}, then {}",
@@ -700,6 +916,7 @@ mod tests {
                 truncated: false,
                 failed: false,
                 line: 2,
+                redacted: Redactions::default(),
             }),
             source: "/demo/claude-demo.jsonl".into(),
             line: 3,
@@ -714,5 +931,22 @@ mod tests {
             ("claude-demo", "/demo/widget", 3)
         );
         assert_eq!(found.by_rule(), &BTreeMap::from([("id_and_secret", 3)]));
+        // A reply scrubbed before it was cut is counted where it is printed,
+        // once each time.
+        let cut = tail(&format!("I set {key}."), 600);
+        let m = Message {
+            reply: Some(crate::model::Reply {
+                text: cut.text,
+                truncated: cut.truncated,
+                failed: false,
+                line: 2,
+                redacted: cut.redacted,
+            }),
+            ..m
+        };
+        let mut found = Redactions::default();
+        found.message(&m);
+        found.message(&m);
+        assert_eq!(found.by_rule(), &BTreeMap::from([("id_and_secret", 6)]));
     }
 }

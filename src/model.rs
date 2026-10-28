@@ -399,6 +399,10 @@ pub struct Reply {
     /// stop): the message answers a failure, not a reply.
     pub failed: bool,
     pub line: usize,
+    /// What was redacted in `text` before it was cut, to be counted where it
+    /// is printed.
+    #[serde(skip)]
+    pub redacted: crate::scrub::Redactions,
 }
 
 /// A session whose transcript `vessa messages` read.

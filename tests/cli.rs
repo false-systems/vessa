@@ -3252,22 +3252,29 @@ fn messages_lists_what_a_person_typed_with_the_reply_it_follows() {
     assert_eq!(v["sessions"][0]["messages"], 3);
     assert_eq!(v["sessions"][0]["headless"], false);
 
-    // A long reply travels as its last 600 characters.
-    let long = format!("{}END", "x".repeat(700));
-    let path = transcript(
-        "long-reply.jsonl",
-        &[
-            claude_user("u1", 0, "Explain the parser.".into()),
-            claude_reply("a1", 0, &long),
-            claude_user("u2", 1, "Shorter, please.".into()),
-        ],
-    );
-    let (v, _) = messages(&["--input", path.to_str().unwrap()]);
-    let reply = &v["messages"][1]["reply"];
-    assert_eq!(reply["text"].as_str().unwrap().chars().count(), 600);
-    assert!(reply["text"].as_str().unwrap().ends_with("END"));
-    assert_eq!(reply["truncated"], true);
-    std::fs::remove_file(path).unwrap();
+    // A long reply travels as its last 600 characters, from a word's start:
+    // a cut inside a word starts at the next.
+    for (long, kept) in [
+        (format!("{}ENDS", "word ".repeat(140)), 600),
+        (format!("{}END", "word ".repeat(140)), 599),
+    ] {
+        let path = transcript(
+            "long-reply.jsonl",
+            &[
+                claude_user("u1", 0, "Explain the parser.".into()),
+                claude_reply("a1", 0, &long),
+                claude_user("u2", 1, "Shorter, please.".into()),
+            ],
+        );
+        let (v, _) = messages(&["--input", path.to_str().unwrap()]);
+        let reply = &v["messages"][1]["reply"];
+        let text = reply["text"].as_str().unwrap();
+        assert_eq!(text.chars().count(), kept, "{text}");
+        assert!(text.starts_with(" word"), "{text}");
+        assert!(text.ends_with("END") || text.ends_with("ENDS"));
+        assert_eq!(reply["truncated"], true);
+        std::fs::remove_file(path).unwrap();
+    }
 
     // The plain form prints each message under the place it was said.
     let out = cli(&["messages", "--input", "examples/claude.jsonl"]);
@@ -4492,12 +4499,12 @@ fn fake_anthropic() -> String {
         "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5kL7",
     ])
 }
-/// A signed evidence token in the shape habitat writes one: JSON in hex
-/// (`7b22` is `{"`), a dot, and a 64-byte signature in hex. Evidence, not a
-/// secret.
+/// A signed evidence token in the shape habitat writes one: an evidence
+/// export's JSON in hex (`7b22` is `{"`), a dot, and a 64-byte signature in
+/// hex. Evidence, not a secret.
 fn evidence_token() -> String {
-    let payload: String =
-        br#"{"schema":"demo-evidence","claim":"ran"}"#.iter().map(|b| format!("{b:02x}")).collect();
+    let export = r#"{"anomalies":[],"effects":[],"evidence":[],"exported_at":1793000000500,"lease_generation":1,"operation_id":"op-demo","results":[],"status":"active","version":1}"#;
+    let payload: String = export.bytes().map(|b| format!("{b:02x}")).collect();
     format!("{payload}.{}", "5e0f".repeat(32))
 }
 
@@ -4726,4 +4733,188 @@ fn usage_commands_scrub_their_warnings_limitations_and_wrapper_records() {
         "{limitations}"
     );
     std::fs::remove_file(path).unwrap();
+}
+
+/// `row` stamped at second `n` of the session, so many rows can follow one
+/// another in time.
+fn at_second(mut row: Value, n: u32) -> Value {
+    row["timestamp"] = format!(
+        "2026-09-30T{:02}:{:02}:{:02}Z",
+        9 + n / 3600,
+        n / 60 % 60,
+        n % 60
+    )
+    .into();
+    row
+}
+
+#[test]
+fn a_reply_cut_through_a_secret_prints_no_part_of_it() {
+    // A reply travels as its last 600 characters. Wherever that cut falls,
+    // in a key or in the word that names one, no part of the secret is
+    // printed: the whole turn is scrubbed before it is cut, and the kept
+    // tail never starts inside a token or a [redacted].
+    let value = "Ab3dE5gH7jK9mN1pQ3sT5vW7".to_owned();
+    let cases = [
+        (fake_zai(), fake_zai()),
+        (fake_github(), fake_github()),
+        (format!("api_key={value}"), value),
+    ];
+    let pad = " and the reply goes on".repeat(30);
+    // From a cut before the prefix to one after what is said, every offset.
+    let lengths = |said: &str| (600 - said.len() - 10)..=600;
+    let mut rows = Vec::new();
+    let mut n = 0;
+    for (said, _) in &cases {
+        for rest in lengths(said) {
+            n += 1;
+            let reply = format!("Set it to {said}{}", &pad[..rest]);
+            rows.push(at_second(claude_reply(&format!("a{n}"), 0, &reply), n));
+            n += 1;
+            let next = claude_user(&format!("u{n}"), 0, format!("Next {n}.").into());
+            rows.push(at_second(next, n));
+        }
+    }
+    let path = transcript("cut-replies.jsonl", &rows);
+    let (v, code) = messages(&["--input", path.to_str().unwrap()]);
+    assert_eq!(code, Some(0));
+    let replies: Vec<&str> = v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["reply"]["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(replies.len(), rows.len() / 2);
+    let mut replies = replies.into_iter();
+    let mut held = 0;
+    for (said, secret) in &cases {
+        let mut whole = 0;
+        for rest in lengths(said) {
+            let reply = replies.next().unwrap();
+            assert!(reply.chars().count() <= 600, "{rest}: {reply}");
+            for piece in secret.as_bytes().windows(6) {
+                let piece = std::str::from_utf8(piece).unwrap();
+                assert!(!reply.contains(piece), "{rest}: {reply}");
+            }
+            let markers = reply.matches("[redacted]").count();
+            assert_eq!(reply.matches("redacted").count(), markers, "{reply}");
+            whole += markers;
+        }
+        assert!(whole > 0, "{said}");
+        held += whole;
+    }
+    // What is counted is what the kept tails hold.
+    assert_eq!(v["redacted"], held);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn a_key_split_by_a_character_a_terminal_hides_is_not_printed_joined() {
+    let key = fake_github();
+    let (a, b) = key.split_at(20);
+    let path = transcript(
+        "hidden-split.jsonl",
+        &[
+            claude_user("u1", 0, format!("use {a}\u{7}{b} now").into()),
+            claude_user("u2", 1, format!("then {a}\u{202E}{b}").into()),
+        ],
+    );
+    let input = path.to_str().unwrap();
+    let out = cli(&["messages", "--input", input]);
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    for piece in [key.as_str(), a, b] {
+        assert!(!stdout.contains(piece), "{stdout}");
+    }
+    assert!(stdout.contains("\n  use [redacted] now\n"), "{stdout}");
+    assert!(stdout.contains("\n  then [redacted]\n"), "{stdout}");
+    let (v, _) = messages(&["--input", input]);
+    assert_eq!(texts(&v), ["use [redacted] now", "then [redacted]"]);
+    assert_eq!(v["redacted"], 2);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn model_names_are_printed_scrubbed() {
+    // A model name comes from the transcript, or from the agent's status:
+    // printed scrubbed, as everything Vessa reads is.
+    let key = fake_github();
+    let record = serde_json::json!({"type":"assistant","uuid":"m1","requestId":"req_011Cmodel","sessionId":"claude-model","cwd":"/demo/widget","timestamp":"2026-09-30T09:01:00Z","message":{"id":"msg_011Cmodel","role":"assistant","model":key,"content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":5,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}});
+    let path = transcript("model-secret.jsonl", &[record]);
+    let input = path.to_str().unwrap();
+    for args in [
+        &["usage"][..],
+        &["usage", "--json"],
+        &["usage", "--by-agent"],
+        &["usage", "--by-agent", "--json"],
+        &["sessions", "--json"],
+        &["stats"],
+        &["stats", "--json"],
+        &["status"],
+        &["status", "--json"],
+        &["receipt"],
+    ] {
+        let out = cli(&[args, &["--input", input]].concat());
+        assert_ne!(out.status.code(), Some(1), "{args:?}");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(!stdout.contains(&key), "{args:?}: {stdout}");
+        assert!(!stderr.contains(&key), "{args:?}: {stderr}");
+        assert!(stdout.contains("[redacted]"), "{args:?}: {stdout}");
+    }
+    let html = temp("model-secret.html");
+    let out = cli(&[
+        "report",
+        "--input",
+        input,
+        "--output",
+        html.to_str().unwrap(),
+    ]);
+    assert_ne!(out.status.code(), Some(1));
+    let report = std::fs::read_to_string(&html).unwrap();
+    assert!(!report.contains(&key));
+    assert!(report.contains("[redacted]"));
+    std::fs::remove_file(html).unwrap();
+    std::fs::remove_file(path).unwrap();
+    // The status line cuts the names it shows: scrubbed before the cut.
+    let status = serde_json::json!({"session_id":"demo","model":{"display_name":format!("Demo {key}")},"cost":{"total_cost_usd":0.5}});
+    let out = statusline(status.to_string().into_bytes());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(!text.contains(&key), "{text}");
+    assert!(text.contains("Demo [redacted]"), "{text}");
+}
+
+#[test]
+fn an_error_vessa_prints_carries_no_secret() {
+    let key = fake_github();
+    for command in ["usage", "status", "messages"] {
+        let out = cli(&[
+            command,
+            "--input",
+            "examples/claude.jsonl",
+            "--session",
+            &key,
+        ]);
+        assert_eq!(out.status.code(), Some(1), "{command}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(!stderr.contains(&key), "{command}: {stderr}");
+        assert!(
+            stderr.contains("native session [redacted] not found"),
+            "{command}: {stderr}"
+        );
+    }
+    // --raw prints what messages reads as written, its errors too.
+    let out = cli(&[
+        "messages",
+        "--raw",
+        "--input",
+        "examples/claude.jsonl",
+        "--session",
+        &key,
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!("native session {key} not found")),
+        "{stderr}"
+    );
 }
