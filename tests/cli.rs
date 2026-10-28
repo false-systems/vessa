@@ -45,6 +45,42 @@ fn native_usage_is_not_double_counted() {
 }
 
 #[test]
+fn invalid_utf8_records_preserve_valid_transcript_evidence() {
+    let path = temp("invalid-utf8.jsonl");
+    let mut bytes = b"\xff\n".to_vec();
+    bytes.extend_from_slice(include_bytes!("../examples/pi.jsonl"));
+    bytes.extend_from_slice(b"\n{\"broken\":\"\xff\"}\n");
+    std::fs::write(&path, bytes).unwrap();
+    let output = cli(&["usage", "--input", path.to_str().unwrap(), "--json"]);
+    assert_eq!(output.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(v["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(v["sessions"][0]["usage"].as_array().unwrap().len(), 2);
+    assert_eq!(v["sessions"][0]["limitations"].as_array().unwrap().len(), 2);
+    let headers = value(cli(&[
+        "sessions",
+        "--headers",
+        "--input",
+        path.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(headers["sessions"].as_array().unwrap().len(), 1);
+    let messages = cli(&["messages", "--input", path.to_str().unwrap(), "--json"]);
+    assert_eq!(messages.status.code(), Some(4));
+    let messages: Value = serde_json::from_slice(&messages.stdout).unwrap();
+    assert_eq!(messages["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(messages["messages"][0]["line"], 4);
+    assert_eq!(
+        messages["coverage"]["limitations"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn malformed_data_is_partial_not_empty_success() {
     let path = temp("broken.jsonl");
     std::fs::write(
@@ -2199,8 +2235,8 @@ fn session_headers_differ_from_the_full_listing_only_where_documented() {
     assert_eq!(full["sessions"][0]["id"], "codex-later", "{full}");
     assert_eq!(headers["sessions"][0]["agent"], "pi", "{headers}");
     assert_eq!(headers["sessions"][0]["id"], "pi-first", "{headers}");
-    // Damage after the header: the full listing drops the transcript with a
-    // warning, headers list it, since they never read that far.
+    // Damage after the header: the full listing preserves the transcript
+    // with a limitation; headers list it without reading that far.
     let damaged = |name: &str, opening: &str| {
         let path = dir.join(name);
         let mut bytes = opening.as_bytes().to_vec();
@@ -2210,13 +2246,24 @@ fn session_headers_differ_from_the_full_listing_only_where_documented() {
     };
     let tail = damaged("damaged-tail.jsonl", &opening("claude-damaged"));
     let (full, headers, code) = both(&tail);
-    assert!(full["sessions"].as_array().unwrap().is_empty(), "{full}");
-    assert_eq!(full["warnings"].as_array().unwrap().len(), 2, "{full}");
+    assert_eq!(full["sessions"].as_array().unwrap().len(), 1, "{full}");
+    assert_eq!(full["sessions"][0]["id"], "claude-damaged");
+    assert!(full["sessions"][0]["limitations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| {
+            value
+                .as_str()
+                .unwrap()
+                .starts_with("line 2: malformed JSON:")
+        }));
+    assert_eq!(full["warnings"], serde_json::json!([]));
     assert_eq!(headers["sessions"][0]["id"], "claude-damaged");
     assert_eq!(headers["warnings"], serde_json::json!([]));
     assert_eq!(code, Some(0));
-    // So of two copies of one session, a damaged first copy gives the
-    // header; the full listing has only the second.
+    // A damaged first copy now supplies the header in both modes; valid
+    // records from the second copy are still merged into the full listing.
     let copies = dir.join("copies");
     std::fs::create_dir_all(&copies).unwrap();
     std::fs::rename(
@@ -2232,14 +2279,14 @@ fn session_headers_differ_from_the_full_listing_only_where_documented() {
     )
     .unwrap();
     let (full, headers, _) = both(copies.to_str().unwrap());
-    assert_eq!(full["sessions"][0]["cwd"], "/demo/other");
-    assert_eq!(full["sessions"][0]["started_at"], "2026-09-30T09:30:00Z");
-    assert_eq!(full["warnings"].as_array().unwrap().len(), 1, "{full}");
+    assert_eq!(full["sessions"][0]["cwd"], "/demo/widget");
+    assert_eq!(full["sessions"][0]["started_at"], "2026-09-30T09:00:00Z");
+    assert_eq!(full["warnings"], serde_json::json!([]));
     assert_eq!(headers["sessions"][0]["cwd"], "/demo/widget");
     assert_eq!(headers["sessions"][0]["started_at"], "2026-09-30T09:00:00Z");
     assert_eq!(headers["warnings"], serde_json::json!([]));
     let source = |v: &Value| v["sessions"][0]["source"].as_str().unwrap().to_owned();
-    assert!(source(&full).ends_with("b.jsonl"), "{full}");
+    assert!(source(&full).ends_with("a.jsonl"), "{full}");
     assert!(source(&headers).ends_with("a.jsonl"), "{headers}");
     std::fs::remove_dir_all(dir).unwrap();
 }

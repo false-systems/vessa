@@ -594,14 +594,14 @@ fn header_file(path: &Path) -> Result<Parsed> {
 fn header(path: &Path) -> Result<Session> {
     let file = BufReader::new(std::fs::File::open(path)?);
     let mut scan = Scan::default();
-    for line in file.lines() {
+    for line in file.split(b'\n') {
         let line = line?;
-        if line.trim().is_empty() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         // A malformed record is skipped, as `parse_file` skips it; saying so
         // is a usage limitation, which this reader does not report.
-        if let Ok(value) = serde_json::from_str::<Value>(&line) {
+        if let Ok(value) = serde_json::from_slice::<Value>(&line) {
             scan.observe(&value);
             if scan.settled() {
                 break;
@@ -815,12 +815,12 @@ fn parse_file(path: &Path) -> Result<Parsed> {
     let file = BufReader::new(std::fs::File::open(path)?);
     let mut records = Vec::new();
     let mut limitations = Vec::new();
-    for (index, line) in file.lines().enumerate() {
+    for (index, line) in file.split(b'\n').enumerate() {
         let line = line?;
-        if line.trim().is_empty() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        match serde_json::from_str::<Value>(&line) {
+        match serde_json::from_slice::<Value>(&line) {
             Ok(value) => records.push((index + 1, value)),
             Err(error) => limitations.push(format!("line {}: malformed JSON: {error}", index + 1)),
         }
@@ -1464,13 +1464,13 @@ fn turns(path: &Path, s: &Session, scrub: bool) -> Result<Turns> {
     // The questions Codex's question tool asked, by item id.
     let mut questions: HashMap<String, Value> = HashMap::new();
     let mut found = Vec::new();
-    for (index, line) in file.lines().enumerate() {
+    for (index, line) in file.split(b'\n').enumerate() {
         let line = line?;
-        if line.trim().is_empty() {
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         let number = index + 1;
-        let v: Value = match serde_json::from_str(&line) {
+        let v: Value = match serde_json::from_slice(&line) {
             Ok(v) => v,
             Err(error) => {
                 read.limitations
