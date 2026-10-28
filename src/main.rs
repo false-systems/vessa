@@ -3,6 +3,7 @@ mod import;
 mod metrics;
 mod model;
 mod render;
+mod scrub;
 mod work;
 
 use anyhow::{ensure, Context, Result};
@@ -76,12 +77,18 @@ enum Cmd {
     ClaudeStatusline,
     /// The messages people typed into agent sessions, each with the agent
     /// reply it follows; harness, tool, subagent and headless turns are
-    /// counted by rule, not listed. With --json: vessa-messages.v1.
+    /// counted by rule, not listed. Every secret-looking token in what is
+    /// printed becomes [redacted], and how many were is said. With --json:
+    /// vessa-messages.v1.
     Messages {
         /// Only messages from this time on: RFC 3339, a UTC date
         /// (YYYY-MM-DD), or an age such as 7d or 12h.
         #[arg(long)]
         since: Option<String>,
+        /// Print secret-looking tokens as written, not redacted; said on
+        /// stderr. Nothing else turns the scrub off.
+        #[arg(long)]
+        raw: bool,
     },
 }
 
@@ -125,12 +132,12 @@ fn run_once(cli: Cli) -> Result<i32> {
         println!("{}", metrics::claude_statusline(&input));
         return Ok(0);
     }
-    if let Cmd::Messages { since } = &cli.command {
+    if let Cmd::Messages { since, raw } = &cli.command {
         ensure!(
             cli.rates.is_none(),
             "--rates cannot be used with messages, which reads no usage to price"
         );
-        return messages(&cli, since.as_deref());
+        return messages(&cli, since.as_deref(), *raw);
     }
     if matches!(cli.command, Cmd::Status) {
         ensure!(
@@ -197,6 +204,10 @@ fn run_once(cli: Cli) -> Result<i32> {
         let rates: Vec<analysis::Rate> = serde_json::from_reader(std::fs::File::open(path)?)?;
         analysis::apply_rates(&mut report, &rates)?;
     }
+    // Every command below prints the report's warnings and limitations, and
+    // the report and exports its wrapper records: words from transcripts and
+    // a wrapper, scrubbed of secrets as `messages` scrubs its own.
+    let found = scrub::report(&mut report);
     // Imported names are untrusted terminal content, on stderr too.
     use render::for_terminal as clean;
     for warning in &report.warnings {
@@ -461,6 +472,9 @@ fn run_once(cli: Cli) -> Result<i32> {
             );
         }
     }
+    if let Some(said) = found.said() {
+        eprintln!("vessa: {said}");
+    }
     if incomplete && headers {
         // Headers read no usage, so they carry no limitations: only a
         // transcript that could not be read leaves the list partial.
@@ -614,7 +628,13 @@ impl<W: Write> Document<W> {
         Ok(())
     }
 
-    fn finish(&mut self, listing: &import::Listing) -> Result<()> {
+    /// Ends the document with what was read, and what was redacted (`found`;
+    /// None under `--raw`).
+    fn finish(
+        &mut self,
+        listing: &import::Listing,
+        found: Option<&scrub::Redactions>,
+    ) -> Result<()> {
         if self.written == 0 {
             write!(
                 self.out,
@@ -627,6 +647,7 @@ impl<W: Write> Document<W> {
         serde_json::to_writer(&mut self.out, &listing.coverage)?;
         write!(self.out, ",\n\"warnings\":")?;
         serde_json::to_writer(&mut self.out, &listing.warnings)?;
+        self.redacted(found)?;
         writeln!(self.out, "}}")?;
         self.out.flush()?;
         Ok(())
@@ -634,18 +655,44 @@ impl<W: Write> Document<W> {
 
     /// Ends a document the failure left open. Its messages are those read
     /// before it; without coverage, it says nothing of the rest.
-    fn fail(&mut self, error: &anyhow::Error) {
+    fn fail(&mut self, error: &anyhow::Error, mut found: Option<&mut scrub::Redactions>) {
         if self.written > 0 {
+            let error = format!("{error:#}");
+            let error = match found.as_deref_mut() {
+                Some(found) => found.text(&error),
+                None => error,
+            };
             let _ = write!(self.out, "\n],\n\"error\":");
-            let _ = serde_json::to_writer(&mut self.out, &format!("{error:#}"));
+            let _ = serde_json::to_writer(&mut self.out, &error);
+            let _ = self.redacted(found.as_deref());
             let _ = writeln!(self.out, "}}");
         }
         let _ = self.out.flush();
     }
+
+    /// How many secret-looking tokens the document's text had redacted, in
+    /// all and by rule; both null under `--raw`, which redacts nothing.
+    fn redacted(&mut self, found: Option<&scrub::Redactions>) -> Result<()> {
+        write!(self.out, ",\n\"redacted\":")?;
+        serde_json::to_writer(&mut self.out, &found.map(scrub::Redactions::total))?;
+        write!(self.out, ",\n\"redacted_by_rule\":")?;
+        serde_json::to_writer(&mut self.out, &found.map(scrub::Redactions::by_rule))?;
+        Ok(())
+    }
 }
 
-/// One message in the plain form: where it was said, then its text.
-fn plain(out: &mut impl Write, m: &model::Message) -> Result<()> {
+/// One message in the plain form: where it was said, then its text,
+/// scrubbed of secrets into `found` unless `--raw` (None). The reply and
+/// question are not printed here, so not counted.
+fn plain(
+    out: &mut impl Write,
+    m: &model::Message,
+    found: Option<&mut scrub::Redactions>,
+) -> Result<()> {
+    let text = match found {
+        Some(found) => std::borrow::Cow::Owned(found.text(&m.text)),
+        None => std::borrow::Cow::Borrowed(m.text.as_str()),
+    };
     let mut notes = String::new();
     if m.kind != "message" {
         notes.push_str(" · ");
@@ -666,14 +713,15 @@ fn plain(out: &mut impl Write, m: &model::Message) -> Result<()> {
         clean(&m.source),
         m.line,
     )?;
-    for line in m.text.lines() {
+    for line in text.lines() {
         writeln!(out, "  {}", clean(line))?;
     }
     Ok(())
 }
 
-/// `vessa messages`: each message is written as its transcript is read.
-fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
+/// `vessa messages`: each message is written as its transcript is read,
+/// with every secret-looking token in its words redacted unless `raw`.
+fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
     if let Some(agent) = &cli.agent {
         supported(agent)?;
     }
@@ -696,25 +744,40 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
             db.display()
         )
     });
+    // What is redacted, by rule; None under `--raw`, which redacts nothing.
+    // Each message is scrubbed as it is printed, after it was read, so the
+    // rules that tell a person's messages apart see the words as written.
+    let mut found = (!raw).then(scrub::Redactions::default);
+    if raw {
+        eprintln!("vessa: --raw: secret-looking tokens are printed as written, not redacted");
+    }
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     let listing = if cli.json {
         let mut doc = Document::new(&mut out);
-        match import::messages(&paths, &select, &mut |m| doc.message(m)) {
+        let read = import::messages(&paths, &select, !raw, &mut |m| match found.as_mut() {
+            Some(found) => doc.message(&found.message(m)),
+            None => doc.message(m),
+        });
+        match read {
             Ok(mut listing) => {
                 listing.coverage.gaps.extend(gaps);
                 listing.warnings.extend(not_installed);
-                doc.finish(&listing)?;
+                scrubbed(&mut listing, found.as_mut());
+                doc.finish(&listing, found.as_ref())?;
                 listing
             }
             Err(error) => {
-                doc.fail(&error);
+                doc.fail(&error, found.as_mut());
                 return Err(error);
             }
         }
     } else {
-        let mut listing = import::messages(&paths, &select, &mut |m| plain(&mut out, m))?;
+        let mut listing = import::messages(&paths, &select, !raw, &mut |m| {
+            plain(&mut out, m, found.as_mut())
+        })?;
         listing.coverage.gaps.extend(gaps);
         listing.warnings.extend(not_installed);
+        scrubbed(&mut listing, found.as_mut());
         let c = &listing.coverage;
         let rules = c
             .excluded
@@ -754,6 +817,12 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
     for limitation in &c.limitations {
         eprintln!("vessa: {}", clean(limitation));
     }
+    // The document says it in `redacted`; the plain form, here.
+    if let Some(said) = found.as_ref().and_then(scrub::Redactions::said) {
+        if !cli.json {
+            eprintln!("vessa: {said}");
+        }
+    }
     let gaps = listing.warnings.len() + c.gaps.len();
     if gaps + c.limitations.len() > 0 {
         eprintln!(
@@ -769,6 +838,22 @@ fn messages(cli: &Cli, from: Option<&str>) -> Result<i32> {
         return Ok(4);
     }
     Ok(0)
+}
+
+/// What `messages` says of its sources, which quotes paths, ids and model
+/// names from transcripts, scrubbed into `found` as the messages are;
+/// untouched under `--raw` (None).
+fn scrubbed(listing: &mut import::Listing, found: Option<&mut scrub::Redactions>) {
+    if let Some(found) = found {
+        let c = &mut listing.coverage;
+        found.lines(
+            listing
+                .warnings
+                .iter_mut()
+                .chain(&mut c.gaps)
+                .chain(&mut c.limitations),
+        );
+    }
 }
 
 /// The time of the latest usage record, so an old transcript is not taken
@@ -788,10 +873,20 @@ fn json(value: &impl serde::Serialize) -> Result<()> {
 }
 
 fn main() {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    // An error can quote what was read, or typed: scrubbed of secrets as
+    // the rest is, unless `messages --raw` asked for the words as written.
+    let raw = matches!(cli.command, Cmd::Messages { raw: true, .. });
+    match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("vessa: {}", render::for_terminal(&format!("{e:#}")));
+            let error = format!("{e:#}");
+            let error = if raw {
+                error
+            } else {
+                scrub::Redactions::default().text(&error)
+            };
+            eprintln!("vessa: {}", render::for_terminal(&error));
             std::process::exit(1)
         }
     }
@@ -824,18 +919,34 @@ mod tests {
         let mut doc = Document::new(&mut out);
         doc.message(&message("Run the checks.")).unwrap();
         doc.message(&message("Then commit.")).unwrap();
-        doc.fail(&anyhow::anyhow!("transcript vanished"));
+        let mut found = scrub::Redactions::default();
+        let key = ["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"].concat();
+        doc.fail(
+            &anyhow::anyhow!("transcript vanished after {key}"),
+            Some(&mut found),
+        );
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["schema"], "vessa-messages.v1");
         assert_eq!(v["messages"].as_array().unwrap().len(), 2);
-        assert_eq!(v["error"], "transcript vanished");
+        assert_eq!(v["error"], "transcript vanished after [redacted]");
+        assert_eq!(v["redacted"], 1);
+        assert_eq!(v["redacted_by_rule"], serde_json::json!({"github": 1}));
         assert!(v.get("coverage").is_none());
+        // Under --raw, nothing is redacted, and the document says it counted
+        // nothing.
+        let mut out = Vec::new();
+        let mut doc = Document::new(&mut out);
+        doc.message(&message("Run the checks.")).unwrap();
+        doc.fail(&anyhow::anyhow!("transcript vanished"), None);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert!(v["redacted"].is_null());
+        assert!(v["redacted_by_rule"].is_null());
     }
 
     #[test]
     fn a_failure_before_any_message_leaves_nothing() {
         let mut out = Vec::new();
-        Document::new(&mut out).fail(&anyhow::anyhow!("no such session"));
+        Document::new(&mut out).fail(&anyhow::anyhow!("no such session"), None);
         assert!(out.is_empty());
     }
 }

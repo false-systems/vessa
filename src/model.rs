@@ -361,7 +361,7 @@ pub fn receipt(family: &Family) -> Result<serde_json::Value> {
 
 /// One message a person typed into an agent session: a record of
 /// `vessa-messages.v1`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Message {
     pub agent: String,
     /// The native session id; a Claude subagent's is `<session>/<agentId>`.
@@ -399,6 +399,10 @@ pub struct Reply {
     /// stop): the message answers a failure, not a reply.
     pub failed: bool,
     pub line: usize,
+    /// What was redacted in `text` before it was cut, to be counted where it
+    /// is printed.
+    #[serde(skip)]
+    pub redacted: crate::scrub::Redactions,
 }
 
 /// A session whose transcript `vessa messages` read.

@@ -414,7 +414,9 @@ so memory holds one transcript at a time:
 ],
 "sessions":[{"agent":"claude","id":"claude-demo","parent":null,"subagent":false,"started_at":"2026-09-30T09:00:00Z","cwd":"/demo/widget","source":"/path/to/claude-demo.jsonl","headless":false,"messages":3}],
 "coverage":{"transcripts":1,"subagent_transcripts":0,"unmodified_transcripts":0,"user_turns":3,"human":3,"excluded":{},"since":null,"earlier":0,"undated":0,"gaps":[],"limitations":[]},
-"warnings":[]}
+"warnings":[],
+"redacted":0,
+"redacted_by_rule":{}}
 ```
 
 * A message names its `agent` and native `session` (a Claude subagent's is
@@ -430,8 +432,9 @@ so memory holds one transcript at a time:
   `answer`: a person's own answer to the agent's question tool, with the
   `question` it answers. `rejection`: the reason a person gave for rejecting
   a tool call. `task`: the task a person typed into a launch prompt.
-* `reply` is the agent turn it follows in its transcript: the last 600
-  characters of its text, with `truncated` and `line`. `failed` says the turn
+* `reply` is the agent turn it follows in its transcript: at most the last
+  600 characters of its text, from the start of a word, with `truncated` and
+  `line`. The turn is scrubbed of secrets whole before it is cut (see below). `failed` says the turn
   was a Claude API error, a Codex error event or a pi error stop: the message
   answers a failure, so "try again" there is a retry, not a correction. Null
   when no agent turn came before.
@@ -454,8 +457,70 @@ so memory holds one transcript at a time:
   Codex fork after the sessions it was forked from; messages in file order.
 * A run that fails writes no partial document. One that fails before its
   first message leaves stdout empty; one that fails after ends the document
-  with `"error"` in place of `sessions`, `coverage` and `warnings`, so its
-  messages are only those read before the failure. Either way it exits 1.
+  with `"error"` in place of `sessions`, `coverage` and `warnings` (and
+  before `redacted`), so its messages are only those read before the
+  failure. Either way it exits 1.
+
+### Secrets are redacted
+
+What people paste to agents, and what tools print back, includes
+credentials. Every secret-looking token in what `messages` prints becomes
+`[redacted]`: in a message's `text`, the `question` it answers and its
+`reply`, and in the warnings, gaps and limitations said of its sources. A
+reply is scrubbed whole before it is cut to its last 600 characters, and the
+part kept starts at a word, never inside a token or a `[redacted]`: so a cut
+never leaves a piece of a key, or a secret without the word that named it.
+The rules judge a text as a terminal shows it, without the control and
+bidirectional formatting characters it drops, so a key split by one is
+redacted whole. The original is never printed, logged or kept. `redacted`
+counts the tokens redacted, and `redacted_by_rule` counts them by rule. The
+plain form says the same on stderr when any were (`vessa: 2 secret-looking
+tokens redacted (github 1, id_and_secret 1)`), counting only the words it
+prints. A message is scrubbed as it is printed, after it is read, so the
+rules below that tell a person's messages apart see the words as written.
+
+`--raw` prints the words as written, and says so on stderr; `redacted` and
+`redacted_by_rule` are then null. Nothing else turns the scrub off.
+
+| Rule | Redacts |
+| --- | --- |
+| `anthropic` | `sk-ant-` keys |
+| `openai` | other `sk-` keys, `sk-proj-` among them |
+| `github` | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_` and `github_pat_` tokens |
+| `slack` | `xoxb-`, `xoxp-`, `xoxa-` and `xoxs-` tokens |
+| `aws` | `AKIA` and `ASIA` key ids |
+| `gitlab` | `glpat-` tokens |
+| `google` | `AIza` API keys |
+| `jwt` | Three base64url parts, the first opening `eyJ` |
+| `private_key` | A PEM `PRIVATE KEY` block, to its end line, else to the end |
+| `id_and_secret` | `<hex, 24 or more>.<letters and digits, 12 or more>`: an id and a secret joined by a dot, as Z.ai issues its keys (`<32 hex>.<16>`), alone or as one name of a path or URL |
+| `mixed_token` | 32 or more characters with two or more each of capitals, lower case letters and digits, and not hex; a path is judged by the pieces of its names |
+| `named_secret` | 16 or more mixed letters and digits right after a word that names a secret: `key`, `token`, `secret`, `password`, `passwd` or `bearer`, alone or ending a name (`api_key`, `GITHUB_TOKEN`, `apiKey`) |
+
+The rules are ohjaa intake's, which scrubs the prompt it sends to its
+drafter (`src/intake.rs` in false-systems/ohjaa), copied, since repositories
+stand alone. After a key's known prefix, the rest of its run, joined by `/` or
+`.`, is judged as a token of its own. A path, which `mixed_token` judges by
+its pieces and `named_secret` leaves alone, is a run that opens with `/`, `~`
+or `.` and names a file with an extension, or has two or more names made of
+words (in one case, short, or capitalised words run together): a base64
+secret can open with `/` too.
+
+Two things shaped like secrets are not redacted. AWS's documented example
+keys (`AKIAIOSFODNN7EXAMPLE` and its secret), each alone; one that opens a
+longer run is judged with it. And a signed evidence export, as habitat signs
+its runtime evidence: hex-encoded JSON (`7b22…` is `{"`), a dot and a 64-byte
+signature in hex, where the JSON is an object that declares itself an export
+(`version` 1, `evidence`, `exported_at` and `operation_id`, as vartio's
+verifier reads it) and holds nothing the rules redact. Redacting one would
+destroy evidence. Anything else on that wire is redacted, habitat's grant
+proofs among them: a grant proof authorizes whoever holds it, for up to 30 s.
+
+A hash, a UUID and a path made of words are left alone; `mixed_token` also
+takes a long name that mixes capitals and digits, and a path with a name that
+reads as no words, a loss the scrub accepts. On the local archive
+(2026-10-28) a default run redacted 54 tokens in 5,733 messages and their
+replies: 51 `mixed_token`, 2 `named_secret` and 1 `id_and_secret`.
 
 ### What counts as a person's message
 
@@ -551,7 +616,14 @@ question tool and 1 rejection reason. 2,701 of the Codex messages carry an id.
 ## Usage export
 
 Usage exports, receipts and reports carry no message text; only `messages`
-prints any. No sibling crate or binary is needed.
+prints any. What they do print of transcripts' and a wrapper's words is
+scrubbed of secrets by the same rules, always: their warnings and
+limitations, the wrapper session records in exports and reports, which hold
+what a session was asked and handed over, and the provider and model names
+usage records give, with the estimate's basis that quotes them. stderr says
+how many tokens were redacted, when any were. An error said on stderr is
+scrubbed too, by every command but `messages --raw`. No sibling crate or
+binary is needed.
 
 ```sh
 vessa usage --input /path/to/session.jsonl --json > /tmp/usage.private.json
