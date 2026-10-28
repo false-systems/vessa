@@ -102,8 +102,12 @@ pub fn history(report: &Report, period: Period) -> Result<Vec<Bucket>> {
 /// given here as null, and every field is unknown.
 pub fn claude_statusline(input: &serde_json::Value) -> String {
     // Source strings are untrusted terminal content; never emit control codes.
+    // They are scrubbed of secrets before they are cut, so a cut leaves no
+    // piece of one.
     let clean = |s: &str| {
-        s.chars()
+        crate::scrub::Redactions::default()
+            .text(s)
+            .chars()
             .filter(|c| crate::render::shown(*c))
             .take(100)
             .collect::<String>()

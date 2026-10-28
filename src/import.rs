@@ -1167,9 +1167,13 @@ pub struct Listing {
 /// `emit` as soon as its transcript is read, so memory holds one
 /// transcript's turns at a time. Transcripts are read in path order, a Codex
 /// fork after the session it was forked from.
+///
+/// With `scrub`, each reply is scrubbed of secrets before it is cut to its
+/// tail; the rest of a message is the caller's to scrub, as it prints it.
 pub fn messages(
     paths: &[PathBuf],
     select: &Selection,
+    scrub: bool,
     emit: &mut dyn FnMut(&Message) -> Result<()>,
 ) -> Result<Listing> {
     let mut warnings = Vec::new();
@@ -1275,7 +1279,8 @@ pub fn messages(
     let mut parents: HashMap<String, Vec<Vec<u64>>> = HashMap::new();
     for (path, s) in &headers {
         if s.agent == "codex" && wanted.contains(&s.id) && !work.iter().any(|(p, _)| p == &path) {
-            match turns(path, s) {
+            // Only its digests are wanted, which are of the words as written.
+            match turns(path, s, false) {
                 Ok(read) => parents
                     .entry(s.id.clone())
                     .or_default()
@@ -1287,7 +1292,7 @@ pub fn messages(
     let mut seen = std::collections::HashSet::new();
     let mut sessions: BTreeMap<(String, String), Conversation> = BTreeMap::new();
     for (path, s) in work {
-        let read = match turns(path, s) {
+        let read = match turns(path, s, scrub) {
             Ok(read) => read,
             Err(error) => {
                 warnings.push(format!("{}: {error:#}", path.display()));
@@ -1357,6 +1362,9 @@ struct Turn {
     question: Option<String>,
     /// Which of one record's answers this is.
     part: usize,
+    /// What was redacted in an agent turn's last characters, scrubbed
+    /// before they were cut.
+    redacted: crate::scrub::Redactions,
 }
 
 impl Turn {
@@ -1377,6 +1385,7 @@ impl Turn {
             kind: "message",
             question: None,
             part: 0,
+            redacted: Default::default(),
         }
     }
 
@@ -1389,23 +1398,38 @@ impl Turn {
         }
     }
 
-    /// An agent turn, or none for one without prose, such as a tool call.
+    /// An agent turn, or none for one without prose, such as a tool call:
+    /// whole, until [`turns`] cuts it as its record is read.
     fn agent(text: String, failed: bool) -> Option<Self> {
         if text.trim().is_empty() {
             return None;
         }
-        let count = text.chars().count();
         Some(Turn {
             user: false,
             failed,
             digest: Some(digest("assistant", &text)),
-            truncated: count > REPLY_TAIL,
-            text: text
-                .chars()
-                .skip(count.saturating_sub(REPLY_TAIL))
-                .collect(),
+            text,
             ..Turn::user(String::new(), None)
         })
+    }
+
+    /// An agent turn reduced to the last characters a message carries as its
+    /// reply: scrubbed whole first, unless `scrub` is off (`--raw`), so a
+    /// cut never splits a secret into pieces no rule knows (see
+    /// [`crate::scrub::tail`]).
+    fn cut(&mut self, scrub: bool) {
+        if scrub {
+            let tail = crate::scrub::tail(&self.text, REPLY_TAIL);
+            (self.text, self.truncated, self.redacted) = (tail.text, tail.truncated, tail.redacted);
+        } else {
+            let count = self.text.chars().count();
+            self.truncated = count > REPLY_TAIL;
+            self.text = self
+                .text
+                .chars()
+                .skip(count.saturating_sub(REPLY_TAIL))
+                .collect();
+        }
     }
 }
 
@@ -1425,8 +1449,10 @@ impl Turns {
     }
 }
 
-/// Reads a transcript's turns, one record at a time, keeping no record.
-fn turns(path: &Path, s: &Session) -> Result<Turns> {
+/// Reads a transcript's turns, one record at a time, keeping no record; an
+/// agent turn's text is cut to its tail as its record is read, scrubbed
+/// first when `scrub`.
+fn turns(path: &Path, s: &Session, scrub: bool) -> Result<Turns> {
     let file = BufReader::new(std::fs::File::open(path)?);
     let mut read = Turns::default();
     let (mut copying, mut exec, mut interactive) = (false, false, false);
@@ -1509,6 +1535,9 @@ fn turns(path: &Path, s: &Session) -> Result<Turns> {
             _ => found.extend(pi_turn(&v)),
         }
         for mut turn in found.drain(..) {
+            if !turn.user {
+                turn.cut(scrub);
+            }
             turn.line = number;
             turn.at = timestamp(&v);
             turn.copied = copying;
@@ -1792,7 +1821,7 @@ fn list(
                 truncated: turn.truncated,
                 failed: turn.failed,
                 line: turn.line,
-                redacted: Default::default(),
+                redacted: turn.redacted,
             });
             continue;
         }

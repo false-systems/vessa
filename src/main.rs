@@ -754,7 +754,7 @@ fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     let listing = if cli.json {
         let mut doc = Document::new(&mut out);
-        let read = import::messages(&paths, &select, &mut |m| match found.as_mut() {
+        let read = import::messages(&paths, &select, !raw, &mut |m| match found.as_mut() {
             Some(found) => doc.message(&found.message(m)),
             None => doc.message(m),
         });
@@ -772,8 +772,9 @@ fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
             }
         }
     } else {
-        let mut listing =
-            import::messages(&paths, &select, &mut |m| plain(&mut out, m, found.as_mut()))?;
+        let mut listing = import::messages(&paths, &select, !raw, &mut |m| {
+            plain(&mut out, m, found.as_mut())
+        })?;
         listing.coverage.gaps.extend(gaps);
         listing.warnings.extend(not_installed);
         scrubbed(&mut listing, found.as_mut());
@@ -872,10 +873,20 @@ fn json(value: &impl serde::Serialize) -> Result<()> {
 }
 
 fn main() {
-    match run(Cli::parse()) {
+    let cli = Cli::parse();
+    // An error can quote what was read, or typed: scrubbed of secrets as
+    // the rest is, unless `messages --raw` asked for the words as written.
+    let raw = matches!(cli.command, Cmd::Messages { raw: true, .. });
+    match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(e) => {
-            eprintln!("vessa: {}", render::for_terminal(&format!("{e:#}")));
+            let error = format!("{e:#}");
+            let error = if raw {
+                error
+            } else {
+                scrub::Redactions::default().text(&error)
+            };
+            eprintln!("vessa: {}", render::for_terminal(&error));
             std::process::exit(1)
         }
     }

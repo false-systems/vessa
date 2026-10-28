@@ -14,9 +14,10 @@
 //! since repositories stand alone: known key prefixes, JWTs, PEM private
 //! key blocks, an id and a secret joined by a dot, a long token mixing
 //! capitals, lower case and digits, and a long mixed token right after a
-//! word that names a secret. Vessa names each rule, and adds two
-//! exceptions that are no secret: AWS's documented example keys, and signed
-//! evidence tokens, which are evidence and would be destroyed.
+//! word that names a secret. Vessa names each rule, judges a text as a
+//! terminal shows it, and adds two exceptions that are no secret: AWS's
+//! documented example keys, and signed evidence exports that hold none,
+//! which are evidence and would be destroyed.
 
 use crate::model::{Message, Report};
 use serde_json::Value;
@@ -46,8 +47,11 @@ impl Redactions {
 
     /// `text` with every secret-looking token replaced by `[redacted]`.
     pub fn text(&mut self, text: &str) -> String {
-        let text = self.private_keys(text);
-        self.tokens(&text)
+        let (out, marks) = marked(text);
+        for (_, rule) in marks {
+            self.add(rule);
+        }
+        out
     }
 
     /// Each of `lines`, scrubbed in place.
@@ -85,7 +89,13 @@ impl Redactions {
             *question = self.text(question);
         }
         if let Some(reply) = &mut m.reply {
+            // A reply was scrubbed whole before it was cut (see [`tail`]):
+            // what that redacted in the part kept is counted here, where it
+            // is printed, each time it is.
             reply.text = self.text(&reply.text);
+            for (rule, n) in &reply.redacted.0 {
+                *self.0.entry(rule).or_default() += n;
+            }
         }
         m
     }
@@ -110,84 +120,6 @@ impl Redactions {
     fn add(&mut self, rule: &'static str) {
         *self.0.entry(rule).or_default() += 1;
     }
-
-    /// PEM private key blocks, whole: to their end line, else to the end.
-    fn private_keys(&mut self, text: &str) -> String {
-        const BEGIN: &str = "-----BEGIN ";
-        let mut out = String::with_capacity(text.len());
-        let mut rest = text;
-        while let Some(begin) = rest.find(BEGIN) {
-            let Some(label) = rest[begin + BEGIN.len()..].find("-----") else {
-                break;
-            };
-            let header_end = begin + BEGIN.len() + label + "-----".len();
-            if !rest[begin..header_end].contains("PRIVATE KEY") {
-                out.push_str(&rest[..header_end]);
-                rest = &rest[header_end..];
-                continue;
-            }
-            out.push_str(&rest[..begin]);
-            out.push_str(REDACTED);
-            self.add("private_key");
-            let after = &rest[header_end..];
-            rest = after
-                .find("-----END ")
-                .and_then(|end| {
-                    let label = end + "-----END ".len();
-                    after[label..]
-                        .find("-----")
-                        .map(|close| &after[label + close + "-----".len()..])
-                })
-                .unwrap_or("");
-        }
-        out.push_str(rest);
-        out
-    }
-
-    /// Every run of token bytes that looks like a secret, on its own or
-    /// after the word before it.
-    fn tokens(&mut self, text: &str) -> String {
-        let bytes = text.as_bytes();
-        let mut out = String::with_capacity(text.len());
-        let (mut copied, mut i) = (0, 0);
-        let mut previous: Option<(usize, usize)> = None;
-        while i < bytes.len() {
-            if !token_byte(bytes[i]) {
-                i += 1;
-                continue;
-            }
-            let start = i;
-            while i < bytes.len() && token_byte(bytes[i]) {
-                i += 1;
-            }
-            // Base64 padding is the token's, unless more of a token follows
-            // it (`key=value`).
-            let mut end = i;
-            while end < bytes.len() && bytes[end] == b'=' {
-                end += 1;
-            }
-            if end < bytes.len() && token_byte(bytes[end]) {
-                end = i;
-            }
-            i = end;
-            // A sentence's full stop is not the token's.
-            let mut stop = end;
-            while stop > start && bytes[stop - 1] == b'.' {
-                stop -= 1;
-            }
-            let run = &text[start..stop];
-            let after = previous.map(|(s, e)| (&text[s..e], &text[e..start]));
-            if let Some((len, rule)) = secret(run, after) {
-                out.push_str(&text[copied..start]);
-                out.push_str(REDACTED);
-                copied = start + len;
-                self.add(rule);
-            }
-            previous = Some((start, stop));
-        }
-        out.push_str(&text[copied..]);
-        out
-    }
 }
 
 /// The end of a text, as a message carries the reply it follows.
@@ -200,20 +132,48 @@ pub struct Tail {
     pub redacted: Redactions,
 }
 
-/// The last `chars` characters of `text`. Not yet scrubbed: cut as written.
+/// The last `chars` characters of `text`, as a message carries the reply
+/// it follows. The text is scrubbed whole before it is cut, so a cut never
+/// leaves a piece of a key no rule knows, or a secret without the word that
+/// named it. The part kept never starts inside a `[redacted]` or inside a
+/// token: a cut through a word starts at the next one.
 pub fn tail(text: &str, chars: usize) -> Tail {
-    let count = text.chars().count();
+    let (scrubbed, marks) = marked(text);
+    let count = scrubbed.chars().count();
+    let mut start = scrubbed
+        .char_indices()
+        .nth(count.saturating_sub(chars))
+        .map_or(scrubbed.len(), |(i, _)| i);
+    if let Some((at, _)) = marks
+        .iter()
+        .find(|(at, _)| *at < start && start < at + REDACTED.len())
+    {
+        start = at + REDACTED.len();
+    }
+    let bytes = scrubbed.as_bytes();
+    if start > 0 && start < bytes.len() && token_byte(bytes[start - 1]) && token_byte(bytes[start])
+    {
+        while start < bytes.len() && token_byte(bytes[start]) {
+            start += 1;
+        }
+    }
+    let mut redacted = Redactions::default();
+    for (_, rule) in marks.iter().filter(|(at, _)| *at >= start) {
+        redacted.add(rule);
+    }
     Tail {
-        text: text.chars().skip(count.saturating_sub(chars)).collect(),
-        truncated: count > chars,
-        redacted: Redactions::default(),
+        truncated: start > 0,
+        text: scrubbed[start..].to_owned(),
+        redacted,
     }
 }
 
 /// What a usage command prints of transcripts' and a wrapper's words,
 /// scrubbed in place: the report's warnings, each session's limitations,
-/// and the wrapper session records linked to it, which hold what a session
-/// was asked and handed over. Usage records carry no words.
+/// the wrapper session records linked to it, which hold what a session was
+/// asked and handed over, and the names its usage records give: the
+/// provider and model a transcript names, and the estimate's basis, which
+/// quotes them.
 pub fn report(report: &mut Report) -> Redactions {
     let mut found = Redactions::default();
     found.lines(&mut report.warnings);
@@ -221,6 +181,151 @@ pub fn report(report: &mut Report) -> Redactions {
         found.lines(&mut session.limitations);
         for record in &mut session.ohjaa {
             found.value(record);
+        }
+        for usage in &mut session.usage {
+            let entry = &mut usage.entry;
+            found.lines(
+                [&mut entry.provider, &mut entry.model]
+                    .into_iter()
+                    .chain(&mut entry.estimate_basis),
+            );
+        }
+    }
+    found
+}
+
+/// `text` with each secret-looking token replaced by `[redacted]`, and
+/// where each marker stands in what is returned, with its rule. The rules
+/// judge the text as a terminal shows it: without the control and
+/// bidirectional formatting characters [`crate::render::for_terminal`]
+/// drops, line breaks aside. So a key split by one is judged whole, and
+/// what hides inside it is replaced with it.
+fn marked(text: &str) -> (String, Vec<(usize, &'static str)>) {
+    let hidden = |c: char| c != '\n' && !crate::render::shown(c);
+    // Where each byte of what is shown stands in `text`, when anything is
+    // hidden.
+    let (shown, at): (std::borrow::Cow<str>, Option<Vec<usize>>) = if text.chars().any(hidden) {
+        let mut shown = String::with_capacity(text.len());
+        let mut at = Vec::with_capacity(text.len());
+        for (i, c) in text.char_indices().filter(|(_, c)| !hidden(*c)) {
+            shown.push(c);
+            at.extend(i..i + c.len_utf8());
+        }
+        (shown.into(), Some(at))
+    } else {
+        (text.into(), None)
+    };
+    let original = |offset: usize| at.as_ref().map_or(offset, |at| at[offset]);
+    let mut out = String::with_capacity(text.len());
+    let mut marks = Vec::new();
+    let mut copied = 0;
+    for (start, end, rule) in spans(&shown) {
+        out.push_str(&text[copied..original(start)]);
+        marks.push((out.len(), rule));
+        out.push_str(REDACTED);
+        copied = original(end - 1) + 1;
+    }
+    out.push_str(&text[copied..]);
+    (out, marks)
+}
+
+/// What looks secret in `text`, in order, as byte ranges with their rule:
+/// its PEM private key blocks, and the tokens around them.
+fn spans(text: &str) -> Vec<(usize, usize, &'static str)> {
+    let mut found = Vec::new();
+    let mut from = 0;
+    // The tokens before each block, and, after an empty last one, the rest.
+    let end = (text.len(), text.len());
+    for (begin, end) in private_keys(text).into_iter().chain([end]) {
+        found.extend(
+            tokens(&text[from..begin])
+                .into_iter()
+                .map(|(start, stop, rule)| (from + start, from + stop, rule)),
+        );
+        if begin < end {
+            found.push((begin, end, "private_key"));
+        }
+        from = end;
+    }
+    found
+}
+
+/// PEM private key blocks, whole: to their end line, else to the end.
+fn private_keys(text: &str) -> Vec<(usize, usize)> {
+    const BEGIN: &str = "-----BEGIN ";
+    let mut blocks = Vec::new();
+    let mut from = 0;
+    while let Some(found) = text[from..].find(BEGIN) {
+        let begin = from + found;
+        let Some(label) = text[begin + BEGIN.len()..].find("-----") else {
+            break;
+        };
+        let header_end = begin + BEGIN.len() + label + "-----".len();
+        if !text[begin..header_end].contains("PRIVATE KEY") {
+            from = header_end;
+            continue;
+        }
+        let end = text[header_end..]
+            .find("-----END ")
+            .and_then(|end| {
+                let label = header_end + end + "-----END ".len();
+                text[label..]
+                    .find("-----")
+                    .map(|close| label + close + "-----".len())
+            })
+            .unwrap_or(text.len());
+        blocks.push((begin, end));
+        from = end;
+    }
+    blocks
+}
+
+/// Every run of token bytes that looks like a secret, on its own or after
+/// the word before it, as byte ranges with their rule.
+fn tokens(text: &str) -> Vec<(usize, usize, &'static str)> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut i = 0;
+    let mut previous: Option<(usize, usize)> = None;
+    while i < bytes.len() {
+        if !token_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && token_byte(bytes[i]) {
+            i += 1;
+        }
+        // Base64 padding is the token's, unless more of a token follows it
+        // (`key=value`).
+        let mut end = i;
+        while end < bytes.len() && bytes[end] == b'=' {
+            end += 1;
+        }
+        if end < bytes.len() && token_byte(bytes[end]) {
+            end = i;
+        }
+        i = end;
+        // A sentence's full stop is not the token's.
+        let mut stop = end;
+        while stop > start && bytes[stop - 1] == b'.' {
+            stop -= 1;
+        }
+        let run = &text[start..stop];
+        let after = previous.map(|(s, e)| (&text[s..e], &text[e..start]));
+        previous = Some((start, stop));
+        let Some((len, rule)) = secret(run, after) else {
+            continue;
+        };
+        found.push((start, start + len, rule));
+        if len < run.len() {
+            // A key's known prefix opened the run: the rest of it, past what
+            // joins them (`/`, `.`), is judged as a token of its own.
+            previous = Some((start, start + len));
+            i = start + len;
+            while i < stop && !bytes[i].is_ascii_alphanumeric() {
+                i += 1;
+            }
         }
     }
     found
@@ -240,7 +345,7 @@ fn secret(run: &str, after: Option<(&str, &str)>) -> Option<(usize, &'static str
     let head = &run[..run
         .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
         .unwrap_or(run.len())];
-    if AWS_EXAMPLES.contains(&run) || AWS_EXAMPLES.contains(&head) || signed_evidence(run) {
+    if AWS_EXAMPLES.contains(&run) || signed_evidence(run) {
         return None;
     }
     let base64url = |part: &str| {
@@ -273,8 +378,7 @@ fn secret(run: &str, after: Option<(&str, &str)>) -> Option<(usize, &'static str
     let mixed =
         run.bytes().any(|b| b.is_ascii_digit()) && run.bytes().any(|b| b.is_ascii_alphabetic());
     let distinct = run.bytes().collect::<BTreeSet<u8>>().len();
-    let long_and_mixed =
-        run.len() >= 16 && mixed && distinct >= 8 && !run.starts_with(['/', '~', '.']);
+    let long_and_mixed = run.len() >= 16 && mixed && distinct >= 8 && !path(run);
     (separated && names_a_secret(word) && long_and_mixed).then_some((run.len(), "named_secret"))
 }
 
@@ -283,7 +387,8 @@ fn secret(run: &str, after: Option<(&str, &str)>) -> Option<(usize, &'static str
 /// them) and Anthropic's `sk-ant-`; GitHub's `ghp_`, `gho_`, `ghu_`, `ghs_`,
 /// `ghr_` and `github_pat_`; Slack's `xoxb-`, `xoxp-`, `xoxa-` and
 /// `xoxs-`; AWS's `AKIA` and `ASIA` key ids; GitLab's `glpat-`; Google's
-/// `AIza`. Each needs a rest long enough to be a key.
+/// `AIza`. Each needs a rest long enough to be a key. AWS's example key id
+/// is none, and a run it opens is judged whole.
 fn known_prefix(head: &str) -> Option<&'static str> {
     let mixed = |s: &str| {
         s.bytes().any(|b| b.is_ascii_digit()) && s.bytes().any(|b| b.is_ascii_alphabetic())
@@ -318,7 +423,7 @@ fn known_prefix(head: &str) -> Option<&'static str> {
     {
         return Some("slack");
     }
-    if prefixed("AKIA", 16, &aws) || prefixed("ASIA", 16, &aws) {
+    if (prefixed("AKIA", 16, &aws) || prefixed("ASIA", 16, &aws)) && !AWS_EXAMPLES.contains(&head) {
         return Some("aws");
     }
     if prefixed("glpat-", 20, &mixed) {
@@ -332,33 +437,121 @@ fn known_prefix(head: &str) -> Option<&'static str> {
 
 /// `<hex, 24 or more>.<letters and digits, 12 or more>`: an id and a secret
 /// joined by a dot, as some providers issue keys (Z.ai's are `<32 hex>.<16
-/// letters and digits>`).
+/// letters and digits>`), alone or as one name of a path or URL.
 fn dotted_key(run: &str) -> bool {
-    let parts: Vec<&str> = run.split('.').collect();
-    parts.windows(2).any(|pair| {
-        pair[0].len() >= 24
-            && pair[0].bytes().all(|b| b.is_ascii_hexdigit())
-            && pair[1].len() >= 12
-            && pair[1].bytes().all(|b| b.is_ascii_alphanumeric())
+    run.split('/').any(|name| {
+        let parts: Vec<&str> = name.split('.').collect();
+        parts.windows(2).any(|pair| {
+            pair[0].len() >= 24
+                && pair[0].bytes().all(|b| b.is_ascii_hexdigit())
+                && pair[1].len() >= 12
+                && pair[1].bytes().all(|b| b.is_ascii_alphanumeric())
+        })
     })
 }
 
-/// A signed evidence token: JSON in hex (`7b22` is `{"`), a dot, and a
-/// 64-byte Ed25519 signature in hex, as habitat writes its runtime evidence
-/// and proofs (`<payload hex>.<signature hex>`). It is shaped like an id and
-/// a secret, but it is evidence, and its signature is public: redacting it
-/// would destroy it.
+/// A signed evidence export, as habitat signs its runtime evidence
+/// (`<payload hex>.<signature hex>`, its `sign_evidence`): a 64-byte Ed25519
+/// signature in hex, over JSON in hex that declares itself an export, with
+/// the `version` 1, `evidence`, `exported_at` and `operation_id` vartio's
+/// verifier reads, and holds nothing a rule redacts. It is shaped like an
+/// id and a secret, but it is evidence, and redacting it would destroy it.
+/// Anything else on that wire is judged by the rules, and redacted: habitat
+/// signs its grant proofs on it too, which authorize whoever holds one for
+/// up to 30 s.
 fn signed_evidence(run: &str) -> bool {
-    let hex = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
-    run.split_once('.').is_some_and(|(payload, signature)| {
-        payload.len() % 2 == 0
-            && payload
-                .get(..4)
-                .is_some_and(|open| open.eq_ignore_ascii_case("7b22"))
-            && hex(payload)
-            && signature.len() == 128
-            && hex(signature)
-    })
+    let Some((payload, signature)) = run.split_once('.') else {
+        return false;
+    };
+    if signature.len() != 128 || !signature.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    let Some(json) = unhex(payload).and_then(|bytes| String::from_utf8(bytes).ok()) else {
+        return false;
+    };
+    let Ok(export) = serde_json::from_str::<Value>(&json) else {
+        return false;
+    };
+    export.is_object()
+        && export["version"] == 1
+        && export["evidence"].is_array()
+        && export["exported_at"].is_u64()
+        && export["operation_id"].is_string()
+        && marked(&json).1.is_empty()
+}
+
+/// The bytes `hex` spells, two digits each; none for what is not hex.
+fn unhex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
+}
+
+/// A path, not a key: a run that opens with `/`, `~` or `.` and names a file
+/// with an extension (`/etc/vessa/deploy.pem`), or has two or more names,
+/// each made of words (`~/.ssh/id_ed25519`). A base64 secret can open with
+/// `/` too, and has no extension, and seldom two names made of words.
+fn path(run: &str) -> bool {
+    if !run.starts_with(['/', '~', '.']) {
+        return false;
+    }
+    let names: Vec<&str> = run
+        .trim_start_matches('~')
+        .split('/')
+        .filter(|name| !name.is_empty())
+        .collect();
+    let extension = names
+        .last()
+        .and_then(|name| name.rsplit_once('.'))
+        .is_some_and(|(stem, extension)| {
+            !stem.is_empty()
+                && (1..=8).contains(&extension.len())
+                && extension.bytes().all(|b| b.is_ascii_alphanumeric())
+        });
+    extension
+        || names.len() >= 2
+            && names
+                .iter()
+                .all(|name| name.split(['.', '-', '_']).all(words))
+}
+
+/// Letters and digits that read as words, as names are written: short
+/// (`macOS`), in lower case, in capitals, or capitalised words run together
+/// (`ScrubTokens2`), capitals alone only at the end. Random letters and
+/// digits mix their cases in any order, and seldom pass.
+fn words(part: &str) -> bool {
+    let lower = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let upper = |b: &u8| b.is_ascii_uppercase() || b.is_ascii_digit();
+    let bytes = part.as_bytes();
+    if (bytes.len() <= 6 && bytes.iter().all(u8::is_ascii_alphanumeric))
+        || bytes.iter().all(lower)
+        || bytes.iter().all(upper)
+    {
+        return true;
+    }
+    // Words run together: a capital, then two or more lower case letters or
+    // digits, again; capitals alone only at the end.
+    let mut i = bytes.iter().take_while(|b| lower(b)).count();
+    while i < bytes.len() {
+        let capitals = bytes[i..]
+            .iter()
+            .take_while(|b| b.is_ascii_uppercase())
+            .count();
+        let rest = bytes[i + capitals..]
+            .iter()
+            .take_while(|b| lower(b))
+            .count();
+        let end = i + capitals == bytes.len();
+        if capitals == 0 || !(end || (capitals == 1 && rest >= 2)) {
+            return false;
+        }
+        i += capitals + rest;
+    }
+    true
 }
 
 /// 32 or more characters with no space, two or more each of capitals, lower
@@ -368,6 +561,7 @@ fn signed_evidence(run: &str) -> bool {
 /// long path, or a versioned or dated file name, made of short words is no
 /// key; a Codex rollout name has one capital besides. A long name with
 /// digits and capitals (`ProjectSettingsV2Controller3`) is redacted too.
+/// What is a path is [`path`]'s to say: opening with `/` is not enough.
 fn mixes_cases_and_digits(run: &str) -> bool {
     let long_and_mixed = |part: &str| {
         let count = |kind: fn(&u8) -> bool| part.bytes().filter(kind).count();
@@ -377,7 +571,7 @@ fn mixes_cases_and_digits(run: &str) -> bool {
             && count(u8::is_ascii_digit) >= 2
             && !part.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
     };
-    if run.starts_with(['/', '~', '.']) {
+    if path(run) {
         run.split(['/', '.', '-', '_']).any(long_and_mixed)
     } else {
         long_and_mixed(run)
