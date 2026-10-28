@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: arc-arm64
+    timeout-minutes: 15
+    env:
+      CARGO_TARGET_DIR: target
+      CARGO_BUILD_BUILD_DIR: target/build
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Keep aligned with rust-toolchain.toml; patch updates still float.
+          toolchain: "1.98"
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Exercise the binary on synthetic fixtures
+        run: >-
+          cargo run --locked -- usage
+          --input examples/claude.jsonl
+          --input examples/codex.jsonl
+          --input examples/pi.jsonl
+          --json
