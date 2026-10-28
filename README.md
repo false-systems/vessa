@@ -620,6 +620,12 @@ cargo run -- report --input examples/claude.jsonl --input examples/codex.jsonl -
 The fixtures are synthetic. No real transcripts, credentials or generated
 reports belong in this repository.
 
+GitHub Actions runs formatting, Clippy and tests on pull requests and pushes
+to `main`, using the existing self-hosted `arc-arm64` runner pool and the
+pinned Rust toolchain. A final smoke check runs the binary on the three
+synthetic agent fixtures. The job has read-only repository permissions and
+does not read native session directories or install a service.
+
 The token-only exports use `vessa-usage.v2`, `vessa-status.v2` and
 `vessa-statistics.v2` because spending fields were removed from v1. Consumers
 must check the schema. `agent-usage.v1` receipts retain their external contract
