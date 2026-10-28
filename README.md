@@ -1,7 +1,7 @@
 # Vessa
 
 Local evidence for what agent sessions consume.
-One Rust binary: native usage imports, spending reports, JSON exports
+One Rust binary: native usage imports, token summaries, JSON exports
 and a standalone HTML report. No database, daemon, JavaScript or
 network calls. Original files stay untouched.
 
@@ -32,7 +32,7 @@ Use `--agent claude|codex|pi` or `--session NATIVE-ID` to filter results.
 Missing `--input` paths, malformed records and unsupported formats are
 reported, not silently treated as zero. Exit 4 means the usage evidence is
 partial: a source warning or a session limitation, each printed to stderr, and
-a last line that counts them. Rate-card notices do not set it. Exit 1 means
+a last line that counts them. Exit 1 means
 the requested operation failed. Use the emitted limitations to judge coverage.
 
 ## Session display and statistics
@@ -65,7 +65,7 @@ usage is its session's usage:
 * `status` and `receipt` total the session with its subagents. Status says how
   many it included and shows each one; its JSON `entries` are that total, with
   `main_entries` and a `subagents` breakdown beside them (see
-  [`vessa-status.v1`](#vessa-statusv1)). Command windows stay the main
+  [`vessa-status.v2`](#vessa-statusv2)). Command windows stay the main
   transcript's.
 * The receipt says which subagents it includes in `limitations`, since
   `agent-usage.v1` has no field for them: how many, each by id up to ten, and
@@ -89,7 +89,7 @@ usage is its session's usage:
 
 A request is still counted once, however many transcripts hold it.
 
-### `vessa-status.v1`
+### `vessa-status.v2`
 
 `status --json` emits one session:
 
@@ -104,8 +104,7 @@ A request is still counted once, however many transcripts hold it.
 * `insights` (the main transcript's command windows), `limitations` (the
   session's, then each subagent's, named) and `warnings`.
 
-From here v1 only gains fields; a field that changes meaning takes a new
-schema name.
+The token-only status format is v2; v1 also carried spending fields.
 
 ### Codex subagents
 
@@ -159,7 +158,7 @@ wait for every usage record to be read. With `--json` it emits
   (Codex: `codex-tui`, or `codex_exec` for `codex exec`) say how a session was
   started, and are null when unknown or for other agents.
 
-Each field is the session's field of the same name in `vessa-usage.v1`, found
+Each field is the session's field of the same name in `vessa-usage.v2`, found
 by the same code, and the list holds the same sessions in the same order, with
 the same warnings. `--agent` and `--session` select as they do for `sessions`.
 
@@ -190,33 +189,25 @@ listings differ, and tests pin how:
   and the full listing the second copy's.
 
 No usage is read, so headers carry no limitations, and exit 4 means only a
-source warning: a transcript that could not be read. `--rates` is refused,
-before or after `sessions`.
+source warning: a transcript that could not be read.
 
 Status, HTML reports and usage JSON also show **command and change insights**.
 A command is a recorded user message and the usage up to the next user message;
 message bodies and tool arguments/output are never retained. Injected context
-can also appear as user messages. Each command shows usage, estimates, tool
+can also appear as user messages. Each command shows token usage, tool
 counts and elapsed time through its latest usage record. Where that time is
 unknown it says why: no usage was recorded in the command, the command or
 its usage records have no timestamp, or its last usage record is
 timestamped before it. Initial request usage
 is shown separately but remains included in totals; logs do not isolate the
-cost of starting context from that request's generation.
+tokens used by starting context from that request's generation.
 
 A change is an explicitly successful `apply_patch`, `Edit`, `Write`, `MultiEdit`,
 `edit` or `write` call. Its usage window starts after the previous successful
 edit result, or at command start, and ends at its result. These windows are
-included in command totals, not additional charges or causal allocation.
+included in command totals, not additional usage or causal allocation.
 Edits hidden inside shell commands or orchestration tools remain unmeasured;
 these are recorded operations, not verified surviving diffs or commits.
-
-**Estimated waste** is a low-confidence range: zero to the priced spending
-in a command with a recorded failed tool. A failure may be useful diagnosis,
-so the upper bound is not a claim that the spending was wasted. Missing prices
-or failure evidence leave waste unknown, not zero. No prompt classification
-or sibling product is involved. Source lines remain available in the JSON
-`insights` field and report. Try the synthetic example:
 
 ```sh
 cargo run -- status --input examples/work.jsonl
@@ -226,11 +217,8 @@ cargo run -- status --input examples/work.jsonl
 agent and model. Calendar periods are UTC; weeks use ISO week years. A session
 crossing a period boundary appears in both periods, with only that period's
 usage. Missing/invalid timestamps remain in an `undated` group. Each group
-says how many of its usage records are priced: a **known estimate subtotal**
-of those, or "no estimate" when none is, never $0. Unpriced usage is counted,
-not priced at zero. JSON emits `vessa-statistics.v1`, whose
-`priced_records` (beside `unpriced_records`) says how many records
-`known_estimated_usd_micros` sums; HTML reports include all four periods.
+shows token totals and the number of usage records. Unknown token categories
+stay null. JSON emits `vessa-statistics.v2`; HTML includes all four periods.
 Default scans cover selected local transcript files, not every account/device.
 
 Claude Code can call the Rust binary directly in `~/.claude/settings.json`:
@@ -239,33 +227,13 @@ Claude Code can call the Rust binary directly in `~/.claude/settings.json`:
 {"statusLine":{"type":"command","command":"~/.cargo/bin/vessa claude-statusline"}}
 ```
 
-This reads Claude's native session identity and running estimate on stdin and
-prints the session estimate first, separately from unknown actual billing.
-A second line shows the last API call's input, output, cache-read and
-cache-write tokens. These are not cumulative session counts; absent categories
-remain unknown, including before the first response or after compaction. A
-field it cannot read, such as a negative or impossibly large cost or a count
-sent as text, shows as unknown, and input that is not JSON shows every field
-unknown: the status line always prints and exits 0, so it never goes blank.
-It makes no model calls and displays no budgets, quotas or limits. Preserve
-any existing status-line customization when installing. See the official
+This reads Claude's native session identity and the last API call's input,
+output, cache-read and cache-write token counts from stdin. These are not
+cumulative session counts. Absent, negative or mistyped counts remain unknown.
+Invalid JSON shows every field as unknown; the status line always prints and
+exits 0. It makes no model calls and displays no spending, budgets, quotas or
+limits. Preserve existing status-line customization when installing. See the
 [Claude status-line contract](https://code.claude.com/docs/en/statusline).
-
-Codex's native `tui.status_line` supports input/output token counters and,
-where supplied by the account, estimated thread cost and thread credits. A
-missing account cost is not fabricated from tokens. Use `vessa status` with
-an explicit transcript and dated `--rates` for an external priced view. Pi
-already shows accumulated usage/cost in its footer and `/session`; its cost is
-still an estimate. Native display support differs by agent/account; this is
-not a universal live billing API. Vessa detects no correction patterns; a
-reader of `messages` does. Vessa does not call a whole session's spending waste.
-
-In Codex, use `/statusline` to move spending/token fields before long model and
-session labels; `/status` opens the native usage details. The footer supports
-native fields, not a Vessa shell-command renderer. Keep account-provided cost
-distinct from Vessa's rate-card estimate. In Pi, use its existing footer and
-`/session` rather than installing a second token counter. Vessa's full command
-breakdown remains available in its reports; it is not injected into agent prompts.
 
 ## Usage evidence
 
@@ -300,90 +268,13 @@ never adds a reasoning subcategory a second time.
   reported as a session limitation (exit 4) until a provider that reports writes
   settles it. Counters that predate the field record zero cache writes.
 * Pi: reads assistant, compaction, branch-summary and standalone usage entries.
-  Recorded costs are estimates. Copied entry IDs across forks are counted once,
+  Copied entry IDs across forks are counted once,
   with parent sessions processed first when available.
 
-Unknown counters and prices stay `null`. Agent-reported USD estimates,
-provider-specific credits, and billed currency amounts are different fields.
-No subscription bill is allocated to sessions implicitly. Native transcript
-imports do not establish actual plan consumption or invoice charges.
-
-`--rates FILE` accepts a JSON array of dated rate cards. See
-[`examples/rates.json`](examples/rates.json) for **synthetic** examples; these
-are not provider prices. Rates use integer USD millionths per million tokens,
-and require provider/model, an RFC3339 validity interval, and a source.
-
-* Each of `input`, `output`, `cache_read` and `cache_write` must be given; a
-  price that is unknown or ambiguous is `null`, never a guess. A record with
-  tokens in that category stays unpriced, and its `estimate_basis` says why;
-  one with none is priced, since zero tokens cost nothing at any price.
-* `prompt_over` and `prompt_up_to` (optional) limit a card to records whose
-  prompt, their input, cache-read and cache-write tokens together, is larger
-  than or at most that many tokens: a provider's long-context price is a card
-  of its own. A range that holds no prompt is refused. A record no card's
-  range covers stays unpriced.
-* A record that carries its source's own estimate (pi records its cost)
-  keeps it, with its basis, where no card prices it.
-* `notes` (optional) says what else the source says, or what the card leaves
-  out. Vessa does not read it.
-* Unknown token counts prevent repricing. Overlapping applicable rates fail.
-* A card that prices no selected usage record is named in a warning, with
-  why: no record of its provider and model, or none in its interval. So is
-  one that leaves records it covers unpriced, with how many and why. A card
-  whose records in its interval all have prompts outside its range, such as
-  a long-context card where no prompt was long, says nothing: it matched.
-  For each provider and model some card names, the records no card covers
-  are counted in a notice of their own: those dated outside every card for
-  it (an earlier price, or usage after the card was read), and those whose
-  prompt size no card for their date covers. Each such record's
-  `estimate_basis` says why. These notices concern pricing only and do not
-  make the output partial (exit 4).
-
-Keep plan multipliers, discounts and service tiers out of this simple API-rate
-estimate unless the supplied rate actually represents them.
-
-### A dated rate card
-
-[`rates/2026-10-27.json`](rates/2026-10-27.json) holds Anthropic's and
-OpenAI's list prices for the models Vessa saw in this machine's transcripts
-on 2026-10-27, read that day from the providers' own pages: Anthropic's
-[pricing](https://platform.claude.com/docs/en/about-claude/pricing) and
-[release notes](https://platform.claude.com/docs/en/release-notes/overview),
-OpenAI's [pricing](https://developers.openai.com/api/docs/pricing) and
-[changelog](https://developers.openai.com/api/docs/changelog). It is **an
-estimate, not a bill**: what the same tokens would cost on the API, at the
-standard tier, which a subscription plan does not charge.
-
-```sh
-vessa usage --rates rates/2026-10-27.json
-```
-
-* **Dated.** Each card ends when the prices were read. It starts at the
-  model's launch, or at its last price change, as the release notes or
-  changelog date them; a change dated a day leaves that whole day unpriced,
-  in any time zone, since the hour is not given. Earlier usage stays
-  unpriced, counted in a notice for its model. Re-read the pages and add
-  cards; never stretch one.
-* **Cache writes are unknown** for every model. Anthropic prices 5-minute and
-  1-hour writes differently, OpenAI 30-minute and 12-hour writes, and a
-  transcript's cache-write count does not say which. A Claude request that
-  wrote to the cache, which is nearly every one, stays unpriced. Codex
-  counters report no cache writes (older ones predate the field and are
-  counted as none), so Codex records are priced; if Codex leaves writes out,
-  those estimates are low.
-* **OpenAI's long context.** The page prices prompts up to 272K input tokens
-  apart from longer ones without saying whether K is 1,000 or 1,024: a prompt
-  between 272,000 and 278,528 tokens stays unpriced.
-* **Not priced:** fast and ultrafast modes, batch and flex, US-only or
-  regional processing, and cloud platforms. Claude Code records say they ran
-  at standard speed with global routing; Codex records do not say their
-  tier. `codex-auto-review` is on no pricing page, and pi's models are not
-  Claude or Codex: both stay unpriced.
-
-Model ids covered: `claude-opus-5-5`, `claude-sonnet-5-5` (two cards: its
-cache reads were cut on 2026-10-07), `claude-opus-4-8`, `gpt-5.5`,
-`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-6-astra` and
-`gpt-6.1-sol`, each OpenAI model with a short- and a long-context card.
+Unknown token counters stay `null`. Spending is not imported, calculated or
+displayed: no prices, rate cards, currency estimates, credits or billing fields.
+Legacy cost fields in native transcripts and linked wrapper receipts are ignored.
+`--rates` is no longer accepted.
 
 ## Messages
 
@@ -620,7 +511,7 @@ prints any. What they do print of transcripts' and a wrapper's words is
 scrubbed of secrets by the same rules, always: their warnings and
 limitations, the wrapper session records in exports and reports, which hold
 what a session was asked and handed over, and the provider and model names
-usage records give, with the estimate's basis that quotes them. stderr says
+usage records give. stderr says
 how many tokens were redacted, when any were. An error said on stderr is
 scrubbed too, by every command but `messages --raw`. No sibling crate or
 binary is needed.
@@ -629,10 +520,10 @@ binary is needed.
 vessa usage --input /path/to/session.jsonl --json > /tmp/usage.private.json
 ```
 
-`usage --json` and `sessions --json` emit `vessa-usage.v1`: `sessions` and
+`usage --json` and `sessions --json` emit `vessa-usage.v2`: `sessions` and
 `warnings`. Each session includes explicit `agent` and native `id`, source,
 lineage, limitations and request-level `usage`. Each usage record preserves
-source, line, time and its token/money `entry`. Optional `ohjaa` records are
+source, line, time and its token `entry`. Optional `ohjaa` records are
 explicitly linked wrapper context. This replaces the initial local
 `vessa-report.v1` export; consumers must check the schema. `--by-agent --json`
 is an aggregate view, not this exchange format.
@@ -651,7 +542,7 @@ show for one session. Without subagents the list is empty and the two totals
 are equal. Subagents remain sessions of their own in the export.
 
 A consumer joins by agent and native session ID only, never directory or time.
-Whole-session spending does not establish spending caused by a conversation
+Whole-session usage does not establish usage caused by a conversation
 pattern. Incomplete source coverage remains visible in the export and exit code.
 
 ## Wrapper handoff
@@ -680,11 +571,8 @@ Native agents do not emit this normalized receipt by themselves.
 ## UI and privacy
 
 The report's header and the `report:` line it prints count sessions as
-`stats` does, with their subagents apart; the header counts rate-card notices
-apart from source warnings. It starts with the known spending subtotal,
-priced/unpriced record coverage and sessions ranked by that subtotal, each
-with its subagents' spending. Rankings are not complete cost
-comparisons when prices are missing. Expand a command to see separate token
+`stats` does, with their subagents apart. It shows usage-record counts and
+session/subagent groupings. Expand a command to see separate token
 categories, tool/failure/edit counts and the source location; full evidence is
 still available below it. No prompt bodies are retained to label commands.
 
@@ -693,7 +581,7 @@ a wrapper, use the working set and handover it delivers, and refresh only when
 facts become stale. Use the receipt/export commands above to associate usage
 with an explicit wrapper session. These remain optional file exchanges, not
 runtime dependencies. Wrapper association does not prove savings: compare
-similar tasks, model/rates, token categories and verified outcomes before
+similar tasks, model, token categories and verified outcomes before
 making that claim. Do not remove safety instructions or validation to lower
 usage.
 
@@ -722,9 +610,14 @@ unlogged requests limit what a local transcript can establish.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-cargo run -- report --input examples/claude.jsonl --input examples/codex.jsonl --input examples/pi.jsonl --rates examples/rates.json --output /tmp/vessa-demo.html
+cargo run -- report --input examples/claude.jsonl --input examples/codex.jsonl --input examples/pi.jsonl --output /tmp/vessa-demo.html
 ```
 
-The fixtures are synthetic. No real transcripts, credentials, unsourced
-rates, or generated reports belong in this repository. A rate card in
-`rates/` names its source and the date it was read.
+The fixtures are synthetic. No real transcripts, credentials or generated
+reports belong in this repository.
+
+The token-only exports use `vessa-usage.v2`, `vessa-status.v2` and
+`vessa-statistics.v2` because spending fields were removed from v1. Consumers
+must check the schema. `agent-usage.v1` receipts retain their external contract
+with token fields only; optional money fields are omitted. Messages and session
+headers retain their existing schemas.

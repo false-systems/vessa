@@ -1,9 +1,9 @@
 repo:
   name: vessa
-  role: Local agent-session usage and spending accounting, and the one reader of agent conversations; imports native usage records, lists the messages people typed, and renders CLI, JSON exports and standalone HTML reports.
+  role: Local agent-session token usage accounting, and the one reader of agent conversations; imports native usage records, lists the messages people typed, and renders CLI, JSON exports and standalone HTML reports.
   not:
     - agent harness
-    - billing authority
+    - pricing or billing
     - knowledge authority
     - daemon
 context:
