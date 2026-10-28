@@ -182,11 +182,10 @@ listings differ, and tests pin how:
 * A file that holds records of two agents: the full listing takes the higher
   ranked header (Codex, then pi, then Claude), headers the first in the file
   that names its session.
-* Damage after the header, such as invalid UTF-8: the full listing drops the
-  transcript with a warning; headers list it, warning of nothing, since they
-  never read that far. So of two copies of one session, when the first by
-  path is damaged, headers give that copy's `started_at`, `cwd` and `source`,
-  and the full listing the second copy's.
+* Malformed records after the header, including invalid UTF-8: the full
+  listing preserves valid records and reports the damaged lines as limitations;
+  headers list the session without limitations, since they never read that
+  far. Both modes keep the first copy's header when copies are merged.
 
 No usage is read, so headers carry no limitations, and exit 4 means only a
 source warning: a transcript that could not be read.
@@ -284,6 +283,11 @@ from. Vessa is the one reader of agent conversations. It reads Claude Code,
 Codex and pi transcripts with the same discovery and headers as its other
 commands, and keeps nothing: no cache, no database. Text goes only to stdout,
 which inherits the permissions you give it.
+
+Malformed JSON records, including invalid UTF-8, are skipped without losing
+valid records elsewhere in the transcript. Usage and message readers report
+these gaps with their original line numbers and exit 4 (partial evidence);
+the header-only reader skips them while looking for a valid session header.
 
 ```sh
 cargo run -- messages --since 7d
