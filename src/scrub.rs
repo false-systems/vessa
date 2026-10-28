@@ -172,8 +172,7 @@ pub fn tail(text: &str, chars: usize) -> Tail {
 /// scrubbed in place: the report's warnings, each session's limitations,
 /// the wrapper session records linked to it, which hold what a session was
 /// asked and handed over, and the names its usage records give: the
-/// provider and model a transcript names, and the estimate's basis, which
-/// quotes them.
+/// provider and model a transcript names.
 pub fn report(report: &mut Report) -> Redactions {
     let mut found = Redactions::default();
     found.lines(&mut report.warnings);
@@ -184,11 +183,7 @@ pub fn report(report: &mut Report) -> Redactions {
         }
         for usage in &mut session.usage {
             let entry = &mut usage.entry;
-            found.lines(
-                [&mut entry.provider, &mut entry.model]
-                    .into_iter()
-                    .chain(&mut entry.estimate_basis),
-            );
+            found.lines([&mut entry.provider, &mut entry.model]);
         }
     }
     found

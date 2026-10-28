@@ -1,4 +1,3 @@
-mod analysis;
 mod import;
 mod metrics;
 mod model;
@@ -15,7 +14,7 @@ use std::path::PathBuf;
 #[command(
     name = "vessa",
     version,
-    about = "Local agent usage and spending evidence. Estimates are not bills."
+    about = "Local agent token usage and conversation evidence."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -29,9 +28,6 @@ struct Cli {
     /// Native session ID, not wrapper session ID.
     #[arg(long, global = true)]
     session: Option<String>,
-    /// Dated rate-card JSON array. No baked-in prices.
-    #[arg(long, global = true)]
-    rates: Option<PathBuf>,
     #[arg(long, global = true)]
     json: bool,
     /// Refresh in the foreground; for status, usage or stats. Ctrl-C stops it.
@@ -52,7 +48,7 @@ enum Cmd {
         #[arg(long)]
         headers: bool,
     },
-    /// Token categories and estimates by session/provider/model.
+    /// Token categories by session/provider/model.
     Usage {
         /// Sum deduplicated usage across native sessions for each agent/model.
         #[arg(long)]
@@ -133,10 +129,6 @@ fn run_once(cli: Cli) -> Result<i32> {
         return Ok(0);
     }
     if let Cmd::Messages { since, raw } = &cli.command {
-        ensure!(
-            cli.rates.is_none(),
-            "--rates cannot be used with messages, which reads no usage to price"
-        );
         return messages(&cli, since.as_deref(), *raw);
     }
     if matches!(cli.command, Cmd::Status) {
@@ -146,13 +138,6 @@ fn run_once(cli: Cli) -> Result<i32> {
         );
     }
     let headers = matches!(cli.command, Cmd::Sessions { headers: true });
-    // Checked here, not by clap: `--rates` is global, and given before the
-    // subcommand a clap conflict does not see it. Headers read no usage to
-    // price, and rate-card notices would read as source warnings.
-    ensure!(
-        !headers || cli.rates.is_none(),
-        "--rates cannot be used with sessions --headers, which reads no usage to price"
-    );
     let (paths, not_installed) = inputs(&cli)?;
     let mut report = if headers {
         import::headers(&paths)?
@@ -190,9 +175,7 @@ fn run_once(cli: Cli) -> Result<i32> {
             }
         );
     }
-    // Partial means the usage evidence itself is incomplete: a source warning
-    // or a session limitation. Rate-card notices added below concern pricing
-    // only; unpriced usage is already shown as such.
+    // Partial means a source warning or session limitation.
     let source_warnings = report.warnings.len();
     let limited = report
         .sessions
@@ -200,10 +183,6 @@ fn run_once(cli: Cli) -> Result<i32> {
         .filter(|s| !s.limitations.is_empty())
         .count();
     let incomplete = source_warnings > 0 || limited > 0;
-    if let Some(path) = cli.rates {
-        let rates: Vec<analysis::Rate> = serde_json::from_reader(std::fs::File::open(path)?)?;
-        analysis::apply_rates(&mut report, &rates)?;
-    }
     // Every command below prints the report's warnings and limitations, and
     // the report and exports its wrapper records: words from transcripts and
     // a wrapper, scrubbed of secrets as `messages` scrubs its own.
@@ -233,7 +212,7 @@ fn run_once(cli: Cli) -> Result<i32> {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 json(
-                    &serde_json::json!({"schema":"vessa-status.v1", "agent":s.agent,"session_id":s.id,"last_recorded_at":last_recorded,"entries":family.totals()?,"main_entries":model::aggregate(s)?,"subagents":subagents,"insights":work::summarize(s)?,"limitations":family.limitations(),"warnings":report.warnings}),
+                    &serde_json::json!({"schema":"vessa-status.v2", "agent":s.agent,"session_id":s.id,"last_recorded_at":last_recorded,"entries":family.totals()?,"main_entries":model::aggregate(s)?,"subagents":subagents,"insights":work::summarize(s)?,"limitations":family.limitations(),"warnings":report.warnings}),
                 )?;
             } else {
                 let n = family.subagents.len();
@@ -294,13 +273,13 @@ fn run_once(cli: Cli) -> Result<i32> {
             let buckets = metrics::history(&report, period)?;
             if cli.json {
                 json(
-                    &serde_json::json!({"schema":"vessa-statistics.v1","timezone":"UTC","buckets":buckets,"warnings":report.warnings,"limitations":report.sessions.iter().flat_map(|s| s.limitations.iter().map(move |l| format!("{}/{}: {l}",s.agent,s.id))).collect::<Vec<_>>() }),
+                    &serde_json::json!({"schema":"vessa-statistics.v2","timezone":"UTC","buckets":buckets,"warnings":report.warnings,"limitations":report.sessions.iter().flat_map(|s| s.limitations.iter().map(move |l| format!("{}/{}: {l}",s.agent,s.id))).collect::<Vec<_>>() }),
                 )?;
             } else {
-                println!("Calendar usage · UTC · selected local records · estimates are not bills");
+                println!("Calendar usage · UTC · selected local records");
                 for b in buckets {
                     println!(
-                        "{} {} · {}{} · {} of {} usage records priced · {}",
+                        "{} {} · {}{} · {} usage records",
                         b.period,
                         clean(&b.agent),
                         render::many(b.sessions, "session"),
@@ -309,15 +288,7 @@ fn run_once(cli: Cli) -> Result<i32> {
                         } else {
                             String::new()
                         },
-                        b.priced_records,
-                        b.priced_records + b.unpriced_records,
-                        match b.priced_records {
-                            0 => "no estimate".to_owned(),
-                            _ => format!(
-                                "known estimate subtotal={}",
-                                render::dollars(Some(b.known_estimated_usd_micros))
-                            ),
-                        },
+                        b.records,
                     );
                     for e in b.entries {
                         println!("  {}", render::usage_line(&e));
@@ -326,7 +297,7 @@ fn run_once(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Report { output } => {
-            let html = render::html(&report, source_warnings)?;
+            let html = render::html(&report)?;
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
@@ -370,7 +341,7 @@ fn run_once(cli: Cli) -> Result<i32> {
             if cli.json {
                 json(&totals)?;
             } else {
-                println!("Deduplicated agent totals · estimates are not bills");
+                println!("Deduplicated agent totals");
                 for (agent, entries) in totals {
                     println!("{}", clean(agent));
                     if entries.is_empty() {
@@ -449,7 +420,7 @@ fn run_once(cli: Cli) -> Result<i32> {
             }
         }
         Cmd::Usage { .. } => {
-            println!("Estimates are not bills. Input excludes cached tokens. Unknown is not zero.");
+            println!("Input excludes cached tokens. Unknown is not zero.");
             for s in &report.sessions {
                 println!("{} {}", clean(&s.agent), clean(&s.id));
                 let entries = model::aggregate(s)?;

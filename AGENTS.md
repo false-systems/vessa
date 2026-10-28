@@ -1,7 +1,7 @@
 # Vessa
 
 Rust only. Local usage accounting and reporting; no agent execution authority.
-Preserve source references and unknown values. Estimates are not bills.
+Preserve source references and unknown values. No spending features: do not import or calculate prices, currency estimates, credits or billing.
 Vessa is the one reader of agent conversations: `messages` lists what people
 typed, on demand, and keeps nothing. Everything Vessa prints of what was
 said is scrubbed of secret-looking tokens first (rules copied from ohjaa

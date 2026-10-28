@@ -33,7 +33,7 @@ pub fn headers(paths: &[PathBuf]) -> Result<Report> {
 /// readers start here, so they list the same sessions in the same order.
 fn sessions(paths: &[PathBuf], parse: fn(&Path) -> Result<Parsed>) -> (Report, Vec<Value>) {
     let mut report = Report {
-        schema: "vessa-usage.v1".into(),
+        schema: "vessa-usage.v2".into(),
         ..Default::default()
     };
     let files = transcripts(paths, &mut report.warnings);
@@ -51,7 +51,7 @@ fn sessions(paths: &[PathBuf], parse: fn(&Path) -> Result<Parsed>) -> (Report, V
         }
     }
     // Native IDs survive resume. Merge transcript copies, then deduplicate real
-    // request/message identities; never use equal text to deduplicate spending.
+    // request/message identities; never use equal text to deduplicate usage.
     let mut merged: BTreeMap<(String, String), Session> = BTreeMap::new();
     for session in report.sessions {
         let key = (session.agent.clone(), session.id.clone());
@@ -437,7 +437,28 @@ fn link(report: &mut Report, wrappers: Vec<Value>) {
                     .iter()
                     .any(|r| r["agent"] == session.agent && r["session_id"] == session.id)
             }) {
-                session.ohjaa.push(wrapper.clone());
+                let mut record = wrapper.clone();
+                // Old wrapper exports may carry spending fields. Preserve
+                // their token evidence, but do not re-export money data.
+                if let Some(receipts) = record["usage"].as_array_mut() {
+                    for receipt in receipts {
+                        if let Some(entries) = receipt["entries"].as_array_mut() {
+                            for entry in entries {
+                                if let Some(entry) = entry.as_object_mut() {
+                                    for key in [
+                                        "estimated_usd_micros",
+                                        "estimate_basis",
+                                        "billed",
+                                        "credits",
+                                    ] {
+                                        entry.remove(key);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                session.ohjaa.push(record);
             }
         }
     }
@@ -496,11 +517,6 @@ fn difference(old: &Entry, new: &Entry) -> String {
             "cache write",
             old.cache_write_tokens,
             new.cache_write_tokens,
-        ),
-        (
-            "estimate",
-            old.estimated_usd_micros,
-            new.estimated_usd_micros,
         ),
     ] {
         if a != b {
@@ -883,10 +899,6 @@ fn base(provider: String, model: String) -> Entry {
         output_tokens: None,
         cache_read_tokens: None,
         cache_write_tokens: None,
-        estimated_usd_micros: None,
-        estimate_basis: None,
-        credits: None,
-        billed: None,
     }
 }
 fn add(s: &mut Session, v: &Value, line: usize, id: String, entry: Entry) {
@@ -1130,14 +1142,6 @@ fn pi(
         entry.output_tokens = count(u, "output")?;
         entry.cache_read_tokens = count(u, "cacheRead")?;
         entry.cache_write_tokens = count(u, "cacheWrite")?;
-        if let Some(cost) = u["cost"]["total"].as_f64() {
-            ensure!(
-                cost.is_finite() && cost >= 0.0 && cost * 1_000_000.0 < u64::MAX as f64,
-                "invalid cost"
-            );
-            entry.estimated_usd_micros = Some((cost * 1_000_000.0).round() as u64);
-            entry.estimate_basis = Some("pi recorded model rates; not provider billing".into());
-        }
         add(s, v, line, id, entry);
     }
     Ok(())

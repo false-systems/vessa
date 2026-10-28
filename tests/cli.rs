@@ -29,27 +29,19 @@ fn value(output: Output) -> Value {
 }
 
 #[test]
-fn native_usage_is_not_double_counted_and_costs_are_not_bills() {
-    let v = value(cli(&[
-        "receipt",
-        "--input",
-        "examples/claude.jsonl",
-        "--rates",
-        "examples/rates.json",
-    ]));
+fn native_usage_is_not_double_counted() {
+    let v = value(cli(&["receipt", "--input", "examples/claude.jsonl"]));
     // Real Claude transcripts never name a provider; the source does.
     assert_eq!(v["entries"][0]["provider"], "anthropic");
     assert_eq!(v["entries"][0]["input_tokens"], 1200);
-    assert_eq!(v["entries"][0]["estimated_usd_micros"], 8715);
-    assert!(v["entries"][0]["billed"].is_null());
+
     let v = value(cli(&["receipt", "--input", "examples/codex.jsonl"]));
     assert_eq!(v["entries"][0]["input_tokens"], 800);
     assert_eq!(v["entries"][0]["cache_read_tokens"], 700);
     assert_eq!(v["entries"][0]["output_tokens"], 200);
-    assert!(v["entries"][0]["estimated_usd_micros"].is_null());
+
     let v = value(cli(&["receipt", "--input", "examples/pi.jsonl"]));
     assert_eq!(v["entries"][0]["input_tokens"], 220);
-    assert_eq!(v["entries"][0]["estimated_usd_micros"], 2200);
 }
 
 #[test]
@@ -122,8 +114,8 @@ fn html_is_private_escaped_and_evidence_links_resolve() {
 }
 
 #[test]
-fn report_explains_partial_spending_and_command_evidence() {
-    let path = temp("spending.html");
+fn report_explains_usage_and_command_evidence() {
+    let path = temp("usage.html");
     let output = cli(&[
         "report",
         "--input",
@@ -139,15 +131,8 @@ fn report_explains_partial_spending_and_command_evidence() {
         String::from_utf8_lossy(&output.stderr)
     );
     let html = std::fs::read_to_string(&path).unwrap();
-    assert!(html.contains("<strong>$0.002200</strong> known estimate subtotal"));
-    assert!(html.contains("<strong>2/4</strong> usage records priced"));
-    assert!(html.contains("<strong>2</strong> unpriced"));
-    let ranking = html
-        .split("Sessions by known estimate subtotal")
-        .nth(1)
-        .unwrap();
-    assert!(ranking.find("pi-demo").unwrap() < ranking.find("codex-demo").unwrap());
-    assert!(html.contains("Unpriced sessions can cost more"));
+
+    assert!(html.contains("<strong>4</strong> usage records"));
     assert!(html.contains("Command 1 ·"));
     assert!(html.contains("Uncached input</th>"));
     assert!(html.contains("Cached input read</th>"));
@@ -215,16 +200,16 @@ fn usage_export_has_no_conversation_payload() {
         "examples/claude.jsonl",
         "--json",
     ]));
-    assert_eq!(v["schema"], "vessa-usage.v1");
+    assert_eq!(v["schema"], "vessa-usage.v2");
     assert_eq!(v["sessions"][0]["totals"][0]["input_tokens"], 1200);
-    assert!(v["sessions"][0]["totals"][0]["estimated_usd_micros"].is_null());
+
     assert!(v["sessions"][0].get("messages").is_none());
     assert!(!v.to_string().contains("I already told you"));
     assert!(!cli(&["patterns"]).status.success());
 }
 
 #[test]
-fn forked_pi_history_is_not_new_spending() {
+fn forked_pi_history_is_not_new_usage() {
     let path = temp("fork.jsonl");
     let original = include_str!("../examples/pi.jsonl");
     let fork = original.replacen(
@@ -256,7 +241,7 @@ fn forked_pi_history_is_not_new_spending() {
 }
 
 #[test]
-fn missing_counts_are_not_free_and_rates_cannot_overlap() {
+fn missing_counts_stay_unknown() {
     let path = temp("missing.jsonl");
     std::fs::write(
         &path,
@@ -265,23 +250,6 @@ fn missing_counts_are_not_free_and_rates_cannot_overlap() {
     .unwrap();
     let v = value(cli(&["receipt", "--input", path.to_str().unwrap()]));
     assert!(v["entries"][0]["cache_read_tokens"].is_null());
-    std::fs::remove_file(path).unwrap();
-    let path = temp("rates.json");
-    let rates: Value = serde_json::from_str(include_str!("../examples/rates.json")).unwrap();
-    std::fs::write(
-        &path,
-        serde_json::to_vec(&vec![&rates[0], &rates[0]]).unwrap(),
-    )
-    .unwrap();
-    assert!(!cli(&[
-        "usage",
-        "--input",
-        "examples/claude.jsonl",
-        "--rates",
-        path.to_str().unwrap()
-    ])
-    .status
-    .success());
     std::fs::remove_file(path).unwrap();
 }
 
@@ -326,7 +294,7 @@ fn unrelated_pi_sessions_can_reuse_short_message_ids() {
         "--json",
     ]));
     assert_eq!(v["pi"][0]["input_tokens"], 440);
-    assert_eq!(v["pi"][0]["estimated_usd_micros"], 4400);
+
     std::fs::remove_file(path).unwrap();
 }
 
@@ -354,7 +322,7 @@ fn ohjaa_links_require_explicit_identity_and_agent_totals_stay_deduplicated() {
         "examples/pi.jsonl",
         "--json",
     ]));
-    assert_eq!(v["pi"][0]["estimated_usd_micros"], 2200);
+    assert_eq!(v["pi"][0]["input_tokens"], 220);
     std::fs::remove_file(path).unwrap();
 }
 
@@ -387,10 +355,12 @@ fn calendar_statistics_use_usage_time_utc_and_preserve_unknowns() {
         "--json",
     ]));
     assert_eq!(v["buckets"][0]["period"], "2025-12");
-    assert_eq!(v["buckets"][0]["known_estimated_usd_micros"], 1_250_000);
+
     assert_eq!(v["buckets"][1]["period"], "2026-01");
-    assert_eq!(v["buckets"][1]["unpriced_records"], 1);
-    assert!(v["buckets"][1]["entries"][0]["estimated_usd_micros"].is_null());
+    assert_eq!(v["buckets"][1]["records"], 1);
+    assert_eq!(v["buckets"][0]["entries"][0]["input_tokens"], 10);
+    assert_eq!(v["buckets"][2]["entries"][0]["input_tokens"], 30);
+
     assert_eq!(v["buckets"][2]["period"], "undated");
     let v = value(cli(&[
         "stats",
@@ -416,55 +386,6 @@ fn calendar_statistics_use_usage_time_utc_and_preserve_unknowns() {
 }
 
 #[test]
-fn stats_say_how_many_records_were_priced_and_no_estimate_when_none() {
-    let line = |args: &[&str]| {
-        let mut argv = vec!["stats", "--input", "examples/claude.jsonl"];
-        argv.extend(args);
-        let out = cli(&argv);
-        assert!(out.status.success());
-        String::from_utf8(out.stdout).unwrap()
-    };
-    let text = line(&["--rates", "examples/rates.json"]);
-    assert!(
-        text.contains("2026-09 claude · 1 session · 1 of 1 usage records priced · known estimate subtotal=$0.008715\n"),
-        "{text}"
-    );
-    // Nothing priced is no estimate, not $0.
-    let text = line(&[]);
-    assert!(
-        text.contains("2026-09 claude · 1 session · 0 of 1 usage records priced · no estimate\n"),
-        "{text}"
-    );
-    assert!(!text.contains("$0.000000"), "{text}");
-    let v = value(cli(&[
-        "stats",
-        "--input",
-        "examples/claude.jsonl",
-        "--json",
-    ]));
-    assert_eq!(v["buckets"][0]["priced_records"], 0);
-    assert_eq!(v["buckets"][0]["unpriced_records"], 1);
-    // The report says the same, in its overview, ranking and statistics.
-    let html = temp("no-estimate.html");
-    let out = cli(&[
-        "report",
-        "--input",
-        "examples/claude.jsonl",
-        "--output",
-        html.to_str().unwrap(),
-    ]);
-    assert!(out.status.success());
-    let page = std::fs::read_to_string(&html).unwrap();
-    assert!(page.contains("<strong>No estimate</strong>"), "{page}");
-    assert!(
-        page.contains("<td>0 of 1</td><td>no estimate</td>"),
-        "{page}"
-    );
-    assert!(!page.contains("$0.000000"), "{page}");
-    std::fs::remove_file(html).unwrap();
-}
-
-#[test]
 fn version_says_which_vessa_this_is() {
     for flag in ["--version", "-V"] {
         let out = cli(&[flag]);
@@ -481,7 +402,7 @@ fn live_status_requires_identity_and_watch_is_bounded_when_requested() {
     assert!(!cli(&["status"]).status.success());
     let v = value(cli(&["status", "--input", "examples/pi.jsonl", "--json"]));
     assert_eq!(v["session_id"], "pi-demo");
-    assert_eq!(v["entries"][0]["estimated_usd_micros"], 2200);
+
     let out = cli(&[
         "status",
         "--input",
@@ -506,7 +427,7 @@ fn live_status_requires_identity_and_watch_is_bounded_when_requested() {
 }
 
 #[test]
-fn native_claude_status_uses_estimate_not_limits_and_sanitizes_terminal_text() {
+fn native_claude_status_shows_tokens_and_sanitizes_terminal_text() {
     use std::io::Write;
     use std::process::Stdio;
     let mut child = Command::new(env!("CARGO_BIN_EXE_vessa"))
@@ -525,9 +446,7 @@ fn native_claude_status_uses_estimate_not_limits_and_sanitizes_terminal_text() {
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.contains("session estimate $4.45"));
-    assert!(text.contains("billed unknown"));
-    assert!(text.starts_with("session estimate $4.45"));
+
     assert!(text
         .contains("Last API call: input 120 · output 35 · cache read 400 · cache write unknown"));
     assert!(!text.contains('\u{1b}'));
@@ -560,37 +479,14 @@ fn claude_statusline_always_prints_and_says_unknown_for_what_it_cannot_read() {
     let realistic = serde_json::json!({"hook_event_name":"Status","session_id":"0a1b2c3d-demo","transcript_path":"/demo/t.jsonl","cwd":"/demo/widget","model":{"id":"demo-model-id","display_name":"Demo"},"workspace":{"current_dir":"/demo/widget","project_dir":"/demo/widget"},"version":"2.0.0","output_style":{"name":"default"},"cost":{"total_cost_usd":0.01234,"total_duration_ms":45000,"total_api_duration_ms":2300,"total_lines_added":156,"total_lines_removed":23},"context_window":{"current_usage":{"input_tokens":8500,"output_tokens":1200,"cache_creation_input_tokens":5000,"cache_read_input_tokens":2000}}});
     let out = statusline(realistic.to_string().into_bytes());
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8(out.stdout).unwrap(),
-        "session estimate $0.01 · billed unknown · Demo · 0a1b2c3d-demo\n\
-         Last API call: input 8500 · output 1200 · cache read 2000 · cache write 5000\n"
-    );
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "Demo · 0a1b2c3d-demo\nLast API call: input 8500 · output 1200 · cache read 2000 · cache write 5000\n");
 
     // Each field it cannot read is unknown, and the others still show.
     let broken = serde_json::json!({"session_id":"demo\u{7}\u{1b}]0;title","model":{"display_name":17,"id":"id\u{1b}[2J"},"cost":{"total_cost_usd":-1.5},"context_window":{"current_usage":{"input_tokens":"8500","output_tokens":-3,"cache_read_input_tokens":2.5,"cache_creation_input_tokens":40}}});
     let out = statusline(broken.to_string().into_bytes());
     assert_eq!(out.status.code(), Some(0));
-    assert_eq!(
-        String::from_utf8(out.stdout).unwrap(),
-        "session estimate unknown · billed unknown · id[2J · demo]0;title\n\
-         Last API call: input unknown · output unknown · cache read unknown · cache write 40\n"
-    );
-    // Negative zero is zero; an amount no session could cost is unknown.
-    for (cost, shown) in [
-        ("-0.0", "$0.00"),
-        ("0", "$0.00"),
-        ("18446744073709.5", "$18446744073709.50"),
-        ("1e14", "unknown"),
-        ("1e308", "unknown"),
-    ] {
-        let input = format!(r#"{{"session_id":"demo","cost":{{"total_cost_usd":{cost}}}}}"#);
-        let out = statusline(input.into_bytes());
-        let text = String::from_utf8(out.stdout).unwrap();
-        assert!(
-            text.starts_with(&format!("session estimate {shown} · ")),
-            "{cost}: {text}"
-        );
-    }
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "id[2J · demo]0;title\nLast API call: input unknown · output unknown · cache read unknown · cache write 40\n");
+
     for input in [
         br#"{"cost":{"total_cost_usd":"4.45"}}"#.to_vec(),
         br#"{"session_id":null,"model":null,"cost":7,"context_window":[]}"#.to_vec(),
@@ -604,12 +500,7 @@ fn claude_statusline_always_prints_and_says_unknown_for_what_it_cannot_read() {
         let out = statusline(input.clone());
         let label = String::from_utf8_lossy(&input[..input.len().min(40)]).into_owned();
         assert_eq!(out.status.code(), Some(0), "{label}");
-        assert_eq!(
-            String::from_utf8(out.stdout).unwrap(),
-            "session estimate unknown · billed unknown · unknown model · unknown session\n\
-             Last API call: input unknown · output unknown · cache read unknown · cache write unknown\n",
-            "{label}"
-        );
+        assert_eq!(String::from_utf8(out.stdout).unwrap(), "unknown model · unknown session\nLast API call: input unknown · output unknown · cache read unknown · cache write unknown\n", "{label}");
     }
 }
 
@@ -621,10 +512,7 @@ fn text_for_a_terminal_carries_no_bidi_or_control_characters() {
     let input = serde_json::json!({"session_id":"demo\u{202E}di","model":{"display_name":"De\u{2066}mo\u{2069}\u{200F}"},"cost":{"total_cost_usd":0.5}});
     let out = statusline(input.to_string().into_bytes());
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(
-        text.starts_with("session estimate $0.50 · billed unknown · Demo · demodi\n"),
-        "{text:?}"
-    );
+    assert!(text.starts_with("Demo · demodi\n"), "{text:?}");
     // A message and the place it was said, in the plain form.
     let mut row = claude_user("b1", 0, "Fix the \u{202E}parser\u{202C} now.".into());
     row["cwd"] = "/demo/\u{2066}widget\u{1b}[2J".into();
@@ -673,7 +561,7 @@ fn native_directory_metadata_is_not_misread_as_an_export() {
     std::fs::write(dir.join("session.meta.json"), "{\"agentType\":\"worker\"}").unwrap();
     let v = value(cli(&["stats", "--input", dir.to_str().unwrap(), "--json"]));
     assert!(v["warnings"].as_array().unwrap().is_empty());
-    assert_eq!(v["buckets"][0]["known_estimated_usd_micros"], 2200);
+
     assert_eq!(
         cli(&[
             "usage",
@@ -688,39 +576,21 @@ fn native_directory_metadata_is_not_misread_as_an_export() {
 }
 
 #[test]
-fn command_change_and_waste_windows_preserve_totals_unknowns_and_privacy() {
+fn command_and_change_windows_preserve_totals_unknowns_and_privacy() {
     let v = value(cli(&["status", "--input", "examples/work.jsonl", "--json"]));
-    assert_eq!(v["entries"][0]["estimated_usd_micros"], 7000);
+    assert_eq!(v["entries"][0]["input_tokens"], 700);
     let insights = &v["insights"];
-    assert_eq!(insights["initial_request"][0]["estimated_usd_micros"], 2000);
+    assert_eq!(insights["initial_request"][0]["input_tokens"], 200);
     assert_eq!(insights["commands"].as_array().unwrap().len(), 2);
     let first = &insights["commands"][0];
-    assert_eq!(first["entries"][0]["estimated_usd_micros"], 3000);
+    assert_eq!(first["entries"][0]["input_tokens"], 300);
+    assert_eq!(first["changes"][0]["entries"][0]["input_tokens"], 300);
     assert_eq!(first["elapsed_seconds"], 20);
     assert_eq!(first["failed_tools"], 1);
-    assert_eq!(
-        first["changes"][0]["entries"][0]["estimated_usd_micros"],
-        3000
-    );
-    assert_eq!(first["waste_upper_bound_usd_micros"], 3000);
-    assert!(insights["commands"][1]["waste_upper_bound_usd_micros"].is_null());
+
     assert!(insights["unattributed"].as_array().unwrap().is_empty());
     let export = value(cli(&["usage", "--input", "examples/work.jsonl", "--json"]));
     assert!(!export.to_string().contains("PRIVATE"));
-    let input = temp("unpriced-work.jsonl");
-    std::fs::write(
-        &input,
-        include_str!("../examples/work.jsonl").replace(",\"cost\":{\"total\":0.002}", ""),
-    )
-    .unwrap();
-    let v = value(cli(&[
-        "status",
-        "--input",
-        input.to_str().unwrap(),
-        "--json",
-    ]));
-    assert!(v["insights"]["commands"][0]["waste_upper_bound_usd_micros"].is_null());
-    std::fs::remove_file(input).unwrap();
     let html = temp("work.html");
     assert!(cli(&[
         "report",
@@ -733,7 +603,7 @@ fn command_change_and_waste_windows_preserve_totals_unknowns_and_privacy() {
     .success());
     let report = std::fs::read_to_string(&html).unwrap();
     assert!(report.contains("Command 1") && report.contains("Change 1"));
-    assert!(report.contains("$0 to $0.003000"));
+
     assert!(!report.contains("PRIVATE"));
     std::fs::remove_file(html).unwrap();
 }
@@ -1005,7 +875,7 @@ fn claude_synthetic_records_are_counted_as_no_usage_not_conflicts() {
         let v: Value = serde_json::from_slice(&output.stdout).unwrap();
         let session = &v["sessions"][0];
         assert!(session["limitations"].as_array().unwrap().is_empty());
-        // Known, and no usage: not a record, not a model, not a price gap.
+        // Known, and no usage: not a record, not a model, not a usage gap.
         assert_eq!(session["synthetic_records"], 2);
         assert_eq!(session["usage"].as_array().unwrap().len(), 1);
         assert_eq!(session["totals"].as_array().unwrap().len(), 1);
@@ -1070,7 +940,7 @@ fn claude_synthetic_records_are_counted_as_no_usage_not_conflicts() {
 }
 
 #[test]
-fn codex_provider_is_inferred_and_unused_rate_cards_warn() {
+fn codex_provider_is_inferred() {
     // Without model_provider, a Codex transcript is still OpenAI's.
     let path = temp("codex-no-provider.jsonl");
     std::fs::write(
@@ -1078,50 +948,10 @@ fn codex_provider_is_inferred_and_unused_rate_cards_warn() {
         include_str!("../examples/codex.jsonl").replace(",\"model_provider\":\"openai\"", ""),
     )
     .unwrap();
-    let v = value(cli(&[
-        "receipt",
-        "--input",
-        path.to_str().unwrap(),
-        "--rates",
-        "examples/rates.json",
-    ]));
+    let v = value(cli(&["receipt", "--input", path.to_str().unwrap()]));
     assert_eq!(v["entries"][0]["provider"], "openai");
-    assert_eq!(v["entries"][0]["estimated_usd_micros"], 3740);
-    std::fs::remove_file(path).unwrap();
 
-    // A rate card that prices nothing is named, not silently ignored.
-    let rates = temp("unused-rates.json");
-    let mut cards: Vec<Value> =
-        serde_json::from_str(include_str!("../examples/rates.json")).unwrap();
-    let mut unused = cards[0].clone();
-    unused["provider"] = "nobody".into();
-    cards.push(unused);
-    std::fs::write(&rates, serde_json::to_vec(&cards).unwrap()).unwrap();
-    let output = cli(&[
-        "usage",
-        "--input",
-        "examples/claude.jsonl",
-        "--rates",
-        rates.to_str().unwrap(),
-        "--json",
-    ]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let warnings = v["warnings"].as_array().unwrap();
-    // The Claude card priced the session; the OpenAI and "nobody" cards did not.
-    assert_eq!(v["sessions"][0]["totals"][0]["estimated_usd_micros"], 8715);
-    assert_eq!(warnings.len(), 2, "{warnings:?}");
-    assert!(warnings.iter().any(|w| w
-        .as_str()
-        .unwrap()
-        .starts_with("rate card nobody/demo-model")));
-    assert!(warnings
-        .iter()
-        .all(|w| w.as_str().unwrap().contains("priced no usage records")));
-    assert!(stderr.contains("rate card nobody/demo-model"));
-    // A pricing notice does not make the usage evidence partial.
-    assert_eq!(output.status.code(), Some(0));
-    std::fs::remove_file(rates).unwrap();
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -1307,29 +1137,16 @@ fn claude_provider_comes_from_response_ids_not_the_source() {
             row["requestId"] = request_id.into();
         }
         write_lines(&path, &[row]);
-        let output = cli(&[
-            "receipt",
-            "--input",
-            path.to_str().unwrap(),
-            "--rates",
-            "examples/rates.json",
-        ]);
+        let output = cli(&["receipt", "--input", path.to_str().unwrap()]);
         let v: Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(v["entries"][0]["provider"], expected, "{message_id}");
-        // Only Anthropic's own usage meets the anthropic rate card.
-        assert_eq!(
-            v["entries"][0]["estimated_usd_micros"].is_null(),
-            expected != "anthropic",
-            "{message_id}"
-        );
     }
     std::fs::remove_file(path).unwrap();
 }
 
 #[test]
-fn non_openai_codex_providers_are_never_priced_as_openai() {
-    // Codex can run against other providers; their usage must not meet an
-    // OpenAI rate card just because Codex is OpenAI's agent.
+fn non_openai_codex_providers_keep_their_identity() {
+    // Codex can run against other providers; preserve the stated provider.
     let path = temp("codex-ollama.jsonl");
     std::fs::write(
         &path,
@@ -1339,25 +1156,13 @@ fn non_openai_codex_providers_are_never_priced_as_openai() {
         ),
     )
     .unwrap();
-    let output = cli(&[
-        "usage",
-        "--input",
-        path.to_str().unwrap(),
-        "--rates",
-        "examples/rates.json",
-        "--json",
-    ]);
+    let output = cli(&["usage", "--input", path.to_str().unwrap(), "--json"]);
     assert_eq!(output.status.code(), Some(0));
     let v: Value = serde_json::from_slice(&output.stdout).unwrap();
     let totals = &v["sessions"][0]["totals"][0];
     assert_eq!(totals["provider"], "ollama");
     assert_eq!(totals["model"], "demo-codex");
-    assert!(totals["estimated_usd_micros"].is_null());
-    // The OpenAI card matched nothing here, and says so.
-    assert!(v["warnings"].as_array().unwrap().iter().any(|w| w
-        .as_str()
-        .unwrap()
-        .starts_with("rate card openai/demo-codex")));
+
     std::fs::remove_file(path).unwrap();
 }
 
@@ -1458,7 +1263,7 @@ fn a_claude_receipt_includes_the_sessions_subagents_and_says_so() {
         // The main transcript alone: its subagents live beside it.
         vec!["--input", main.to_str().unwrap()],
     ] {
-        let mut argv = vec!["receipt", "--rates", "examples/rates.json"];
+        let mut argv = vec!["receipt"];
         argv.extend(&args);
         let output = cli(&argv);
         assert_eq!(
@@ -1475,8 +1280,7 @@ fn a_claude_receipt_includes_the_sessions_subagents_and_says_so() {
         assert_eq!(entries[0]["output_tokens"], 300 + 1375);
         assert_eq!(entries[0]["cache_read_tokens"], 800 + 2500);
         assert_eq!(entries[0]["cache_write_tokens"], 100 + 80);
-        // 8715 for the main transcript, 10130 + 11564 for the subagent.
-        assert_eq!(entries[0]["estimated_usd_micros"], 8715 + 10130 + 11564);
+
         assert!(
             v["limitations"].as_array().unwrap().iter().any(|l| {
                 let l = l.as_str().unwrap();
@@ -2078,7 +1882,7 @@ fn an_older_codex_subagents_subagent_still_counts_to_the_root() {
 }
 
 /// A session header's fields: `vessa-session-headers.v1` has these and no
-/// others, each as `vessa-usage.v1` has it.
+/// others, each as `vessa-usage.v2` has it.
 const HEADER: [&str; 8] = [
     "agent",
     "id",
@@ -2447,8 +2251,7 @@ fn session_headers_print_a_line_each_and_refuse_rates_wherever_given() {
         String::from_utf8(text.stdout).unwrap(),
         "pi pi-demo · started 2026-09-30T11:00:00Z · /demo/widget\n"
     );
-    // Headers read no usage to price; a rate card would only add notices
-    // that a caller takes for gaps.
+    // The removed flag is rejected in either position.
     for args in [
         vec!["sessions", "--headers", "--rates", "examples/rates.json"],
         vec!["--rates", "examples/rates.json", "sessions", "--headers"],
@@ -2460,20 +2263,6 @@ fn session_headers_print_a_line_each_and_refuse_rates_wherever_given() {
         assert!(output.stdout.is_empty(), "{args:?}");
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("--rates"), "{args:?}: {stderr}");
-    }
-    // Without --headers, sessions reads usage, so a rate card is accepted in
-    // either position.
-    for args in [
-        vec!["sessions", "--rates", "examples/rates.json"],
-        vec!["--rates", "examples/rates.json", "sessions"],
-    ] {
-        let mut argv = args.clone();
-        argv.extend(["--json", "--input", "examples/claude.jsonl"]);
-        let v = value(cli(&argv));
-        assert_eq!(
-            v["sessions"][0]["totals"][0]["estimated_usd_micros"], 8715,
-            "{args:?}"
-        );
     }
 }
 
@@ -2803,15 +2592,13 @@ fn a_subagent_whose_requests_another_session_counted_is_not_silently_dropped() {
 }
 
 #[test]
-fn a_report_ranks_each_session_with_its_subagents() {
+fn a_report_lists_each_session_with_its_subagents() {
     let dir = claude_family("family-ranking", true);
     let html = temp("ranking.html");
     let out = cli(&[
         "report",
         "--input",
         dir.to_str().unwrap(),
-        "--rates",
-        "examples/rates.json",
         "--output",
         html.to_str().unwrap(),
     ]);
@@ -2822,351 +2609,24 @@ fn a_report_ranks_each_session_with_its_subagents() {
     );
     let page = std::fs::read_to_string(&html).unwrap();
     let ranking = page
-        .split("<h3>Sessions by known estimate subtotal</h3>")
+        .split("<h3>Sessions and subagents</h3>")
         .nth(1)
         .unwrap()
         .split("</table>")
         .next()
         .unwrap();
-    // One row: the session, its subagent's spending included.
+    // One row: the session, its subagent's records included.
     assert_eq!(
         ranking.matches("<tr><th scope=\"row\">").count(),
         1,
         "{ranking}"
     );
     assert!(
-        ranking.contains("claude · claude-demo</a> · 1 subagent</th><td>$0.030409</td><td>0</td>"),
+        ranking.contains("claude · claude-demo</a> · 1 subagent</th><td>3</td>"),
         "{ranking}"
     );
     std::fs::remove_file(html).unwrap();
     std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn a_report_counts_rate_card_notices_apart_from_source_warnings() {
-    let html = temp("notices.html");
-    let out = cli(&[
-        "report",
-        "--input",
-        "examples/claude.jsonl",
-        "--rates",
-        "examples/rates.json",
-        "--output",
-        html.to_str().unwrap(),
-    ]);
-    assert!(out.status.success());
-    let page = std::fs::read_to_string(&html).unwrap();
-    // The OpenAI card priced nothing: a notice, not a gap in the evidence.
-    assert!(
-        page.contains("<p>1 session · 0 source warnings · 1 rate-card notice</p>"),
-        "{page}"
-    );
-    std::fs::remove_file(html).unwrap();
-}
-
-/// A Claude request at 09:MM on 2026-09-30 with these token counts.
-fn claude_usage(n: u32, input: u64, output: u64, read: u64, write: u64) -> Value {
-    serde_json::json!({"type":"assistant","uuid":format!("p{n}"),"requestId":format!("req_011Cprice{n}"),"sessionId":"claude-priced","cwd":"/demo/widget","timestamp":format!("2026-09-30T09:{n:02}:00Z"),"message":{"id":format!("msg_011Cprice{n}"),"role":"assistant","model":"demo-model","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":input,"output_tokens":output,"cache_read_input_tokens":read,"cache_creation_input_tokens":write}}})
-}
-
-#[test]
-fn a_rate_card_leaves_an_unknown_price_unknown_and_can_bound_the_prompt() {
-    let mut later = claude_usage(5, 1_000, 100, 0, 0);
-    later["timestamp"] = "2026-10-15T09:00:00Z".into();
-    let path = transcript(
-        "priced.jsonl",
-        &[
-            claude_usage(1, 1_000, 100, 0, 0),
-            claude_usage(2, 1_000, 100, 0, 500),
-            claude_usage(3, 300_000, 100, 0, 0),
-            claude_usage(4, 275_000, 100, 0, 0),
-            later,
-        ],
-    );
-    let card = |input: u64, output: u64, bound: (&str, u64)| {
-        let mut card = serde_json::json!({"provider":"anthropic","model":"demo-model","effective_from":"2026-09-01T00:00:00Z","effective_until":"2026-10-01T00:00:00Z","source":"SYNTHETIC TEST RATE, not a real provider price","input":input,"output":output,"cache_read":100_000,"cache_write":null,"notes":"An estimate, not a bill."});
-        card[bound.0] = bound.1.into();
-        card
-    };
-    let rates = temp("bounded-rates.json");
-    std::fs::write(
-        &rates,
-        serde_json::to_vec(&[
-            card(1_000_000, 2_000_000, ("prompt_up_to", 272_000)),
-            card(2_000_000, 3_000_000, ("prompt_over", 278_528)),
-        ])
-        .unwrap(),
-    )
-    .unwrap();
-    let output = cli(&[
-        "usage",
-        "--input",
-        path.to_str().unwrap(),
-        "--rates",
-        rates.to_str().unwrap(),
-        "--json",
-    ]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    // Pricing notices never make the usage evidence partial.
-    assert_eq!(output.status.code(), Some(0), "{stderr}");
-    let v: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let usage = v["sessions"][0]["usage"].as_array().unwrap();
-    let entry = |n: usize| &usage[n - 1]["entry"];
-    // Short prompt, no cache writes: priced by the first card.
-    assert_eq!(entry(1)["estimated_usd_micros"], 1_000 + 200);
-    // Cache writes at an unknown price: unknown, and said why.
-    assert!(entry(2)["estimated_usd_micros"].is_null(), "{}", entry(2));
-    let why = entry(2)["estimate_basis"].as_str().unwrap();
-    assert!(
-        why.contains("cache-write price unknown") && why.contains("500"),
-        "{why}"
-    );
-    // A long prompt: the second card's rates.
-    assert_eq!(entry(3)["estimated_usd_micros"], 600_000 + 300);
-    // Between the two bounds no card applies.
-    assert!(entry(4)["estimated_usd_micros"].is_null());
-    let why = entry(4)["estimate_basis"].as_str().unwrap();
-    assert!(why.contains("275000"), "{why}");
-    // Outside every card's dates: unpriced, and said why.
-    assert!(entry(5)["estimated_usd_micros"].is_null());
-    let why = entry(5)["estimate_basis"].as_str().unwrap();
-    assert!(
-        why.contains("no anthropic/demo-model rate card covers its date"),
-        "{why}"
-    );
-    // The first card says what it left unpriced, and the model what no card
-    // covered: by date and by prompt size, each counted once.
-    let warnings: Vec<&str> = v["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|w| w.as_str().unwrap())
-        .collect();
-    assert_eq!(warnings.len(), 3, "{warnings:?}");
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.contains("priced 1 of the 2 usage records it covers")
-                && w.contains("cache-write")),
-        "{warnings:?}"
-    );
-    assert!(
-        warnings.contains(&"anthropic/demo-model: 1 usage record is dated outside every rate card for it, so it stays unpriced"),
-        "{warnings:?}"
-    );
-    assert!(
-        warnings.contains(&"anthropic/demo-model: 1 usage record has a prompt size that no rate card for its date covers, so it stays unpriced"),
-        "{warnings:?}"
-    );
-    // A long-context card where no prompt was long says nothing of its own;
-    // the record no card's range covers is counted for its model, and a
-    // card dated where no record is still gets a notice.
-    let mut undated = card(1_000_000, 2_000_000, ("prompt_up_to", 272_000));
-    undated["effective_from"] = "2026-08-01T00:00:00Z".into();
-    undated["effective_until"] = "2026-09-01T00:00:00Z".into();
-    std::fs::write(
-        &rates,
-        serde_json::to_vec(&[
-            card(2_000_000, 3_000_000, ("prompt_over", 278_528)),
-            undated,
-        ])
-        .unwrap(),
-    )
-    .unwrap();
-    let short = transcript("short.jsonl", &[claude_usage(1, 1_000, 100, 0, 0)]);
-    let v = value(cli(&[
-        "usage",
-        "--input",
-        short.to_str().unwrap(),
-        "--rates",
-        rates.to_str().unwrap(),
-        "--json",
-    ]));
-    let warnings: Vec<&str> = v["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|w| w.as_str().unwrap())
-        .collect();
-    assert_eq!(warnings.len(), 2, "{warnings:?}");
-    assert!(
-        warnings.iter().any(|w| w.contains("priced no usage records: no selected anthropic/demo-model record (1 record) is dated in its interval")),
-        "{warnings:?}"
-    );
-    assert!(
-        warnings
-            .iter()
-            .any(|w| w.starts_with("anthropic/demo-model: 1 usage record has a prompt size")),
-        "{warnings:?}"
-    );
-    std::fs::remove_file(short).unwrap();
-    // A record that carries its source's own estimate, such as pi's, keeps
-    // it where a card cannot price it, under its own basis.
-    std::fs::write(
-        &rates,
-        serde_json::to_vec(&[serde_json::json!({"provider":"zai","model":"demo-glm","effective_from":"2026-09-01T00:00:00Z","effective_until":"2026-10-01T00:00:00Z","source":"SYNTHETIC TEST RATE, not a real provider price","input":1_000_000,"output":2_000_000,"cache_read":null,"cache_write":0})])
-        .unwrap(),
-    )
-    .unwrap();
-    let v = value(cli(&[
-        "usage",
-        "--input",
-        "examples/pi.jsonl",
-        "--rates",
-        rates.to_str().unwrap(),
-        "--json",
-    ]));
-    let usage = v["sessions"][0]["usage"].as_array().unwrap();
-    // The reply read 400 cached tokens, at a price the card leaves unknown.
-    assert_eq!(usage[0]["entry"]["estimated_usd_micros"], 2_000);
-    assert_eq!(
-        usage[0]["entry"]["estimate_basis"],
-        "pi recorded model rates; not provider billing"
-    );
-    // The compaction read none: priced by the card, 20 and 10 tokens.
-    assert_eq!(usage[1]["entry"]["estimated_usd_micros"], 20 + 20);
-    let notice = v["warnings"][0].as_str().unwrap();
-    assert!(
-        notice.contains("priced 1 of the 2 usage records it covers")
-            && notice.contains("keeps the estimate its source recorded"),
-        "{notice}"
-    );
-    // Every category must be given; null is how a card says unknown.
-    let mut missing = card(1_000_000, 2_000_000, ("prompt_up_to", 272_000));
-    missing.as_object_mut().unwrap().remove("cache_write");
-    // And a prompt range must hold a prompt.
-    let mut empty = card(1_000_000, 2_000_000, ("prompt_up_to", 1_000));
-    empty["prompt_over"] = 300_000.into();
-    for (card, says) in [(missing, "cache_write"), (empty, "prompt_over")] {
-        std::fs::write(&rates, serde_json::to_vec(&[card]).unwrap()).unwrap();
-        let output = cli(&[
-            "usage",
-            "--input",
-            path.to_str().unwrap(),
-            "--rates",
-            rates.to_str().unwrap(),
-        ]);
-        assert_eq!(output.status.code(), Some(1), "{says}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(says),
-            "{says}"
-        );
-    }
-    std::fs::remove_file(rates).unwrap();
-    std::fs::remove_file(path).unwrap();
-}
-
-#[test]
-fn the_dated_rate_card_is_sourced_and_says_it_is_no_bill() {
-    let card = concat!(env!("CARGO_MANIFEST_DIR"), "/rates/2026-10-27.json");
-    let cards: Vec<Value> =
-        serde_json::from_str(&std::fs::read_to_string(card).expect(card)).unwrap();
-    let mut models = std::collections::BTreeSet::new();
-    for card in &cards {
-        let source = card["source"].as_str().unwrap();
-        assert!(source.contains("https://"), "{card}");
-        assert!(source.contains("read 2026-10-27"), "{card}");
-        assert!(
-            card["notes"]
-                .as_str()
-                .unwrap()
-                .contains("An estimate, not a bill"),
-            "{card}"
-        );
-        // Dated: valid no later than when the prices were read.
-        assert!(card["effective_until"].as_str().unwrap() <= "2026-10-27T21:00:00Z");
-        // A price the pricing page no longer shows names where it was read.
-        if card["effective_until"] != "2026-10-27T21:00:00Z" {
-            assert!(
-                source.contains("https://platform.claude.com/docs/en/release-notes/overview"),
-                "{card}"
-            );
-        }
-        models.insert(format!(
-            "{}/{}",
-            card["provider"].as_str().unwrap(),
-            card["model"].as_str().unwrap()
-        ));
-    }
-    for model in [
-        "anthropic/claude-opus-5-5",
-        "anthropic/claude-sonnet-5-5",
-        "anthropic/claude-opus-4-8",
-        "openai/gpt-5.5",
-        "openai/gpt-5.6-sol",
-        "openai/gpt-5.6-terra",
-        "openai/gpt-5.6-luna",
-        "openai/gpt-6-astra",
-        "openai/gpt-6.1-sol",
-    ] {
-        assert!(models.contains(model), "{model}: {models:?}");
-    }
-    // A Codex session on gpt-6.1-sol: one short request, one long.
-    let path = temp("card-codex.jsonl");
-    let total = |input: u64, cached: u64, output: u64| serde_json::json!({"input_tokens":input,"cached_input_tokens":cached,"cache_write_input_tokens":0,"output_tokens":output});
-    write_lines(
-        &path,
-        &[
-            serde_json::json!({"type":"session_meta","payload":{"id":"codex-card","cwd":"/demo/widget","model_provider":"openai","source":"cli","timestamp":"2026-10-20T10:00:00Z"}}),
-            serde_json::json!({"type":"turn_context","payload":{"model":"gpt-6.1-sol"}}),
-            serde_json::json!({"timestamp":"2026-10-20T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":total(200_000, 100_000, 10_000)}}}),
-            serde_json::json!({"timestamp":"2026-10-20T10:02:00Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":total(600_000, 400_000, 20_000)}}}),
-        ],
-    );
-    let v = value(cli(&[
-        "usage",
-        "--input",
-        path.to_str().unwrap(),
-        "--rates",
-        "rates/2026-10-27.json",
-        "--json",
-    ]));
-    let usage = v["sessions"][0]["usage"].as_array().unwrap();
-    // $2, $0.10 and $10 per million up to 272K input tokens.
-    assert_eq!(
-        usage[0]["entry"]["estimated_usd_micros"],
-        200_000 + 10_000 + 100_000
-    );
-    // $4, $0.20 and $15 per million above it.
-    assert_eq!(
-        usage[1]["entry"]["estimated_usd_micros"],
-        400_000 + 60_000 + 150_000
-    );
-    std::fs::remove_file(path).unwrap();
-    // A Claude session on claude-opus-5-5: $4, $0.20 and $20 per million;
-    // cache writes are priced by how long they are kept, which a transcript
-    // count does not say, so a request that wrote to the cache is unknown.
-    let path = transcript(
-        "card-claude.jsonl",
-        &[
-            claude_usage(1, 1_000, 2_000, 50_000, 0),
-            claude_usage(2, 1_000, 2_000, 50_000, 400),
-        ]
-        .map(|mut row| {
-            row["message"]["model"] = "claude-opus-5-5".into();
-            row["timestamp"] = row["timestamp"]
-                .as_str()
-                .unwrap()
-                .replace("2026-09-30", "2026-10-20")
-                .into();
-            row
-        }),
-    );
-    let v = value(cli(&[
-        "usage",
-        "--input",
-        path.to_str().unwrap(),
-        "--rates",
-        "rates/2026-10-27.json",
-        "--json",
-    ]));
-    let usage = v["sessions"][0]["usage"].as_array().unwrap();
-    assert_eq!(
-        usage[0]["entry"]["estimated_usd_micros"],
-        4_000 + 40_000 + 10_000
-    );
-    assert!(usage[1]["entry"]["estimated_usd_micros"].is_null());
-    std::fs::remove_file(path).unwrap();
 }
 
 // ---- messages ---------------------------------------------------------------
@@ -3727,13 +3187,30 @@ fn a_pi_session_lists_its_messages_and_a_fork_only_its_own() {
 
 #[test]
 fn messages_select_by_time_session_and_agent() {
+    // The reader skips files older than --since; do not depend on checkout times.
+    let dir = temp("time-selection");
+    std::fs::create_dir(&dir).unwrap();
+    let paths: Vec<_> = ["claude", "codex", "pi"]
+        .iter()
+        .map(|agent| {
+            let path = dir.join(format!("{agent}.jsonl"));
+            std::fs::copy(format!("examples/{agent}.jsonl"), &path).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_791_158_400))
+                .unwrap();
+            path
+        })
+        .collect();
     let all = [
         "--input",
-        "examples/claude.jsonl",
+        paths[0].to_str().unwrap(),
         "--input",
-        "examples/codex.jsonl",
+        paths[1].to_str().unwrap(),
         "--input",
-        "examples/pi.jsonl",
+        paths[2].to_str().unwrap(),
     ];
     let (v, _) = messages(&[&all[..], &["--since", "2026-09-30T09:01:00Z"]].concat());
     assert_eq!(texts(&v).len(), 4);
@@ -3777,10 +3254,6 @@ fn messages_select_by_time_session_and_agent() {
         ),
         (&["--agent", "opencode"][..], "SQLite"),
         (&["--since", "soon"][..], "expected RFC 3339"),
-        (
-            &["--rates", "examples/rates.json"][..],
-            "--rates cannot be used",
-        ),
     ] {
         let out = cli(&[&["messages"], &all[..], args].concat());
         assert_eq!(out.status.code(), Some(1), "{args:?}");
@@ -3790,6 +3263,7 @@ fn messages_select_by_time_session_and_agent() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -4917,4 +4391,135 @@ fn an_error_vessa_prints_carries_no_secret() {
         stderr.contains(&format!("native session {key} not found")),
         "{stderr}"
     );
+}
+
+/// All structured token views must omit money, including legacy wrapper entries.
+fn assert_token_only(value: &Value) {
+    match value {
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                assert!(
+                    ![
+                        "estimated_usd_micros",
+                        "estimate_basis",
+                        "credits",
+                        "billed",
+                        "known_estimated_usd_micros",
+                        "priced_records",
+                        "unpriced_records",
+                        "waste_upper_bound_usd_micros",
+                        "cost"
+                    ]
+                    .contains(&key.as_str()),
+                    "unexpected spending field: {key}"
+                );
+                assert_token_only(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                assert_token_only(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn spending_is_absent_from_every_usage_view_and_the_removed_flag_is_rejected() {
+    for command in ["usage", "sessions", "status", "stats", "receipt"] {
+        let v = value(cli(&[command, "--input", "examples/pi.jsonl", "--json"]));
+        assert_token_only(&v);
+        let out = cli(&[command, "--input", "examples/pi.jsonl"]);
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        for label in [
+            "estimated=",
+            "billed=",
+            "credits=",
+            "estimate subtotal",
+            "Estimated waste",
+            "$",
+        ] {
+            assert!(!text.contains(label), "{command}: {text}");
+        }
+        for args in [
+            vec![command, "--rates", "removed.json"],
+            vec!["--rates", "removed.json", command],
+        ] {
+            let out = cli(&args);
+            assert_eq!(out.status.code(), Some(2));
+            assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument '--rates'"));
+            assert!(out.stdout.is_empty());
+        }
+    }
+    let v = value(cli(&["stats", "--input", "examples/pi.jsonl", "--json"]));
+    assert_eq!(v["schema"], "vessa-statistics.v2");
+    assert_eq!(v["buckets"][0]["records"], 2);
+    assert_eq!(v["buckets"][0]["entries"][0]["input_tokens"], 220);
+    let out = cli(&["stats", "--input", "examples/pi.jsonl"]);
+    assert!(String::from_utf8(out.stdout)
+        .unwrap()
+        .contains("2026-09 pi · 1 session · 2 usage records\n"));
+    let out = cli(&["--help"]);
+    assert!(!String::from_utf8(out.stdout).unwrap().contains("--rates"));
+}
+
+#[test]
+fn legacy_costs_are_ignored_without_losing_tokens_or_wrapper_identity() {
+    let input = temp("ignored-cost.jsonl");
+    let rows = include_str!("../examples/pi.jsonl").replace("0.002", "-99999999999.0");
+    std::fs::write(&input, rows).unwrap();
+    let mut receipt = value(cli(&["receipt", "--input", input.to_str().unwrap()]));
+    assert_eq!(receipt["entries"][0]["input_tokens"], 220);
+    assert_token_only(&receipt);
+    receipt["entries"][0]["estimated_usd_micros"] = 999999.into();
+    receipt["entries"][0]["estimate_basis"] = "legacy pricing".into();
+    receipt["entries"][0]["billed"] = serde_json::json!({"micros":999,"unit":"USD"});
+    receipt["entries"][0]["credits"] = serde_json::json!({"micros":999,"unit":"credit"});
+    let export = temp("legacy-wrapper.json");
+    std::fs::write(&export, serde_json::json!({"schema":"ohjaa-sessions.v1","sessions":[{"id":"oh-legacy","agent":"pi","usage":[receipt]}],"unreadable":[]}).to_string()).unwrap();
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        input.to_str().unwrap(),
+        "--input",
+        export.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(v["schema"], "vessa-usage.v2");
+    assert_eq!(v["sessions"][0]["ohjaa"][0]["id"], "oh-legacy");
+    assert_eq!(
+        v["sessions"][0]["ohjaa"][0]["usage"][0]["entries"][0]["input_tokens"],
+        220
+    );
+    assert_token_only(&v);
+    let html = temp("token-only.html");
+    let out = cli(&[
+        "report",
+        "--input",
+        input.to_str().unwrap(),
+        "--input",
+        export.to_str().unwrap(),
+        "--output",
+        html.to_str().unwrap(),
+    ]);
+    assert!(out.status.success());
+    let page = std::fs::read_to_string(&html).unwrap();
+    for removed in [
+        "estimated_usd_micros",
+        "estimate_basis",
+        "billed",
+        "credits",
+        "legacy pricing",
+        "spending",
+        "Estimated waste",
+        "$",
+    ] {
+        assert!(!page.contains(removed), "report contains {removed}");
+    }
+    assert!(page.contains("in=220 out=110 cache-read=400 cache-write=0"));
+    for path in [input, export, html] {
+        std::fs::remove_file(path).unwrap();
+    }
 }

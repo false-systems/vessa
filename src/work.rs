@@ -137,7 +137,6 @@ pub struct Window {
     pub tools: usize,
     pub failed_tools: usize,
     pub changes: Vec<Change>,
-    pub waste_upper_bound_usd_micros: Option<u64>,
 }
 #[derive(Serialize)]
 pub struct Change {
@@ -239,13 +238,6 @@ pub fn summarize(s: &Session) -> Result<Insights> {
             }
             (Some(start), Some(end)) => Ok((end - start).num_seconds()),
         };
-        let waste = if failures > 0 && !usage.is_empty() {
-            usage.iter().try_fold(0u64, |sum, (_, u)| {
-                sum.checked_add(u.entry.estimated_usd_micros?)
-            })
-        } else {
-            None
-        };
         commands.push(Window {
             source: command.source.clone(),
             line: command.line,
@@ -256,14 +248,13 @@ pub fn summarize(s: &Session) -> Result<Insights> {
             tools: tools.len(),
             failed_tools: failures,
             changes,
-            waste_upper_bound_usd_micros: waste,
         });
     }
     Ok(Insights {
         commands,
         unattributed: model::aggregate_usage(s.usage.iter().enumerate().filter(|(i, _)| !assigned.contains(i)).map(|(_, u)| u))?,
         initial_request: model::aggregate_usage(s.usage.first().into_iter())?,
-        basis: "Commands are recorded user-message windows; injected context may also appear as user messages. Changes are successful named edit-tool results, not commits or verified surviving diffs. Change usage covers the window since the previous edit result (or command start); it is included in command totals, not additive or causal attribution. Opaque shell/exec edits and unrecognized results remain unmeasured. Elapsed time ends at the latest usage record, not command completion. Initial request includes context and generation; context-only cost is unknown. Waste: low-confidence range from zero to spending in a command containing a failed tool; failure can be useful work. No failure evidence means unknown waste, not zero. Conversation classification is not performed.",
+        basis: "Commands are recorded user-message windows; injected context may also appear as user messages. Changes are successful named edit-tool results, not commits or verified surviving diffs. Change usage covers the window since the previous edit result (or command start); it is included in command totals, not additive or causal attribution. Opaque shell/exec edits and unrecognized results remain unmeasured. Elapsed time ends at the latest usage record, not command completion. Initial request includes context and generation, which cannot be separated. Conversation classification is not performed.",
     })
 }
 fn parse_time(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
@@ -279,8 +270,7 @@ pub fn text(insights: &Insights) -> String {
         for e in values {
             let _ = writeln!(
                 out,
-                "  estimated={} · in={} out={} cache-read={} cache-write={} · {}/{}",
-                crate::render::dollars(e.estimated_usd_micros),
+                "  in={} out={} cache-read={} cache-write={} · {}/{}",
                 crate::render::number(e.input_tokens),
                 crate::render::number(e.output_tokens),
                 crate::render::number(e.cache_read_tokens),
@@ -290,7 +280,9 @@ pub fn text(insights: &Insights) -> String {
             );
         }
     };
-    out.push_str("Initial recorded request (included in totals; context-only cost unknown)\n");
+    out.push_str(
+        "Initial recorded request (included in totals; context and generation combined)\n",
+    );
     entries(&mut out, &insights.initial_request);
     for (i, c) in insights.commands.iter().enumerate() {
         let _ = writeln!(
@@ -317,20 +309,15 @@ pub fn text(insights: &Insights) -> String {
             );
             entries(&mut out, &change.entries);
         }
-        if c.failed_tools > 0 {
-            let _ = writeln!(out, "  Estimated waste: $0 to {} (failed tools={}; low confidence, whole-command upper bound)", crate::render::dollars(c.waste_upper_bound_usd_micros), c.failed_tools);
-        } else {
-            out.push_str("  Estimated waste: unknown (no failed-tool evidence)\n");
-        }
     }
     if insights.commands.is_empty() {
-        out.push_str("Commands, changes and estimated waste: unknown (no command boundaries)\n");
+        out.push_str("Commands and changes: unknown (no command boundaries)\n");
     }
     if !insights.unattributed.is_empty() {
         out.push_str("Usage without a recorded command\n");
         entries(&mut out, &insights.unattributed);
     }
-    out.push_str("Observed windows, not causal costs. Opaque edits remain unmeasured; failures may be useful work.\n");
+    out.push_str("Observed windows, not causal attribution. Opaque edits remain unmeasured; failures may be useful work.\n");
     // All imported labels remain untrusted terminal content.
     out.chars()
         .filter(|c| crate::render::shown(*c) || *c == '\n')
