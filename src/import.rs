@@ -113,10 +113,27 @@ fn roots(sessions: &mut [&mut Session], limit: bool) {
 /// Every file under `paths` that may be a transcript or an ohjaa export, in
 /// path order, once each; what could not be listed is a warning.
 fn transcripts(paths: &[PathBuf], warnings: &mut Vec<String>) -> Vec<PathBuf> {
+    let sources = transcript_sources(paths);
+    warnings.extend(
+        sources
+            .gaps
+            .into_iter()
+            .map(|(path, why)| format!("{}: {why}", path.display())),
+    );
+    sources.files
+}
+
+struct Sources {
+    files: Vec<PathBuf>,
+    gaps: Vec<(PathBuf, String)>,
+}
+
+fn transcript_sources(paths: &[PathBuf]) -> Sources {
     let mut files = Vec::new();
+    let mut gaps = Vec::new();
     for path in paths {
         if let Err(error) = discover(path, &mut files) {
-            warnings.push(format!("{}: {error}", path.display()));
+            gaps.push((path.clone(), error.to_string()));
         }
         // Claude Code keeps a session's subagent transcripts beside it, in
         // `<session>/subagents/`. They are that session's usage, so a
@@ -126,13 +143,76 @@ fn transcripts(paths: &[PathBuf], warnings: &mut Vec<String>) -> Vec<PathBuf> {
             && std::fs::symlink_metadata(&subagents).is_ok()
         {
             if let Err(error) = discover(&subagents, &mut files) {
-                warnings.push(format!("{}: {error}", subagents.display()));
+                gaps.push((subagents, error.to_string()));
             }
         }
     }
     files.sort();
     files.dedup();
-    files
+    Sources { files, gaps }
+}
+
+/// Secret-shaped occurrences, including tool traffic and subagent transcripts.
+/// Reuses native discovery, identity and lineage; never keeps conversation text.
+pub fn secrets(paths: &[PathBuf], select: &Selection) -> crate::secrets::Report {
+    let mut report = crate::secrets::Report::new(select.since);
+    let sources = transcript_sources(paths);
+    for (path, why) in sources.gaps {
+        report.gap(&path.display().to_string(), None, why);
+    }
+    for path in paths {
+        if path.is_file()
+            && !matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("jsonl" | "json")
+            )
+        {
+            report.gap(
+                &path.display().to_string(),
+                None,
+                "not a supported native transcript".into(),
+            );
+        }
+    }
+    let mut headers = Vec::new();
+    for path in sources.files {
+        if path.extension().is_some_and(|s| s == "json") {
+            report.gap(
+                &path.display().to_string(),
+                None,
+                "a wrapper export contains no native conversation content".into(),
+            );
+            continue;
+        }
+        match header(&path) {
+            Ok(session) => headers.push((path, session)),
+            Err(error) => report.gap(
+                &path.display().to_string(),
+                None,
+                format!("native identity unreadable: {error:#}"),
+            ),
+        }
+    }
+    roots(
+        &mut headers.iter_mut().map(|(_, s)| s).collect::<Vec<_>>(),
+        false,
+    );
+    let chosen = |s: &Session| {
+        select.agent.as_ref().is_none_or(|a| *a == s.agent)
+            && select
+                .session
+                .as_ref()
+                .is_none_or(|id| *id == s.id || s.subagent_of() == Some(id.as_str()))
+    };
+    if let Some(id) = &select.session {
+        if !headers.iter().any(|(_, s)| chosen(s) && s.id == *id) {
+            report.gap("selected session", None, format!("native session {id} was not read; subagents alone cannot establish its coverage"));
+        }
+    }
+    for (path, session) in headers.into_iter().filter(|(_, s)| chosen(s)) {
+        crate::secrets::scan_file(&path, &session, select.since, &mut report);
+    }
+    report
 }
 
 /// Counts each request once across the sessions, and says what the usage

@@ -3,6 +3,7 @@ mod metrics;
 mod model;
 mod render;
 mod scrub;
+mod secrets;
 mod work;
 
 use anyhow::{ensure, Context, Result};
@@ -40,6 +41,14 @@ struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum Cmd {
+    /// Scan native input/output for secret-shaped tokens. Prints only location,
+    /// rule and count metadata, never values. With --json: vessa-secrets.v1.
+    Secrets {
+        /// RFC 3339, UTC date or age (7d, 12h); exclusive. Undated findings
+        /// remain visible and make a time-filtered scan partial (exit 4).
+        #[arg(long)]
+        since: Option<String>,
+    },
     /// List native sessions and source coverage.
     Sessions {
         /// Each session's header alone (identity, lineage, start, folder,
@@ -131,6 +140,9 @@ fn run_once(cli: Cli) -> Result<i32> {
     if let Cmd::Messages { since, raw } = &cli.command {
         return messages(&cli, since.as_deref(), *raw);
     }
+    if let Cmd::Secrets { since } = &cli.command {
+        return scan_secrets(&cli, since.as_deref());
+    }
     if matches!(cli.command, Cmd::Status) {
         ensure!(
             !cli.input.is_empty() || cli.session.is_some(),
@@ -193,7 +205,7 @@ fn run_once(cli: Cli) -> Result<i32> {
         eprintln!("vessa: {}", clean(warning));
     }
     match cli.command {
-        Cmd::ClaudeStatusline | Cmd::Messages { .. } => unreachable!(),
+        Cmd::ClaudeStatusline | Cmd::Messages { .. } | Cmd::Secrets { .. } => unreachable!(),
         Cmd::Status => {
             let families = model::families(&report.sessions);
             ensure!(
@@ -690,8 +702,85 @@ fn plain(
     Ok(())
 }
 
-/// `vessa messages`: each message is written as its transcript is read,
-/// with every secret-looking token in its words redacted unless `raw`.
+/// On-demand secret-shaped occurrences: metadata only, with honest coverage.
+fn scan_secrets(cli: &Cli, from: Option<&str>) -> Result<i32> {
+    if let Some(agent) = &cli.agent {
+        supported(agent)?;
+    }
+    let select = import::Selection {
+        agent: cli.agent.clone(),
+        session: cli.session.clone(),
+        since: from.map(since).transpose()?,
+    };
+    let (paths, warnings) = inputs(cli)?;
+    let mut report = import::secrets(&paths, &select);
+    for warning in warnings {
+        report.gap("requested source", None, warning);
+    }
+    if cli.input.is_empty() && cli.agent.is_none() {
+        if let Some(path) = opencode(select.since) {
+            report.gap(
+                &path.display().to_string(),
+                None,
+                "opencode uses SQLite, which Vessa does not read".into(),
+            );
+        }
+    }
+    let complete = report.complete;
+    let mut value = serde_json::to_value(report)?;
+    // Metadata can itself contain a matched value (including a native ID).
+    // Scrub the entire document, not just its human-readable rendering.
+    secrets::scrub_metadata(&mut value);
+    if cli.json {
+        json(&value)?;
+    } else {
+        let findings = value["findings"].as_array().context("missing findings")?;
+        let total = findings.iter().try_fold(0u64, |sum, f| {
+            sum.checked_add(f["count"].as_u64().context("finding without a count")?)
+                .context("finding count overflow")
+        })?;
+        println!(
+            "{total} secret-shaped occurrence(s) in {} transcript(s) · {}",
+            value["transcripts"],
+            if complete {
+                "scan complete"
+            } else {
+                "scan incomplete (exit 4)"
+            }
+        );
+        for f in findings {
+            let text = |key: &str| render::for_terminal(f[key].as_str().unwrap_or("unknown"));
+            println!(
+                "  {}/{} · {} · {} × {} · {}:{} · {}",
+                text("agent"),
+                text("session"),
+                text("where"),
+                text("rule"),
+                f["count"],
+                text("source"),
+                f["line"],
+                text("at")
+            );
+        }
+    }
+    for gap in value["unreadable"]
+        .as_array()
+        .context("missing unreadable coverage")?
+    {
+        eprintln!(
+            "vessa: {}: {}",
+            render::for_terminal(gap["path"].as_str().unwrap_or("unknown")),
+            render::for_terminal(gap["why"].as_str().unwrap_or("unknown"))
+        );
+    }
+    if !complete {
+        eprintln!("vessa: partial secrets scan (exit 4); findings do not establish an all-clear");
+    }
+    Ok(if complete { 0 } else { 4 })
+}
+
+/// Each message is written as its transcript is read; secrets are scrubbed
+/// unless the person explicitly asks for `messages --raw`.
 fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
     if let Some(agent) = &cli.agent {
         supported(agent)?;

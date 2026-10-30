@@ -8,6 +8,10 @@ said is scrubbed of secret-looking tokens first (rules copied from ohjaa
 intake); only `messages --raw` prints them as written. Correction detection
 belongs to ohjaa intake. Usage exports, receipts and reports carry no message
 text.
+`secrets` scans native records on demand and emits only scrubbed finding
+metadata, never matched values or conversation text. It includes tool traffic
+and subagents; unreadable or temporally unknown findings cannot become an
+all-clear. Its optional JSON output creates no dependency on any consumer.
 No runtime dependency on sibling repositories. No database, daemon or implicit
 network calls. Never commit real transcripts or reports; use synthetic fixtures.
 Validate with cargo fmt --check, cargo clippy --all-targets -- -D warnings,
