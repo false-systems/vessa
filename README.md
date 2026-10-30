@@ -275,6 +275,46 @@ displayed: no prices, rate cards, currency estimates, credits or billing fields.
 Legacy cost fields in native transcripts and linked wrapper receipts are ignored.
 `--rates` is no longer accepted.
 
+## Secret-shaped findings
+
+`vessa secrets` scans native Claude Code, Codex and pi records on demand,
+including subagent and headless transcripts, user/assistant text, tool inputs
+and tool outputs. It uses the same detector as message redaction. These are
+heuristic matches, not proof that a credential is valid or that an archive
+contains no other kind of secret. Nothing is stored; no network is used.
+
+```sh
+cargo run -- secrets --input examples/codex.jsonl --json
+cargo run -- secrets --since 7d --agent claude
+```
+
+The `vessa-secrets.v1` document carries `complete`, `since`, `transcripts`,
+`findings` and `unreadable`. Each finding contains the native `agent` and
+`session`, optional `cwd` and `at`, source path and line, `where` (`person`,
+`agent`, `tool_input`, `tool_output`, or `other`), detector `rule` and `count`.
+`person` denotes a native user-role input, not independent verification that
+a human authored it. Counts are matched occurrences in selected native
+records, not unique credentials; mirrored or copied records can repeat an
+occurrence. Canonical source paths are read only once per invocation.
+No value, message text or fingerprint is emitted. Metadata is scrubbed too,
+including native IDs and path components. There is no `--raw` mode.
+
+`--since` has the same syntax and exclusive boundary as `messages`.
+Undated findings stay visible as `at: null`; with a time filter they make
+the scan partial rather than silently falling outside the window. Damaged
+JSON/UTF-8 records, unreadable paths, identity failures, missing selected
+sessions, unsupported exports and known unread OpenCode stores are reported
+in `unreadable` with `complete: false` and exit 4. Valid records around a
+damaged record are still scanned; detectable damaged-record occurrences
+have unknown time and location kind. Unknown record shapes are scanned as
+`other`, not silently ignored. A complete scan means its selected sources
+were read, not that the detector can recognize every possible secret.
+
+`--session` selects native sessions and their known subagents. A subagent
+alone does not establish coverage for its unread parent. Normal input
+discovery and symlink refusal apply. Plain output gives the same metadata
+and coverage status; JSON is suitable for an optional downstream consumer.
+
 ## Messages
 
 `messages` lists what people wrote in their agent sessions, each message with
