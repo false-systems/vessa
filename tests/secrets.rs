@@ -5,13 +5,15 @@ use std::process::{Command, Output};
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
-            "vessa-secrets-{}-{}",
+            "vessa-secrets-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir(&path).unwrap();
         Self(path)
@@ -240,4 +242,33 @@ fn secrets_report_unsupported_and_empty_sources_as_partial() {
         .as_str()
         .unwrap()
         .contains("SQLite"));
+}
+
+#[test]
+fn secrets_keep_subagent_evidence_without_claiming_an_unread_parent_was_scanned() {
+    let f = Fixture::new();
+    let parent = f.file("parent.jsonl", &[json!({"type":"user","sessionId":"parent","cwd":"/fixture","timestamp":"2026-10-01T00:00:00Z","message":{"role":"user","content":"Synthetic parent."}})]);
+    let children = parent.with_extension("").join("subagents");
+    std::fs::create_dir_all(&children).unwrap();
+    let child = children.join("agent-child.jsonl");
+    std::fs::write(&child, format!("{}\n", json!({"type":"user","sessionId":"parent","agentId":"child","isSidechain":true,"timestamp":"2026-10-01T00:00:01Z","message":{"role":"user","content":[{"type":"tool_result","content":key()}]}}))).unwrap();
+    let found = document(&f.run(&parent, &["--json", "--session", "parent"]), 0);
+    assert_eq!(found["transcripts"], 2);
+    assert_eq!(found["findings"][0]["session"], "parent/child");
+    assert_eq!(found["findings"][0]["where"], "tool_output");
+    let partial = document(&f.run(&child, &["--json", "--session", "parent"]), 4);
+    assert_eq!(partial["findings"].as_array().unwrap().len(), 1);
+    assert_eq!(partial["complete"], false);
+}
+
+#[test]
+fn secrets_scan_unknown_records_and_content_variants_instead_of_silently_dropping_them() {
+    let f = Fixture::new();
+    let path = f.file("future.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"future","cwd":"/fixture"}}),
+        json!({"timestamp":"2026-10-01T00:00:01Z","type":"future_record","data":key()}),
+        json!({"timestamp":"2026-10-01T00:00:02Z","type":"response_item","payload":{"type":"message","role":"user","text":key()}}),
+    ]);
+    let found = document(&f.run(&path, &["--json"]), 0);
+    assert_eq!(found["findings"].as_array().unwrap().len(), 2, "{found}");
 }
