@@ -187,3 +187,57 @@ fn secrets_respect_filters_and_scrub_metadata_too() {
     assert_eq!(absent["complete"], false);
     assert_eq!(f.run(&path, &["--raw"]).status.code(), Some(2));
 }
+
+#[test]
+fn secrets_never_echo_a_matched_value_inside_source_paths_or_folders() {
+    let f = Fixture::new();
+    let k = key();
+    let path = f.file(&format!("{k}.jsonl"), &[
+        json!({"type":"session_meta","payload":{"id":"path-scan","cwd":format!("/fixture/{k}")}}),
+        json!({"type":"response_item","timestamp":"2026-10-01T00:00:01Z","payload":{"type":"function_call_output","output":k}}),
+    ]);
+    let value = document(&f.run(&path, &["--json"]), 0);
+    assert!(value["findings"][0]["source"]
+        .as_str()
+        .unwrap()
+        .contains("[redacted]"));
+    assert_eq!(value["findings"][0]["cwd"], "/fixture/[redacted]");
+}
+
+#[test]
+fn secrets_report_unsupported_and_empty_sources_as_partial() {
+    let f = Fixture::new();
+    let wrapper = f.file(
+        "wrapper.json",
+        &[json!({"schema":"ohjaa-sessions.v1","sessions":[]})],
+    );
+    assert_eq!(
+        document(&f.run(&wrapper, &["--json"]), 4)["complete"],
+        false
+    );
+    let empty = f.file("empty.jsonl", &[]);
+    assert_eq!(document(&f.run(&empty, &["--json"]), 4)["complete"], false);
+    let arbitrary = f.file(
+        "unsupported.txt",
+        &[json!({"text":"not a native transcript"})],
+    );
+    assert_eq!(
+        document(&f.run(&arbitrary, &["--json"]), 4)["complete"],
+        false
+    );
+    let db = f.0.join("data/opencode/opencode.db");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    std::fs::write(&db, []).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vessa"))
+        .args(["secrets", "--json"])
+        .env("HOME", &f.0)
+        .env("XDG_DATA_HOME", f.0.join("data"))
+        .output()
+        .unwrap();
+    let value = document(&out, 4);
+    assert_eq!(value["unreadable"].as_array().unwrap().len(), 1);
+    assert!(value["unreadable"][0]["why"]
+        .as_str()
+        .unwrap()
+        .contains("SQLite"));
+}
