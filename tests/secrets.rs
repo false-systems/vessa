@@ -62,11 +62,7 @@ fn opaque_transport_matches_are_counted_without_hiding_key_shaped_values() {
             rows.iter()
                 .map(|row| row["count"].as_u64().unwrap())
                 .sum::<u64>(),
-            if value["transcripts"] == 1 {
-                2
-            } else {
-                unreachable!()
-            }
+            2
         );
         let opaque_count: u64 = rows
             .iter()

@@ -296,6 +296,15 @@ The `vessa-secrets.v1` document carries `complete`, `since`, `transcripts`,
 a human authored it. Counts are matched occurrences in selected native
 records, not unique credentials; mirrored or copied records can repeat an
 occurrence. Canonical source paths are read only once per invocation.
+Each finding also reports `opaque_count`: a measured subset of `count` in
+native Claude thinking-signature or Codex encrypted-reasoning fields. These
+fields are still scanned, including for provider-shaped keys; their context
+is not an exemption or a claim that their contents are safe. Older producers
+may omit this field, which means unknown, not zero.
+`undated_records` counts readable finding records that produced a timestamp
+coverage warning under `--since`; it is not a count of unreadable files.
+Known file-history snapshots use their nested native timestamp. Missing or
+invalid times in unknown record formats remain unknown and partial.
 No value, message text or fingerprint is emitted. Metadata is scrubbed too,
 including native IDs and path components. There is no `--raw` mode.
 

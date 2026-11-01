@@ -13,6 +13,8 @@ pub struct Report {
     since: Option<String>,
     pub complete: bool,
     pub transcripts: usize,
+    /// Readable finding records which produced a missing-timestamp warning.
+    pub undated_records: usize,
     pub findings: Vec<Finding>,
     pub unreadable: Vec<Gap>,
 }
@@ -29,6 +31,8 @@ pub struct Finding {
     place: &'static str,
     rule: &'static str,
     count: usize,
+    /// A measured subset of count, in native signature/encrypted-content fields.
+    opaque_count: usize,
 }
 
 #[derive(Serialize)]
@@ -45,6 +49,7 @@ impl Report {
             since: since.map(|t| t.to_rfc3339()),
             complete: true,
             transcripts: 0,
+            undated_records: 0,
             findings: Vec::new(),
             unreadable: Vec::new(),
         }
@@ -117,17 +122,25 @@ pub fn scan_file(
                 // role and time are unknown, never silently assigned to a window.
                 let text = String::from_utf8_lossy(&bytes);
                 let mut marks = BTreeMap::new();
-                count(&text, "other", &mut marks);
+                count(&text, "other", false, &mut marks);
                 append(report, session, &source, number, None, marks);
                 continue;
             }
         };
-        let at = record["timestamp"].as_str().map(str::to_owned).or_else(|| {
-            record["timestamp"]
-                .as_i64()
-                .and_then(DateTime::from_timestamp_millis)
-                .map(|t| t.to_rfc3339())
+        let stamp = record.get("timestamp").or_else(|| {
+            (record["type"] == "file-history-snapshot")
+                .then(|| record["snapshot"].get("timestamp"))
+                .flatten()
         });
+        let at = stamp
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                stamp
+                    .and_then(Value::as_i64)
+                    .and_then(DateTime::from_timestamp_millis)
+                    .map(|t| t.to_rfc3339())
+            });
         let parsed = at
             .as_deref()
             .and_then(|t| DateTime::parse_from_rfc3339(t).ok());
@@ -137,9 +150,7 @@ pub fn scan_file(
         let at = parsed.and(at);
         let mut marks = BTreeMap::new();
         for (place, value) in pieces(&session.agent, &record) {
-            let mut text = String::new();
-            flatten(value, &mut text);
-            count(&text, place, &mut marks);
+            count_piece(&session.agent, value, place, &mut marks);
         }
         if !marks.is_empty() && since.is_some() && at.is_none() {
             report.gap(
@@ -148,17 +159,54 @@ pub fn scan_file(
                 "finding has no valid time; it is included but cannot be placed after --since"
                     .into(),
             );
+            report.undated_records += 1;
         }
         append(report, session, &source, number, at, marks);
     }
 }
 
-type Marks = BTreeMap<(&'static str, &'static str), usize>;
-fn count(text: &str, place: &'static str, marks: &mut Marks) {
+#[derive(Default)]
+struct Counts {
+    total: usize,
+    opaque: usize,
+}
+type Marks = BTreeMap<(&'static str, &'static str), Counts>;
+
+fn count_piece(agent: &str, value: &Value, place: &'static str, marks: &mut Marks) {
+    let field = match (agent, value["type"].as_str()) {
+        ("claude", Some("thinking")) => Some("signature"),
+        ("codex", Some("reasoning")) => Some("encrypted_content"),
+        _ => None,
+    };
+    if let Some((field, text)) =
+        field.and_then(|field| value[field].as_str().map(|text| (field, text)))
+    {
+        // Keep scanning both portions. Context is not an exemption: even a
+        // provider-shaped key in a metadata field remains a finding.
+        count(text, place, true, marks);
+        let mut rest = value.clone();
+        rest.as_object_mut()
+            .expect("a field belongs to an object")
+            .remove(field);
+        let mut text = String::new();
+        flatten(&rest, &mut text);
+        count(&text, place, false, marks);
+    } else {
+        let mut text = String::new();
+        flatten(value, &mut text);
+        count(&text, place, false, marks);
+    }
+}
+
+fn count(text: &str, place: &'static str, opaque: bool, marks: &mut Marks) {
     let mut found = Redactions::default();
     let _ = found.text(text);
     for (&rule, &n) in found.by_rule() {
-        *marks.entry((place, rule)).or_default() += n;
+        let counts = marks.entry((place, rule)).or_default();
+        counts.total += n;
+        if opaque {
+            counts.opaque += n;
+        }
     }
 }
 
@@ -170,7 +218,7 @@ fn append(
     at: Option<String>,
     marks: Marks,
 ) {
-    for ((place, rule), count) in marks {
+    for ((place, rule), counts) in marks {
         report.findings.push(Finding {
             agent: session.agent.clone(),
             session: session.id.clone(),
@@ -180,7 +228,8 @@ fn append(
             at: at.clone(),
             place,
             rule,
-            count,
+            count: counts.total,
+            opaque_count: counts.opaque,
         });
     }
 }
