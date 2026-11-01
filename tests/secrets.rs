@@ -232,6 +232,16 @@ fn secrets_keep_good_records_and_unknown_times_without_claiming_complete_coverag
     assert_eq!(value["complete"], false);
     assert_eq!(value["findings"].as_array().unwrap().len(), 3, "{value}");
     assert_eq!(value["unreadable"].as_array().unwrap().len(), 3, "{value}");
+    let damaged = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["line"] == 5)
+        .unwrap();
+    assert!(
+        damaged["opaque_count"].is_null(),
+        "damaged records have unknown structured context: {value}"
+    );
     assert!(value["findings"]
         .as_array()
         .unwrap()
