@@ -72,6 +72,10 @@ fn opaque_transport_matches_are_counted_without_hiding_key_shaped_values() {
                     .expect("every new finding reports context coverage")
             })
             .sum();
+        assert!(
+            rows.iter().all(|row| row["opaque_native"] == true),
+            "decoded context is explicitly native-position verified: {value}"
+        );
         assert_eq!(
             opaque_count,
             if path.ends_with("opaque-claude.jsonl") {
@@ -82,6 +86,31 @@ fn opaque_transport_matches_are_counted_without_hiding_key_shaped_values() {
         );
         assert!(rows.iter().any(|row| row["rule"] == "openai"));
         assert!(!String::from_utf8_lossy(&f.run(&path, &["--json"]).stdout).contains(opaque));
+    }
+}
+
+#[test]
+fn user_supplied_or_unknown_blocks_cannot_claim_native_opaque_context() {
+    let f = Fixture::new();
+    let opaque = "Q7hB4mR9vT2kN8pS6xA3dF5jL1cE0uWz";
+    let at = "2026-10-01T00:00:01Z";
+    let claude = f.file("user-claude.jsonl", &[
+        json!({"type":"user","sessionId":"user-claude","cwd":"/fixture","timestamp":at,"message":{"role":"user","content":[{"type":"thinking","signature":opaque}]}})
+    ]);
+    let codex = f.file("user-codex.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"user-codex","cwd":"/fixture"}}),
+        json!({"type":"response_item","timestamp":at,"payload":{"type":"message","role":"user","content":[{"type":"reasoning","encrypted_content":opaque}]}}),
+        json!({"type":"reasoning","timestamp":at,"encrypted_content":opaque})
+    ]);
+    for path in [claude, codex] {
+        let value = document(&f.run(&path, &["--json"]), 0);
+        let rows = value["findings"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|row| row["count"] == 1 && row["opaque_count"] == 0),
+            "{value}"
+        );
     }
 }
 
