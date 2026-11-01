@@ -105,6 +105,22 @@ fn nested_file_history_times_are_honored_without_inventing_times_for_unknown_rec
     assert_eq!(value["unreadable"].as_array().unwrap().len(), 1);
     assert_eq!(value["complete"], false);
 }
+
+#[test]
+fn nested_history_times_are_not_borrowed_by_other_native_formats() {
+    let f = Fixture::new();
+    let path = f.file("codex-unknown-history.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"unknown-history","cwd":"/fixture"}}),
+        json!({"type":"file-history-snapshot","snapshot":{"timestamp":"2026-09-30T00:00:00Z","data":key()}})
+    ]);
+    let value = document(
+        &f.run(&path, &["--json", "--since", "2026-10-01T00:00:00Z"]),
+        4,
+    );
+    assert_eq!(value["findings"].as_array().unwrap().len(), 1);
+    assert!(value["findings"][0]["at"].is_null());
+    assert_eq!(value["undated_records"], 1);
+}
 fn document(out: &Output, expected: i32) -> Value {
     assert_eq!(
         out.status.code(),
