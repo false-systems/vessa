@@ -300,7 +300,9 @@ Each finding also reports `opaque_count`: a measured subset of `count` in
 native Claude thinking-signature or Codex encrypted-reasoning fields. These
 fields are still scanned, including for provider-shaped keys; their context
 is not an exemption or a claim that their contents are safe. Older producers
-may omit this field, which means unknown, not zero.
+may omit this field, which means unknown, not zero. Retained matches from
+damaged records carry null context because their native fields could not be
+decoded; summaries keep known counts as lower bounds.
 `undated_records` counts readable finding records that produced a timestamp
 coverage warning under `--since`; it is not a count of unreadable files.
 Known file-history snapshots use their nested native timestamp. Missing or

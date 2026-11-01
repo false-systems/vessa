@@ -32,7 +32,7 @@ pub struct Finding {
     rule: &'static str,
     count: usize,
     /// A measured subset of count, in native signature/encrypted-content fields.
-    opaque_count: usize,
+    opaque_count: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -122,7 +122,7 @@ pub fn scan_file(
                 // role and time are unknown, never silently assigned to a window.
                 let text = String::from_utf8_lossy(&bytes);
                 let mut marks = BTreeMap::new();
-                count(&text, "other", false, &mut marks);
+                count(&text, "other", None, &mut marks);
                 append(report, session, &source, number, None, marks);
                 continue;
             }
@@ -165,10 +165,17 @@ pub fn scan_file(
     }
 }
 
-#[derive(Default)]
 struct Counts {
     total: usize,
-    opaque: usize,
+    opaque: Option<usize>,
+}
+impl Default for Counts {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            opaque: Some(0),
+        }
+    }
 }
 type Marks = BTreeMap<(&'static str, &'static str), Counts>;
 
@@ -183,29 +190,31 @@ fn count_piece(agent: &str, value: &Value, place: &'static str, marks: &mut Mark
     {
         // Keep scanning both portions. Context is not an exemption: even a
         // provider-shaped key in a metadata field remains a finding.
-        count(text, place, true, marks);
+        count(text, place, Some(true), marks);
         let mut rest = value.clone();
         rest.as_object_mut()
             .expect("a field belongs to an object")
             .remove(field);
         let mut text = String::new();
         flatten(&rest, &mut text);
-        count(&text, place, false, marks);
+        count(&text, place, Some(false), marks);
     } else {
         let mut text = String::new();
         flatten(value, &mut text);
-        count(&text, place, false, marks);
+        count(&text, place, Some(false), marks);
     }
 }
 
-fn count(text: &str, place: &'static str, opaque: bool, marks: &mut Marks) {
+fn count(text: &str, place: &'static str, opaque: Option<bool>, marks: &mut Marks) {
     let mut found = Redactions::default();
     let _ = found.text(text);
     for (&rule, &n) in found.by_rule() {
         let counts = marks.entry((place, rule)).or_default();
         counts.total += n;
-        if opaque {
-            counts.opaque += n;
+        match (counts.opaque.as_mut(), opaque) {
+            (Some(count), Some(true)) => *count += n,
+            (_, None) => counts.opaque = None,
+            _ => {}
         }
     }
 }
