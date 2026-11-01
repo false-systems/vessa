@@ -128,7 +128,7 @@ pub fn scan_file(
             }
         };
         let stamp = record.get("timestamp").or_else(|| {
-            (record["type"] == "file-history-snapshot")
+            (session.agent == "claude" && record["type"] == "file-history-snapshot")
                 .then(|| record["snapshot"].get("timestamp"))
                 .flatten()
         });
