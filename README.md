@@ -303,6 +303,12 @@ is not an exemption or a claim that their contents are safe. Older producers
 may omit this field, which means unknown, not zero. Retained matches from
 damaged records carry null context because their native fields could not be
 decoded; summaries keep known counts as lower bounds.
+`opaque_native: true` explicitly verifies that positive opaque subsets were
+classified at native transport positions: Claude assistant thinking blocks
+or Codex response-item reasoning payloads. User blocks, tool content, unknown
+records and merely matching field names do not gain that context. Older
+reports without this marker are unverified; they must not be used to dismiss
+credential alerts. Detection and redaction still include every occurrence.
 `undated_records` counts readable finding records that produced a timestamp
 coverage warning under `--since`; it is not a count of unreadable files.
 Known file-history snapshots use their nested native timestamp. Missing or

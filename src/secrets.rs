@@ -33,6 +33,8 @@ pub struct Finding {
     count: usize,
     /// A measured subset of count, in native signature/encrypted-content fields.
     opaque_count: Option<usize>,
+    /// Positive opaque subsets were attributed at verified native positions.
+    opaque_native: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -149,8 +151,8 @@ pub fn scan_file(
         }
         let at = parsed.and(at);
         let mut marks = BTreeMap::new();
-        for (place, value) in pieces(&session.agent, &record) {
-            count_piece(&session.agent, value, place, &mut marks);
+        for (place, value, opaque_field) in pieces(&session.agent, &record) {
+            count_piece(value, place, opaque_field, &mut marks);
         }
         if !marks.is_empty() && since.is_some() && at.is_none() {
             report.gap(
@@ -179,12 +181,7 @@ impl Default for Counts {
 }
 type Marks = BTreeMap<(&'static str, &'static str), Counts>;
 
-fn count_piece(agent: &str, value: &Value, place: &'static str, marks: &mut Marks) {
-    let field = match (agent, value["type"].as_str()) {
-        ("claude", Some("thinking")) => Some("signature"),
-        ("codex", Some("reasoning")) => Some("encrypted_content"),
-        _ => None,
-    };
+fn count_piece(value: &Value, place: &'static str, field: Option<&'static str>, marks: &mut Marks) {
     if let Some((field, text)) =
         field.and_then(|field| value[field].as_str().map(|text| (field, text)))
     {
@@ -239,6 +236,7 @@ fn append(
             rule,
             count: counts.total,
             opaque_count: counts.opaque,
+            opaque_native: counts.opaque.map(|_| true),
         });
     }
 }
@@ -275,7 +273,14 @@ fn role(role: Option<&str>) -> &'static str {
     }
 }
 
-fn blocks<'a>(content: &'a Value, place: &'static str, out: &mut Vec<(&'static str, &'a Value)>) {
+type Piece<'a> = (&'static str, &'a Value, Option<&'static str>);
+
+fn blocks<'a>(
+    content: &'a Value,
+    place: &'static str,
+    native_thinking: bool,
+    out: &mut Vec<Piece<'a>>,
+) {
     if let Some(items) = content.as_array() {
         for block in items {
             let before = out.len();
@@ -283,45 +288,47 @@ fn blocks<'a>(content: &'a Value, place: &'static str, out: &mut Vec<(&'static s
                 Some("tool_use" | "toolCall") => {
                     for field in ["input", "arguments"] {
                         if !block[field].is_null() {
-                            out.push(("tool_input", &block[field]));
+                            out.push(("tool_input", &block[field], None));
                         }
                     }
                 }
                 Some("tool_result" | "toolResult") => {
                     for field in ["content", "output"] {
                         if !block[field].is_null() {
-                            out.push(("tool_output", &block[field]));
+                            out.push(("tool_output", &block[field], None));
                         }
                     }
                 }
-                _ => out.push((place, block)),
+                Some("thinking") if native_thinking => out.push((place, block, Some("signature"))),
+                _ => out.push((place, block, None)),
             }
             if out.len() == before {
-                out.push(("other", block));
+                out.push(("other", block, None));
             }
         }
     } else {
-        out.push((place, content));
+        out.push((place, content, None));
     }
 }
 
-fn pieces<'a>(agent: &str, record: &'a Value) -> Vec<(&'static str, &'a Value)> {
+fn pieces<'a>(agent: &str, record: &'a Value) -> Vec<Piece<'a>> {
     let mut out = Vec::new();
     if agent == "codex" && record["type"] == "response_item" {
         let p = &record["payload"];
         match p["type"].as_str() {
-            Some("message") => blocks(&p["content"], role(p["role"].as_str()), &mut out),
+            Some("message") => blocks(&p["content"], role(p["role"].as_str()), false, &mut out),
+            Some("reasoning") => out.push(("other", p, Some("encrypted_content"))),
             Some("function_call" | "custom_tool_call") => {
                 for field in ["arguments", "input"] {
                     if !p[field].is_null() {
-                        out.push(("tool_input", &p[field]));
+                        out.push(("tool_input", &p[field], None));
                     }
                 }
             }
             Some("function_call_output" | "custom_tool_call_output") => {
-                out.push(("tool_output", &p["output"]))
+                out.push(("tool_output", &p["output"], None))
             }
-            _ => out.push(("other", p)),
+            _ => out.push(("other", p, None)),
         }
     } else if record["message"].is_object() {
         let m = &record["message"];
@@ -330,7 +337,9 @@ fn pieces<'a>(agent: &str, record: &'a Value) -> Vec<(&'static str, &'a Value)> 
         } else {
             role(m["role"].as_str())
         };
-        blocks(&m["content"], place, &mut out);
+        let native_thinking =
+            agent == "claude" && record["type"] == "assistant" && place == "agent";
+        blocks(&m["content"], place, native_thinking, &mut out);
     } else if agent == "codex" && record["type"] == "event_msg" {
         let p = &record["payload"];
         let place = match p["type"].as_str() {
@@ -338,13 +347,13 @@ fn pieces<'a>(agent: &str, record: &'a Value) -> Vec<(&'static str, &'a Value)> 
             Some("agent_message" | "agent_reasoning") => "agent",
             _ => "other",
         };
-        out.push((place, p));
+        out.push((place, p, None));
     } else {
-        out.push(("other", record));
+        out.push(("other", record, None));
     }
-    out.retain(|(_, value)| !value.is_null());
+    out.retain(|(_, value, _)| !value.is_null());
     if out.is_empty() {
-        out.push(("other", record));
+        out.push(("other", record, None));
     }
     out
 }
