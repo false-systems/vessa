@@ -43,6 +43,32 @@ fn key() -> String {
 }
 
 #[test]
+fn explicit_secret_labels_survive_the_native_scan_without_changing_redaction() {
+    let f = Fixture::new();
+    let value = ["Ab3dE5gH7jK9mN1pQ3sT", "5vW7yZ9bC1dF3hJ5kL7mN9p"].concat();
+    let path = f.file("labelled-codex.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"labelled-codex","cwd":"/fixture"}}),
+        json!({"type":"event_msg","timestamp":"2026-10-01T00:00:01Z","payload":{"type":"user_message","message":format!("password: {value}")}}),
+        json!({"type":"event_msg","timestamp":"2026-10-01T00:00:02Z","payload":{"type":"user_message","message":value}})
+    ]);
+    let output = f.run(&path, &["--json"]);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(&value));
+    let doc = document(&output, 0);
+    let rows = doc["findings"].as_array().unwrap();
+    for rule in ["named_secret", "mixed_token"] {
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["rule"] == rule)
+                .map(|row| row["count"].as_u64().unwrap())
+                .sum::<u64>(),
+            1,
+            "{doc}"
+        );
+    }
+    assert_eq!(rows.len(), 2, "{doc}");
+}
+
+#[test]
 fn opaque_transport_matches_are_counted_without_hiding_key_shaped_values() {
     let f = Fixture::new();
     let at = "2026-10-01T00:00:01Z";

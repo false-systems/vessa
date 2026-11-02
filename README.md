@@ -283,6 +283,13 @@ and tool outputs. It uses the same detector as message redaction. These are
 heuristic matches, not proof that a credential is valid or that an archive
 contains no other kind of secret. Nothing is stored; no network is used.
 
+Rule names describe the evidence, not severity or confirmation. Recognised key
+formats take precedence, then explicit secret labels (`password`, `api_key`,
+`token`, and similar words), then the generic long mixed-string heuristic.
+A long labelled value is `named_secret`, not merely `mixed_token`; the value
+is redacted once either way. Generic matches alone can also be identifiers,
+encoded data or examples. Every occurrence and coverage gap is still reported.
+
 ```sh
 cargo run -- secrets --input examples/codex.jsonl --json
 cargo run -- secrets --since 7d --agent claude

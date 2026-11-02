@@ -362,19 +362,22 @@ fn secret(run: &str, after: Option<(&str, &str)>) -> Option<(usize, &'static str
     if dotted_key(run) {
         return Some((run.len(), "id_and_secret"));
     }
-    if mixes_cases_and_digits(run) {
-        return Some((run.len(), "mixed_token"));
+    // Preserve the more specific evidence when both rules match. This changes
+    // attribution, not which bytes are redacted or how many occurrences exist.
+    if let Some((word, between)) = after {
+        let separated = (1..=4).contains(&between.len())
+            && between
+                .bytes()
+                .all(|b| matches!(b, b' ' | b'\t' | b':' | b'=' | b'"' | b'\''));
+        let mixed =
+            run.bytes().any(|b| b.is_ascii_digit()) && run.bytes().any(|b| b.is_ascii_alphabetic());
+        let distinct = run.bytes().collect::<BTreeSet<u8>>().len();
+        let long_and_mixed = run.len() >= 16 && mixed && distinct >= 8 && !path(run);
+        if separated && names_a_secret(word) && long_and_mixed {
+            return Some((run.len(), "named_secret"));
+        }
     }
-    let (word, between) = after?;
-    let separated = (1..=4).contains(&between.len())
-        && between
-            .bytes()
-            .all(|b| matches!(b, b' ' | b'\t' | b':' | b'=' | b'"' | b'\''));
-    let mixed =
-        run.bytes().any(|b| b.is_ascii_digit()) && run.bytes().any(|b| b.is_ascii_alphabetic());
-    let distinct = run.bytes().collect::<BTreeSet<u8>>().len();
-    let long_and_mixed = run.len() >= 16 && mixed && distinct >= 8 && !path(run);
-    (separated && names_a_secret(word) && long_and_mixed).then_some((run.len(), "named_secret"))
+    mixes_cases_and_digits(run).then_some((run.len(), "mixed_token"))
 }
 
 /// The rule of a key that `head` (a run's leading letters, digits, `_` and
@@ -739,7 +742,13 @@ mod tests {
     fn an_explicit_secret_label_takes_precedence_over_generic_shape() {
         let value = fake(&["Ab3dE5gH7jK9mN1pQ3sT", "5vW7yZ9bC1dF3hJ5kL7mN9p"]);
         assert_eq!(scrub(&value).1.by_rule(), &one("mixed_token"));
-        for label in ["password", "api_key", "access_token", "client_secret", "Bearer"] {
+        for label in [
+            "password",
+            "api_key",
+            "access_token",
+            "client_secret",
+            "Bearer",
+        ] {
             let (hidden, found) = scrub(&format!("{label}: {value}"));
             assert_eq!(found.by_rule(), &one("named_secret"), "{label}");
             assert_eq!(found.total(), 1);
