@@ -736,6 +736,18 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_secret_label_takes_precedence_over_generic_shape() {
+        let value = fake(&["Ab3dE5gH7jK9mN1pQ3sT", "5vW7yZ9bC1dF3hJ5kL7mN9p"]);
+        assert_eq!(scrub(&value).1.by_rule(), &one("mixed_token"));
+        for label in ["password", "api_key", "access_token", "client_secret", "Bearer"] {
+            let (hidden, found) = scrub(&format!("{label}: {value}"));
+            assert_eq!(found.by_rule(), &one("named_secret"), "{label}");
+            assert_eq!(found.total(), 1);
+            assert!(!hidden.contains(&value));
+        }
+    }
+
+    #[test]
     fn a_long_mixed_token_after_a_word_that_names_a_secret_is_redacted() {
         let value = &BODY[..24];
         for text in [
