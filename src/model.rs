@@ -69,6 +69,13 @@ pub struct Session {
     /// its session's own.
     #[serde(skip)]
     pub partly_sidechain: bool,
+    /// When every record, an agent reply among them, was written within
+    /// `import::ONE_GO_MS`, the time of the earliest: the transcript is a
+    /// copy of earlier history with nothing added live, its stamps say when
+    /// it was copied, and `started_at` is unknown. Absent for every other
+    /// session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_in_one_go: Option<String>,
 }
 
 /// A Claude launch record: the tool result that says a subagent started.
@@ -108,6 +115,8 @@ pub struct Header<'a> {
     pub source: &'a str,
     pub entrypoint: Option<&'a str>,
     pub originator: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub written_in_one_go: Option<&'a str>,
 }
 
 impl Session {
@@ -121,6 +130,7 @@ impl Session {
             source: &self.source,
             entrypoint: self.entrypoint.as_deref(),
             originator: self.originator.as_deref(),
+            written_in_one_go: self.written_in_one_go.as_deref(),
         }
     }
 
@@ -394,6 +404,9 @@ pub struct Coverage {
     pub subagent_transcripts: usize,
     /// Transcripts last modified before `since`, not read.
     pub unmodified_transcripts: usize,
+    /// Transcripts written in one go, not read: copies of earlier history,
+    /// so no message in them was typed when its record says.
+    pub copies: usize,
     /// User turns read: `human`, `excluded`, `earlier` and `undated` sum to it.
     pub user_turns: usize,
     /// Messages listed.

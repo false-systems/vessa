@@ -661,8 +661,10 @@ fn parse_export(path: &Path) -> Result<Parsed> {
 }
 
 /// A transcript's header alone: the [`Scan`] that [`parse_file`] makes of
-/// every record, made of the records up to the one that settles it. The rest
-/// of the file is not read, and no record is kept.
+/// every record, made of the records up to the one that settles it. Of the
+/// records after it only their times and whether each is a reply are read,
+/// until one shows the transcript was not written in one go ([`Scan::live`]):
+/// a copy is read to its end. No record is kept.
 fn header_file(path: &Path) -> Result<Parsed> {
     if path.extension().is_some_and(|s| s == "json") {
         return parse_export(path);
@@ -674,6 +676,7 @@ fn header_file(path: &Path) -> Result<Parsed> {
 fn header(path: &Path) -> Result<Session> {
     let file = BufReader::new(std::fs::File::open(path)?);
     let mut scan = Scan::default();
+    let mut settled = false;
     for line in file.split(b'\n') {
         let line = line?;
         if line.iter().all(u8::is_ascii_whitespace) {
@@ -682,8 +685,13 @@ fn header(path: &Path) -> Result<Session> {
         // A malformed record is skipped, as `parse_file` skips it; saying so
         // is a usage limitation, which this reader does not report.
         if let Ok(value) = serde_json::from_slice::<Value>(&line) {
-            scan.observe(&value);
-            if scan.settled() {
+            if settled {
+                scan.time(&value);
+            } else {
+                scan.observe(&value);
+                settled = scan.settled();
+            }
+            if settled && scan.live() {
                 break;
             }
         }
@@ -716,6 +724,31 @@ struct Scan {
     /// (Claude Code's `api-request` records, in subagent transcripts too)
     /// do not count.
     not_sidechain: bool,
+    /// The earliest record time, in milliseconds and as written, and the
+    /// latest: how long the transcript took to write.
+    earliest: Option<(i64, String)>,
+    latest_ms: Option<i64>,
+    /// Whether any record is an agent's reply.
+    replied: bool,
+}
+
+/// A transcript every record of which, an agent reply among them, was
+/// written within this many milliseconds was written in one go: no model
+/// answers that fast, so it is a copy of earlier history with nothing added
+/// live. Measured on 2026-11-03: the 34 transcripts Codex Desktop rewrote at
+/// once took 0 to 191 ms each, and the fastest live session with a reply
+/// took 1242 ms; 500 ms sits about 2.5 times from both.
+pub const ONE_GO_MS: i64 = 500;
+
+/// Whether a record is an agent's reply, in any format read: a Claude
+/// `assistant` record, a Codex assistant message or `agent_message` event,
+/// or a pi assistant message.
+fn reply(v: &Value) -> bool {
+    let p = &v["payload"];
+    v["type"] == "assistant"
+        || (v["type"] == "response_item" && p["type"] == "message" && p["role"] == "assistant")
+        || (v["type"] == "event_msg" && p["type"] == "agent_message")
+        || (v["type"] == "message" && v["message"]["role"] == "assistant")
 }
 
 /// The header facts of one record that opens a session.
@@ -770,6 +803,7 @@ impl Scan {
         if self.started_at.is_none() {
             self.started_at = timestamp(v);
         }
+        self.time(v);
         for (slot, key) in [
             (&mut self.cwd, "cwd"),
             (&mut self.entrypoint, "entrypoint"),
@@ -782,6 +816,33 @@ impl Scan {
         self.sidechain |= v["isSidechain"] == true;
         self.sidechain_said |= v["isSidechain"].is_boolean();
         self.not_sidechain |= v["isSidechain"] == false;
+    }
+
+    /// A record's time and whether it is a reply: all that is read of the
+    /// records after the header settles, until the transcript shows it was
+    /// not written in one go.
+    fn time(&mut self, v: &Value) {
+        if let Some(at) = timestamp(v) {
+            if let Ok(ms) = chrono::DateTime::parse_from_rfc3339(&at).map(|t| t.timestamp_millis())
+            {
+                if self
+                    .earliest
+                    .as_ref()
+                    .is_none_or(|(earliest, _)| ms < *earliest)
+                {
+                    self.earliest = Some((ms, at));
+                }
+                self.latest_ms = Some(self.latest_ms.map_or(ms, |latest| latest.max(ms)));
+            }
+        }
+        self.replied |= reply(v);
+    }
+
+    /// Whether a record shows the transcript was not written in one go: two
+    /// of its records are at least [`ONE_GO_MS`] apart. A live session shows
+    /// it within its first records, since a person takes longer to type.
+    fn live(&self) -> bool {
+        self.span().is_some_and(|span| span >= ONE_GO_MS)
     }
 
     /// The agent the records so far say wrote the file, with the record that
@@ -822,11 +883,28 @@ impl Scan {
         dated && placed && (agent != "claude" || claude())
     }
 
+    /// How long the records seen took to write, earliest to latest.
+    fn span(&self) -> Option<i64> {
+        Some(self.latest_ms? - self.earliest.as_ref()?.0)
+    }
+
+    /// When every record seen, an agent reply among them, was written within
+    /// [`ONE_GO_MS`]: the time of the earliest, as written.
+    fn written_in_one_go(&self) -> Option<String> {
+        if !self.replied || !self.span().is_some_and(|span| span < ONE_GO_MS) {
+            return None;
+        }
+        self.earliest.as_ref().map(|(_, at)| at.clone())
+    }
+
     /// The session the records seen say this is, with no usage read yet.
     fn session(self, path: &Path, limitations: Vec<String>) -> Result<Session> {
         let Some((agent, _)) = self.opening() else {
             bail!("unsupported or missing native session header");
         };
+        // A copy was read whole, so it is no limitation: only its start is
+        // unknown, and `written_in_one_go` says why.
+        let copied = self.written_in_one_go();
         let opening = match agent {
             "codex" => self.codex,
             "pi" => self.pi,
@@ -865,7 +943,12 @@ impl Scan {
             agent: agent.into(),
             id,
             parent,
-            started_at: opening.started_at.or(self.started_at),
+            // A copy's stamps say when it was copied, not when it started.
+            started_at: if copied.is_some() {
+                None
+            } else {
+                opening.started_at.or(self.started_at)
+            },
             cwd: Some(opening.cwd)
                 .filter(|cwd| !cwd.is_empty())
                 .or(self.cwd)
@@ -884,6 +967,7 @@ impl Scan {
             subagent: (agent == "claude" && self.sidechain)
                 || (agent == "codex" && opening.subagent_source),
             partly_sidechain: agent == "claude" && self.sidechain && self.not_sidechain,
+            written_in_one_go: copied,
         })
     }
 }
@@ -1334,6 +1418,12 @@ pub fn messages(
                 coverage.unmodified_transcripts += 1;
                 continue;
             }
+        }
+        // A copy's words were typed before it was written, when its records
+        // do not say; the session it copied lists them, if it was read.
+        if s.written_in_one_go.is_some() {
+            coverage.copies += 1;
+            continue;
         }
         if s.agent == "codex" {
             if let Some(parent) = &s.parent {

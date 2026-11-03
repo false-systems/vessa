@@ -153,6 +153,12 @@ wait for every usage record to be read. With `--json` it emits
   Codex fork's `forked_from_id`, a pi `parentSession`. Null for none.
 * `started_at` (RFC 3339) and `cwd` come from the header, else from the first
   record that has them; unknown is null and `""`.
+* `written_in_one_go`, only on a copy: when every record, an agent reply among
+  them, was written within 500 ms, the time of the earliest. No model answers
+  that fast, so the transcript is a copy of earlier history with nothing added
+  live; its stamps say when it was copied, and its `started_at` is null. Codex
+  Desktop wrote 34 such copies at once on 2026-10-28, in 0 to 191 ms each; the
+  fastest live session with a reply on the same Mac took 1242 ms.
 * `source` is the transcript read; of copies of one session, the first path.
 * `entrypoint` (Claude: `cli`, or `sdk-cli` for `claude -p`) and `originator`
   (Codex: `codex-tui`, or `codex_exec` for `codex exec`) say how a session was
@@ -165,13 +171,17 @@ the same warnings. `--agent` and `--session` select as they do for `sessions`.
 The header reader reads a transcript only until its header is known, and keeps
 no records. Each fact is the first record's that states it, so a transcript
 that never states one, such as a Claude session that never names its
-`entrypoint`, is read to its end. Two rules look at every record; here the
-header reader relies on how the agents write: each opens its own transcripts
-with its header and none holds another agent's records, and Claude Code marks
-every record of a transcript alike as a sidechain or not. On 928 local
-transcripts (3.2 GB, 2026-10-26) the two listings were identical; headers took
-under 0.5 s and 8 MB of memory, the full listing over 20 s and 1.2 GB on a
-loaded machine.
+`entrypoint`, is read to its end. Of the records after that it reads only
+their times and whether each is a reply, until two are 500 ms apart: a live
+session shows that within its first records, and a copy is read to its end.
+Two rules look at every record; here the header reader relies on how the
+agents write: each opens its own transcripts with its header and none holds
+another agent's records, and Claude Code marks every record of a transcript
+alike as a sidechain or not. On 928 local transcripts (3.2 GB, 2026-10-26)
+the two listings were identical; headers took under 0.5 s and 8 MB of memory,
+the full listing over 20 s and 1.2 GB on a loaded machine. On 1011
+transcripts (2026-11-03), 59 of them copies holding 49 MB, headers took
+0.26 s warm, against 0.05 s before copies were read to their end.
 
 Where a file breaks those habits, or is damaged past its header, the two
 listings differ, and tests pin how:
@@ -348,7 +358,7 @@ so memory holds one transcript at a time:
 {"agent":"claude","session":"claude-demo","parent":null,"kind":"message","id":"u2","at":"2026-09-30T09:02:00Z","cwd":"/demo/widget","text":"I already told you to run the local checks.","question":null,"reply":{"text":"The implementation is ready.","truncated":false,"failed":false,"line":3},"source":"/path/to/claude-demo.jsonl","line":4}
 ],
 "sessions":[{"agent":"claude","id":"claude-demo","parent":null,"subagent":false,"started_at":"2026-09-30T09:00:00Z","cwd":"/demo/widget","source":"/path/to/claude-demo.jsonl","headless":false,"messages":3}],
-"coverage":{"transcripts":1,"subagent_transcripts":0,"unmodified_transcripts":0,"user_turns":3,"human":3,"excluded":{},"since":null,"earlier":0,"undated":0,"gaps":[],"limitations":[]},
+"coverage":{"transcripts":1,"subagent_transcripts":0,"unmodified_transcripts":0,"copies":0,"user_turns":3,"human":3,"excluded":{},"since":null,"earlier":0,"undated":0,"gaps":[],"limitations":[]},
 "warnings":[],
 "redacted":0,
 "redacted_by_rule":{}}
@@ -380,7 +390,9 @@ so memory holds one transcript at a time:
   `user_turns` is `human` plus every count in `excluded` plus `earlier` and
   `undated` (with `--since`, a message at or before it, or with no time).
   Codex subagent transcripts and, with `--since`, transcripts last written
-  before it are counted and not read. `gaps` names sources Vessa knows of and
+  before it are counted and not read, and so are `copies`: transcripts
+  written in one go (see `written_in_one_go` under Session headers), whose
+  words were typed before the time their records show. `gaps` names sources Vessa knows of and
   does not read. opencode keeps its sessions in SQLite
   (`~/.local/share/opencode/opencode.db`), and Vessa takes no SQLite
   dependency, so a default run where that store was written in the window is

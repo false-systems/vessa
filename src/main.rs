@@ -374,11 +374,18 @@ fn run_once(cli: Cli) -> Result<i32> {
                 }))?;
             } else {
                 for s in &report.sessions {
+                    let started = match (&s.started_at, &s.written_in_one_go) {
+                        (Some(at), _) => at.clone(),
+                        (None, Some(copied)) => format!(
+                            "unknown (a copy of earlier history, written in one go at {copied})"
+                        ),
+                        (None, None) => "unknown".into(),
+                    };
                     println!(
                         "{} {} · started {} · {}",
                         clean(&s.agent),
                         clean(&s.id),
-                        clean(s.started_at.as_deref().unwrap_or("unknown")),
+                        clean(&started),
                         clean(&s.cwd)
                     );
                 }
@@ -858,6 +865,19 @@ fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
             if rules.is_empty() { String::new() } else { format!(": {rules}") },
             c.subagent_transcripts,
         )?;
+        match c.copies {
+            0 => {}
+            1 => writeln!(
+                out,
+                "1 transcript written in one go not read: it is a copy of earlier history, \
+                 so none of its messages was typed when it shows"
+            )?,
+            n => writeln!(
+                out,
+                "{n} transcripts written in one go not read: they are copies of earlier \
+                 history, so none of their messages was typed when they show"
+            )?,
+        }
         if let Some(since) = &c.since {
             writeln!(
                 out,
