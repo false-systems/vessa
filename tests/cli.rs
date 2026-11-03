@@ -4570,3 +4570,194 @@ fn legacy_costs_are_ignored_without_losing_tokens_or_wrapper_identity() {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+/// A Codex transcript: its header, one typed message and, `reply_ms` after
+/// the header, the agent's reply (none when `None`). Every record is stamped,
+/// as Codex Desktop stamps the ones it writes.
+fn codex_transcript(id: &str, reply_ms: Option<u64>) -> Vec<Value> {
+    // `ms` after 2026-10-28T13:53:49.100Z.
+    let at = |ms: u64| {
+        let total = 49_100 + ms;
+        format!("2026-10-28T13:53:{:02}.{:03}Z", total / 1000, total % 1000)
+    };
+    let mut rows = vec![
+        serde_json::json!({"timestamp": at(0), "type": "session_meta", "payload": {
+            "id": id, "timestamp": at(0), "cwd": "/demo/widget",
+            "originator": "Codex Desktop", "source": "vscode"}}),
+        serde_json::json!({"timestamp": at(0), "type": "event_msg", "payload": {
+            "type": "user_message", "message": "Check the parser."}}),
+        serde_json::json!({"timestamp": at(0), "type": "response_item", "payload": {
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "Check the parser."}]}}),
+    ];
+    if let Some(ms) = reply_ms {
+        rows.push(
+            serde_json::json!({"timestamp": at(ms), "type": "response_item", "payload": {
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "The parser check passed."}]}}),
+        );
+        rows.push(
+            serde_json::json!({"timestamp": at(ms), "type": "event_msg", "payload": {
+            "type": "token_count", "info": {"total_token_usage": {
+                "input_tokens": 100, "cached_input_tokens": 0, "output_tokens": 10}}}}),
+        );
+    }
+    rows
+}
+
+#[test]
+fn a_transcript_written_in_one_go_is_a_copy_whose_start_is_unknown() {
+    // Codex Desktop rewrote 34 threads at once (2026-10-28): every record of
+    // each, replies included, stamped within 191 ms, while the fastest live
+    // session with a reply on this Mac spans 1242 ms. Such a file is a copy
+    // of earlier history; its stamps say when it was copied, not when anyone
+    // started a session or typed a word.
+    let dir = temp("copies");
+    std::fs::create_dir_all(&dir).unwrap();
+    write_lines(
+        &dir.join("codex-copy.jsonl"),
+        &codex_transcript("codex-copy", Some(190)),
+    );
+    write_lines(
+        &dir.join("pi-copy.jsonl"),
+        &[
+            serde_json::json!({"type": "session", "version": 3, "id": "pi-copy",
+                "timestamp": "2026-10-28T13:53:49.100Z", "cwd": "/demo/widget"}),
+            serde_json::json!({"type": "message", "id": "p1", "timestamp": "2026-10-28T13:53:49.100Z",
+                "message": {"role": "user", "content": [{"type": "text", "text": "Check the parser."}]}}),
+            serde_json::json!({"type": "message", "id": "p2", "timestamp": "2026-10-28T13:53:49.101Z",
+                "message": {"role": "assistant", "provider": "zai", "model": "demo-glm",
+                    "content": [{"type": "text", "text": "Done."}],
+                    "usage": {"input": 200, "output": 100, "cacheRead": 0, "cacheWrite": 0}}}),
+        ],
+    );
+    let dir_arg = dir.to_str().unwrap();
+
+    let headers = value(cli(&[
+        "sessions",
+        "--headers",
+        "--input",
+        dir_arg,
+        "--json",
+    ]));
+    for session in headers["sessions"].as_array().unwrap() {
+        assert_eq!(session["started_at"], Value::Null, "{session}");
+        // Said in the header too, so a reader of headers alone (ohjaa's
+        // report) can tell a copy from a session it could not date.
+        assert_eq!(
+            session["written_in_one_go"], "2026-10-28T13:53:49.100Z",
+            "{session}"
+        );
+    }
+    assert_eq!(headers["sessions"].as_array().unwrap().len(), 2);
+
+    let text = cli(&["sessions", "--headers", "--input", dir_arg]);
+    assert_eq!(text.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8_lossy(&text.stdout),
+        "codex codex-copy · started unknown (a copy of earlier history, written in one go at \
+         2026-10-28T13:53:49.100Z) · /demo/widget\n\
+         pi pi-copy · started unknown (a copy of earlier history, written in one go at \
+         2026-10-28T13:53:49.100Z) · /demo/widget\n"
+    );
+
+    // Read whole, a copy is no limitation: the usage is complete (exit 0),
+    // only its start is unknown, and the copy says when it was written.
+    let usage = value(cli(&["usage", "--input", dir_arg, "--json"]));
+    for session in usage["sessions"].as_array().unwrap() {
+        assert_eq!(session["started_at"], Value::Null, "{session}");
+        assert_eq!(
+            session["written_in_one_go"], "2026-10-28T13:53:49.100Z",
+            "{session}"
+        );
+        assert_eq!(session["limitations"], serde_json::json!([]), "{session}");
+    }
+
+    let messages = value(cli(&["messages", "--input", dir_arg, "--json"]));
+    assert_eq!(messages["messages"], serde_json::json!([]));
+    assert_eq!(messages["coverage"]["copies"], 2);
+    assert_eq!(messages["coverage"]["transcripts"], 0);
+    let text = cli(&["messages", "--input", dir_arg]);
+    assert!(text.status.success());
+    assert!(
+        String::from_utf8_lossy(&text.stdout).contains(
+            "2 transcripts written in one go not read: they are copies of earlier history, \
+             so none of their messages was typed when they show"
+        ),
+        "{}",
+        String::from_utf8_lossy(&text.stdout)
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_live_transcript_and_an_idle_one_keep_their_start() {
+    let dir = temp("live");
+    std::fs::create_dir_all(&dir).unwrap();
+    // 499 ms is still one go; at 500 ms the reply counts as live.
+    write_lines(
+        &dir.join("edge-copy.jsonl"),
+        &codex_transcript("edge-copy", Some(499)),
+    );
+    write_lines(
+        &dir.join("edge-live.jsonl"),
+        &codex_transcript("edge-live", Some(500)),
+    );
+    write_lines(
+        &dir.join("live.jsonl"),
+        &codex_transcript("live", Some(2_000)),
+    );
+    // A session opened and closed with no reply: a person did start it.
+    write_lines(&dir.join("idle.jsonl"), &codex_transcript("idle", None));
+    let headers = value(cli(&[
+        "sessions",
+        "--headers",
+        "--input",
+        dir.to_str().unwrap(),
+        "--json",
+    ]));
+    let start = |id: &str| {
+        headers["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap_or_else(|| panic!("{id} not listed: {headers}"))["started_at"]
+            .clone()
+    };
+    assert_eq!(start("edge-copy"), Value::Null);
+    assert_eq!(start("edge-live"), "2026-10-28T13:53:49.100Z");
+    assert_eq!(start("live"), "2026-10-28T13:53:49.100Z");
+    assert_eq!(start("idle"), "2026-10-28T13:53:49.100Z");
+    for session in headers["sessions"].as_array().unwrap() {
+        assert_eq!(
+            session.get("written_in_one_go").is_some(),
+            session["id"] == "edge-copy",
+            "{session}"
+        );
+    }
+    // Only a copy gains the key; every other session's export is unchanged.
+    // The idle session has no usage, which leaves the export partial (exit
+    // 4): read what it says all the same.
+    let usage: Value =
+        serde_json::from_slice(&cli(&["usage", "--input", dir.to_str().unwrap(), "--json"]).stdout)
+            .unwrap();
+    assert_eq!(usage["sessions"].as_array().unwrap().len(), 4);
+    for session in usage["sessions"].as_array().unwrap() {
+        assert_eq!(
+            session.get("written_in_one_go").is_some(),
+            session["id"] == "edge-copy",
+            "{session}"
+        );
+    }
+
+    let messages = value(cli(&[
+        "messages",
+        "--input",
+        dir.to_str().unwrap(),
+        "--json",
+    ]));
+    assert_eq!(messages["coverage"]["copies"], 1);
+    assert_eq!(messages["coverage"]["transcripts"], 3);
+    std::fs::remove_dir_all(dir).unwrap();
+}
