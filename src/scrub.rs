@@ -189,6 +189,34 @@ pub fn report(report: &mut Report) -> Redactions {
     found
 }
 
+/// `text` as a terminal shows it: without the control and bidirectional
+/// formatting characters [`crate::render::for_terminal`] drops, line breaks
+/// aside. What the rules judge, and what the secrets scan searches.
+pub fn shown(text: &str) -> std::borrow::Cow<'_, str> {
+    let hidden = |c: char| c != '\n' && !crate::render::shown(c);
+    if text.chars().any(hidden) {
+        text.chars()
+            .filter(|c| !hidden(*c))
+            .collect::<String>()
+            .into()
+    } else {
+        text.into()
+    }
+}
+
+/// Each secret-looking token in `text`, as a terminal shows it, with its
+/// rule: what the secrets scan counts, and how a credential this machine
+/// holds is recognized. The values live only as long as the caller keeps
+/// them, which is never past the record or credential file being read;
+/// nothing prints them.
+pub fn found(text: &str) -> Vec<(&'static str, String)> {
+    let shown = shown(text);
+    spans(&shown)
+        .into_iter()
+        .map(|(start, end, rule)| (rule, shown[start..end].to_owned()))
+        .collect()
+}
+
 /// `text` with each secret-looking token replaced by `[redacted]`, and
 /// where each marker stands in what is returned, with its rule. The rules
 /// judge the text as a terminal shows it: without the control and
@@ -328,7 +356,7 @@ fn tokens(text: &str) -> Vec<(usize, usize, &'static str)> {
 
 /// The bytes a token is made of (all ASCII, so a run of them always starts
 /// and ends on a character boundary).
-fn token_byte(byte: u8) -> bool {
+pub fn token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'/' | b'~')
 }
 

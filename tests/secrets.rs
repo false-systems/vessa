@@ -24,13 +24,26 @@ impl Fixture {
         std::fs::write(&path, text).unwrap();
         path
     }
+    /// The scan of `path`, with [`key`] one of the credentials this machine
+    /// holds, as a secret-named variable.
     fn run(&self, path: &Path, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_vessa"))
+        self.run_with(path, args, &[("FIXTURE_API_KEY", &key())])
+    }
+    /// The scan in an emptied environment: the fixture is the home folder,
+    /// there is no PATH (so no gh), and `env` is all that is set besides.
+    /// Never the person's own credentials.
+    fn run_with(&self, path: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_vessa"));
+        command
+            .env_clear()
+            .env("HOME", &self.0)
             .args(["secrets", "--input"])
             .arg(path)
-            .args(args)
-            .output()
-            .unwrap()
+            .args(args);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        command.output().unwrap()
     }
 }
 impl Drop for Fixture {
@@ -51,7 +64,7 @@ fn explicit_secret_labels_survive_the_native_scan_without_changing_redaction() {
         json!({"type":"event_msg","timestamp":"2026-10-01T00:00:01Z","payload":{"type":"user_message","message":format!("password: {value}")}}),
         json!({"type":"event_msg","timestamp":"2026-10-01T00:00:02Z","payload":{"type":"user_message","message":value}})
     ]);
-    let output = f.run(&path, &["--json"]);
+    let output = f.run_with(&path, &["--json"], &[("FIXTURE_PASSWORD", &value)]);
     assert!(!String::from_utf8_lossy(&output.stdout).contains(&value));
     let doc = document(&output, 0);
     let rows = doc["findings"].as_array().unwrap();
@@ -82,7 +95,14 @@ fn opaque_transport_matches_are_counted_without_hiding_key_shaped_values() {
         json!({"type":"response_item","timestamp":at,"payload":{"type":"reasoning","summary":[],"encrypted_content":key()}})
     ]);
     for path in [claude, codex] {
-        let value = document(&f.run(&path, &["--json"]), 0);
+        let value = document(
+            &f.run_with(
+                &path,
+                &["--json"],
+                &[("FIXTURE_API_KEY", &key()), ("FIXTURE_SIGNING_KEY", opaque)],
+            ),
+            0,
+        );
         let rows = value["findings"].as_array().unwrap();
         assert_eq!(
             rows.iter()
@@ -111,7 +131,11 @@ fn opaque_transport_matches_are_counted_without_hiding_key_shaped_values() {
             }
         );
         assert!(rows.iter().any(|row| row["rule"] == "openai"));
-        assert!(!String::from_utf8_lossy(&f.run(&path, &["--json"]).stdout).contains(opaque));
+        assert!(!String::from_utf8_lossy(
+            &f.run_with(&path, &["--json"], &[("FIXTURE_SIGNING_KEY", opaque)])
+                .stdout
+        )
+        .contains(opaque));
     }
 }
 
@@ -129,7 +153,10 @@ fn user_supplied_or_unknown_blocks_cannot_claim_native_opaque_context() {
         json!({"type":"reasoning","timestamp":at,"encrypted_content":opaque})
     ]);
     for path in [claude, codex] {
-        let value = document(&f.run(&path, &["--json"]), 0);
+        let value = document(
+            &f.run_with(&path, &["--json"], &[("FIXTURE_SIGNING_KEY", opaque)]),
+            0,
+        );
         let rows = value["findings"].as_array().unwrap();
         assert!(!rows.is_empty());
         assert!(
@@ -140,8 +167,11 @@ fn user_supplied_or_unknown_blocks_cannot_claim_native_opaque_context() {
     }
 }
 
+/// A record without a time of its own takes the time of the record before
+/// it, said as such: a transcript is appended to, so it was written at or
+/// after that one. A nested time is honored only where it is native.
 #[test]
-fn nested_file_history_times_are_honored_without_inventing_times_for_unknown_records() {
+fn a_record_without_a_time_takes_the_time_of_the_record_before_said_as_inferred() {
     let f = Fixture::new();
     let path = f.file("history.jsonl", &[
         json!({"type":"user","sessionId":"history","cwd":"/fixture","timestamp":"2026-10-01T00:00:00Z","message":{"role":"user","content":"Synthetic header"}}),
@@ -151,13 +181,34 @@ fn nested_file_history_times_are_honored_without_inventing_times_for_unknown_rec
     ]);
     let value = document(
         &f.run(&path, &["--json", "--since", "2026-10-01T00:00:00Z"]),
-        4,
+        0,
     );
     let rows = value["findings"].as_array().unwrap();
     assert_eq!(rows.len(), 2, "{value}");
-    assert_eq!(rows.iter().filter(|row| row["at"].is_null()).count(), 1);
+    let inferred: Vec<&Value> = rows.iter().filter(|r| r["at_inferred"] == true).collect();
+    assert_eq!(inferred.len(), 1, "{value}");
+    assert_eq!(inferred[0]["line"], 4);
+    assert_eq!(inferred[0]["at"], "2026-10-01T00:00:01Z");
+    assert_eq!(value["undated_records"], 0);
+    assert_eq!(value["complete"], true);
+}
+
+/// The record before is the window's edge or earlier: the one without a
+/// time may be either side of `--since`, so it stays unplaced.
+#[test]
+fn a_record_after_one_before_the_window_stays_unplaced() {
+    let f = Fixture::new();
+    let path = f.file("edge.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"edge","cwd":"/fixture"}}),
+        json!({"type":"response_item","timestamp":"2026-09-30T00:00:00Z","payload":{"type":"message","role":"user","content":"Synthetic"}}),
+        json!({"type":"response_item","payload":{"type":"function_call_output","output":key()}}),
+    ]);
+    let value = document(
+        &f.run(&path, &["--json", "--since", "2026-10-01T00:00:00Z"]),
+        4,
+    );
+    assert!(value["findings"][0]["at"].is_null(), "{value}");
     assert_eq!(value["undated_records"], 1);
-    assert_eq!(value["unreadable"].as_array().unwrap().len(), 1);
     assert_eq!(value["complete"], false);
 }
 
@@ -257,7 +308,14 @@ fn secrets_cover_native_person_agent_and_both_tool_directions_without_values() {
         let plain = f.run(&path, &[]);
         assert!(plain.status.success());
         let text = String::from_utf8(plain.stdout).unwrap();
-        assert!(text.contains("4 secret-shaped occurrence(s)"), "{text}");
+        assert!(
+            text.contains("4 occurrence(s) of this machine's credentials"),
+            "{text}"
+        );
+        assert!(
+            text.contains("environment variable FIXTURE_API_KEY"),
+            "{text}"
+        );
         assert!(!text.contains(&k));
     }
 }
@@ -286,7 +344,9 @@ fn secrets_keep_good_records_and_unknown_times_without_claiming_complete_coverag
     );
     assert_eq!(value["complete"], false);
     assert_eq!(value["findings"].as_array().unwrap().len(), 3, "{value}");
-    assert_eq!(value["unreadable"].as_array().unwrap().len(), 3, "{value}");
+    // The two damaged lines; the record without a time follows one inside
+    // the window, and takes its time.
+    assert_eq!(value["unreadable"].as_array().unwrap().len(), 2, "{value}");
     let damaged = value["findings"]
         .as_array()
         .unwrap()
@@ -301,7 +361,7 @@ fn secrets_keep_good_records_and_unknown_times_without_claiming_complete_coverag
         .as_array()
         .unwrap()
         .iter()
-        .any(|v| v["where"] == "tool_output" && v["at"].is_null()));
+        .any(|v| v["where"] == "tool_output" && v["at_inferred"] == true));
     assert!(!value["findings"]
         .as_array()
         .unwrap()
@@ -377,6 +437,7 @@ fn secrets_report_unsupported_and_empty_sources_as_partial() {
     std::fs::write(&db, []).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_vessa"))
         .args(["secrets", "--json"])
+        .env_clear()
         .env("HOME", &f.0)
         .env("XDG_DATA_HOME", f.0.join("data"))
         .output()
@@ -416,4 +477,157 @@ fn secrets_scan_unknown_records_and_content_variants_instead_of_silently_droppin
     ]);
     let found = document(&f.run(&path, &["--json"]), 0);
     assert_eq!(found["findings"].as_array().unwrap().len(), 2, "{found}");
+}
+
+/// A random-looking key of a known shape, not [`key`]: no placeholder.
+fn other_key() -> String {
+    ["gh", "p_", "Q7hB4mR9vT2kN8pS6xA3dF5jL1cE0uWzY4tR"].concat()
+}
+
+/// A finding is one of this machine's credentials in a transcript: every
+/// other secret-shaped string is counted by rule, plain placeholders apart,
+/// and never listed.
+#[test]
+fn only_this_machines_credentials_are_findings_and_the_rest_are_counted() {
+    let f = Fixture::new();
+    let mine = ["Zq8", "Wn3Rt6Yp1Ks4Vb7Xm2Lc5Hd9Fg0"].concat();
+    let path = f.file("mixed.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"mixed","cwd":"/fixture"}}),
+        json!({"type":"response_item","timestamp":"2026-10-01T00:00:01Z","payload":{"type":"function_call_output","output":format!("token: {mine}")}}),
+        json!({"type":"response_item","timestamp":"2026-10-01T00:00:02Z","payload":{"type":"function_call_output","output":other_key()}}),
+        json!({"type":"response_item","timestamp":"2026-10-01T00:00:03Z","payload":{"type":"function_call_output","output":key()}}),
+    ]);
+    let out = f.run_with(&path, &["--json"], &[("DEPLOY_TOKEN", &mine)]);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for value in [&mine, &other_key()] {
+        assert!(
+            !text.contains(value.as_str()),
+            "a value left the reader: {text}"
+        );
+    }
+    let doc = document(&out, 0);
+    let rows = doc["findings"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "{doc}");
+    assert_eq!(rows[0]["held"], "environment variable DEPLOY_TOKEN");
+    assert_eq!(rows[0]["line"], 2);
+    assert_eq!(
+        doc["candidates"],
+        json!({"github": 1, "openai": 1}),
+        "{doc}"
+    );
+    assert_eq!(doc["placeholders"], 1, "sk-a1a1… is a placeholder: {doc}");
+    let read = doc["compared_with"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["source"] == "environment variable DEPLOY_TOKEN")
+        .unwrap();
+    assert_eq!(
+        (read["status"].clone(), read["credentials"].clone()),
+        (json!("read"), json!(1))
+    );
+    let plain = f.run_with(&path, &[], &[("DEPLOY_TOKEN", &mine)]);
+    let said = String::from_utf8(plain.stdout).unwrap();
+    assert!(
+        said.contains("1 occurrence(s) of this machine's credentials"),
+        "{said}"
+    );
+    assert!(
+        said.contains("Not alarms: 2 other secret-shaped string(s)"),
+        "{said}"
+    );
+    assert!(said.contains("(1 plainly placeholders)"), "{said}");
+}
+
+/// Nothing this machine holds appears: an all-clear, said as one, however
+/// many other secret-shaped strings were counted.
+#[test]
+fn no_held_credential_in_the_transcripts_is_said_as_such() {
+    let f = Fixture::new();
+    let path = f.file("clear.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"clear","cwd":"/fixture"}}),
+        json!({"type":"response_item","timestamp":"2026-10-01T00:00:01Z","payload":{"type":"function_call_output","output":other_key()}}),
+    ]);
+    let doc = document(&f.run_with(&path, &["--json"], &[]), 0);
+    assert_eq!(doc["findings"], json!([]));
+    assert_eq!(doc["candidates"], json!({"github": 1}));
+    let said = String::from_utf8(f.run_with(&path, &[], &[]).stdout).unwrap();
+    assert!(
+        said.starts_with(
+            "None of this machine's credentials appears in 1 transcript(s) · scan complete"
+        ),
+        "{said}"
+    );
+}
+
+/// The credential files under the home folder are compared; one that exists
+/// but cannot be read leaves the scan partial, never an all-clear.
+#[cfg(unix)]
+#[test]
+fn credential_files_are_compared_and_an_unreadable_one_leaves_the_scan_partial() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    std::fs::write(
+        f.0.join(".git-credentials"),
+        format!("https://x:{}@github.com\n", other_key()),
+    )
+    .unwrap();
+    let path = f.file("files.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"files","cwd":"/fixture"}}),
+        json!({"type":"response_item","timestamp":"2026-10-01T00:00:01Z","payload":{"type":"function_call_output","output":other_key()}}),
+    ]);
+    let doc = document(&f.run_with(&path, &["--json"], &[]), 0);
+    assert_eq!(doc["findings"][0]["held"], "~/.git-credentials", "{doc}");
+    std::fs::write(f.0.join(".netrc"), "machine x password y\n").unwrap();
+    std::fs::set_permissions(f.0.join(".netrc"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(f.0.join(".netrc")).is_ok() {
+        return; // root reads it anyway: nothing to show here
+    }
+    let partial = document(&f.run_with(&path, &["--json"], &[]), 4);
+    assert_eq!(partial["complete"], false);
+    assert!(
+        partial["unreadable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|gap| gap["path"] == "~/.netrc"),
+        "{partial}"
+    );
+}
+
+/// The GitHub CLI's login is compared when gh is on PATH.
+#[cfg(unix)]
+#[test]
+fn the_github_cli_login_is_compared_when_gh_is_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let bin = f.0.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\n[ \"$1 $2\" = \"auth token\" ] && echo {}\n",
+            other_key()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = f.file("gh.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"gh","cwd":"/fixture"}}),
+        json!({"type":"response_item","timestamp":"2026-10-01T00:00:01Z","payload":{"type":"message","role":"user","content":other_key()}}),
+    ]);
+    let doc = document(
+        &f.run_with(&path, &["--json"], &[("PATH", bin.to_str().unwrap())]),
+        0,
+    );
+    assert_eq!(
+        doc["findings"][0]["held"], "GitHub CLI login (gh auth token)",
+        "{doc}"
+    );
+    assert_eq!(doc["findings"][0]["where"], "person");
 }

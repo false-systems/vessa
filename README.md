@@ -279,16 +279,38 @@ Legacy cost fields in native transcripts and linked wrapper receipts are ignored
 
 `vessa secrets` scans native Claude Code, Codex and pi records on demand,
 including subagent and headless transcripts, user/assistant text, tool inputs
-and tool outputs. It uses the same detector as message redaction. These are
-heuristic matches, not proof that a credential is valid or that an archive
-contains no other kind of secret. Nothing is stored; no network is used.
+and tool outputs, for **the credentials this machine holds**. A finding is
+an alarm: one of your credentials reached an agent session, and so the
+provider that ran it. Nothing is stored; no network is used.
 
-Rule names describe the evidence, not severity or confirmation. Recognised key
-formats take precedence, then explicit secret labels (`password`, `api_key`,
-`token`, and similar words), then the generic long mixed-string heuristic.
-A long labelled value is `named_secret`, not merely `mixed_token`; the value
-is redacted once either way. Generic matches alone can also be identifiers,
-encoded data or examples. Every occurrence and coverage gap is still reported.
+The credentials are read at the start of each scan, kept in memory only,
+compared by value and never printed, logged or written: the report names
+each source (`compared_with`: its name, `read`, `absent` or `unreadable`,
+and how many credentials it held), never a value. The sources are the
+environment's secret-named variables (a name with `TOKEN`, `SECRET`,
+`PASSWORD`, `PASSWD`, `KEY`, `CREDENTIAL` or `AUTH`, but not a socket, path,
+file, folder or session key), the GitHub CLI's login (`gh auth token`, when
+gh is on PATH), and `~/.aws/credentials`, `~/.config/gh/hosts.yml`,
+`~/.git-credentials`, `~/.netrc`, `~/.npmrc`, `~/.docker/config.json`,
+`~/.codex/auth.json`, `~/.pi/agent/auth.json`, `~/.claude/.credentials.json`
+and `~/.ssh/id_{ed25519,rsa,ecdsa}`. From a file, a credential is each
+secret-shaped string the detector recognizes in it; from a variable or gh,
+also the whole value (16 bytes or more), whatever its shape. Each is looked
+for in every record as it stands, alone, so it is found however it is
+labelled there. macOS Keychain items are not read, since reading one can
+prompt. A source that exists but cannot be read leaves the scan partial.
+
+Every other secret-shaped string the detector finds (the same detector as
+message redaction) is counted by its rule in `candidates`, never listed:
+other people's keys, test fixtures, examples, signatures, ids. Of those,
+`placeholders` counts the plain ones: a few characters repeated
+(`sk-a1a1a1…`), a straight run of the alphabet or digits, or an AWS
+documentation example (`…EXAMPLE`). Rule names describe the evidence:
+recognised key formats take precedence, then explicit secret labels
+(`password`, `api_key`, `token`, and similar words), then the generic long
+mixed-string heuristic. A finding's `rule` is the one the detector gives the
+credential where it stands, `no_known_shape` where it gives none, and its
+`held` names the source that holds it.
 
 ```sh
 cargo run -- secrets --input examples/codex.jsonl --json
@@ -296,9 +318,12 @@ cargo run -- secrets --since 7d --agent claude
 ```
 
 The `vessa-secrets.v1` document carries `complete`, `since`, `transcripts`,
-`findings` and `unreadable`. Each finding contains the native `agent` and
-`session`, optional `cwd` and `at`, source path and line, `where` (`person`,
-`agent`, `tool_input`, `tool_output`, or `other`), detector `rule` and `count`.
+`findings`, `unreadable`, `compared_with`, `candidates` and `placeholders`.
+A report without `compared_with` is from an earlier vessa, whose findings
+were every secret-shaped match, not held credentials. Each finding contains
+the native `agent` and `session`, optional `cwd` and `at` (with
+`at_inferred`), source path and line, `where` (`person`, `agent`,
+`tool_input`, `tool_output`, or `other`), detector `rule`, `held` and `count`.
 `person` denotes a native user-role input, not independent verification that
 a human authored it. Counts are matched occurrences in selected native
 records, not unique credentials; mirrored or copied records can repeat an
@@ -318,14 +343,18 @@ reports without this marker are unverified; they must not be used to dismiss
 credential alerts. Detection and redaction still include every occurrence.
 `undated_records` counts readable finding records that produced a timestamp
 coverage warning under `--since`; it is not a count of unreadable files.
-Known file-history snapshots use their nested native timestamp. Missing or
-invalid times in unknown record formats remain unknown and partial.
+Known file-history snapshots use their nested native timestamp. A record
+with no valid time of its own takes the time of the record before it in its
+transcript, which is appended to, and says so (`at_inferred: true`); under
+`--since` that places it only when that time is inside the window. Without
+a record before it, or after one at or before `--since`, its time stays
+unknown and the scan partial.
 No value, message text or fingerprint is emitted. Metadata is scrubbed too,
 including native IDs and path components. There is no `--raw` mode.
 
 `--since` has the same syntax and exclusive boundary as `messages`.
-Undated findings stay visible as `at: null`; with a time filter they make
-the scan partial rather than silently falling outside the window. Damaged
+Findings that stay undated are visible as `at: null`; with a time filter
+they make the scan partial rather than silently falling outside the window. Damaged
 JSON/UTF-8 records, unreadable paths, identity failures, missing selected
 sessions, unsupported exports and known unread OpenCode stores are reported
 in `unreadable` with `complete: false` and exit 4. Valid records around a

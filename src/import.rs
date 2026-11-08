@@ -154,7 +154,11 @@ fn transcript_sources(paths: &[PathBuf]) -> Sources {
 
 /// Secret-shaped occurrences, including tool traffic and subagent transcripts.
 /// Reuses native discovery, identity and lineage; never keeps conversation text.
-pub fn secrets(paths: &[PathBuf], select: &Selection) -> crate::secrets::Report {
+pub fn secrets(
+    paths: &[PathBuf],
+    select: &Selection,
+    held: &crate::held::Held,
+) -> crate::secrets::Report {
     let mut report = crate::secrets::Report::new(select.since);
     let sources = transcript_sources(paths);
     for (path, why) in sources.gaps {
@@ -210,7 +214,7 @@ pub fn secrets(paths: &[PathBuf], select: &Selection) -> crate::secrets::Report 
         }
     }
     for (path, session) in headers.into_iter().filter(|(_, s)| chosen(s)) {
-        crate::secrets::scan_file(&path, &session, select.since, &mut report);
+        crate::secrets::scan_file(&path, &session, select.since, held, &mut report);
     }
     report
 }
