@@ -24,3 +24,6 @@ read-only; Vessa takes no SQLite dependency. Tests that make such a store
 need `sqlite3` on PATH, and CI installs it. Never commit real transcripts or reports; use synthetic fixtures.
 Validate with cargo fmt --check, cargo clippy --all-targets -- -D warnings,
 and cargo test. Run the binary on a fixture before claiming completion.
+The gate is `sykli run`, by this repository's own `sykli.json`: list a new
+file in its tasks' inputs and run `sykli lock sykli.json`, or sykli serves
+an old cached pass.
