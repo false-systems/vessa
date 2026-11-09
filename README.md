@@ -20,7 +20,9 @@ cargo run -- messages --since 7d --json
 ```
 
 `--input` is repeatable and accepts a file or directory. Without it, Vessa
-reads `~/.claude/projects`, `~/.codex/sessions`, and `~/.pi/agent/sessions`.
+reads `~/.claude/projects`, `~/.codex/sessions`, `~/.pi/agent/sessions`, and
+opencode's store (`$XDG_DATA_HOME/opencode/opencode.db`, else
+`~/.local/share/opencode/opencode.db`; see [opencode](#opencode)).
 One of these that does not exist is an agent not installed here, and no gap,
 unless `--agent` asks for that agent: then it is a warning (`codex: not
 installed here`), since what was asked for cannot be read.
@@ -28,7 +30,7 @@ Directories discover native `.jsonl` transcripts; select a wrapper's
 `ohjaa-sessions.v1` `.json` export as an explicit file, so agent metadata JSON
 is not mistaken for a usage source.
 Pass explicit paths for relocated agent directories or a bounded selection.
-Use `--agent claude|codex|pi` or `--session NATIVE-ID` to filter results.
+Use `--agent claude|codex|pi|opencode` or `--session NATIVE-ID` to filter results.
 Missing `--input` paths, malformed records and unsupported formats are
 reported, not silently treated as zero. Exit 4 means the usage evidence is
 partial: a source warning or a session limitation, each printed to stderr, and
@@ -120,6 +122,70 @@ selects the session with its subagents, `status` and `receipt` total them
 (the receipt names them in `limitations`), `stats` counts the session once and
 its subagents apart, and the usage export names them in `subagents`. A thread
 whose `session_meta` names no other session stands alone.
+
+### opencode
+
+opencode keeps every session in one SQLite database. Vessa takes no SQLite
+dependency: it reads the store with the `sqlite3` command (3.33 or newer,
+for `-json`), read-only and with `-init /dev/null`, so a person's
+`~/.sqliterc` cannot change what it prints; it keeps nothing. A store is a
+file given with `--input` that is a SQLite database or ends in `.db`, a file
+named `opencode.db` in a folder given with `--input`, or the default one,
+which is read unless `--agent` asks for another agent. An `XDG_DATA_HOME`
+that is empty or relative is ignored, as the XDG specification says. Vessa
+reads opencode's current layout, the `session_v2` and `session_message`
+tables; a store in any other (a missing table or column, or a file that is
+no SQLite database) is a source warning, never an empty store, and so is a
+store when `sqlite3` is not on `PATH` or cannot print JSON. Older opencode
+kept sessions in a `session` table, which newer opencode copies into
+`session_v2`; one it has not copied is a warning, and not read.
+
+* A session is a row of `session_v2`: its `id`, its `directory` for `cwd`,
+  and its creation for `started_at`; `source` is the store. A message's
+  `seq` stands for its line. Warnings and gaps about one session's messages
+  name the session, since every session counts from 0.
+* Usage: each `assistant` message, and each `compaction` (the summary
+  opencode asks a model for), that records tokens is one request, under its
+  message id, read for the whole store in one query. opencode counts
+  reasoning apart from output; Vessa counts it as output, as Codex's
+  `output_tokens` does. Input is uncached, as opencode keeps it. A response
+  that records no tokens at all, such as an error before any, is no request:
+  a known record with no usage, counted in `synthetic_records`. opencode's
+  `cost` is not read.
+* A session with a `parent_id` is a subagent: opencode keeps one as a session
+  of its own. It counts to the session at the top of its chain, followed as
+  [Codex subagents](#codex-subagents)' lineages are; a chain that loops has
+  no top, and each session in it stands alone, with a limitation.
+* A session with a `fork_session_id` is a fork, and that session is its
+  `parent`, as a Codex fork's is. opencode copies the messages of the
+  session it was forked from up to the fork into it, each under a new id but
+  with its `seq`, creation time and data. A message of the fork whose origin
+  holds one at its `seq` created at the same time is a copy: a copied
+  response counts under the id of the one it copies, so it is counted once,
+  with the origin, and the fork's own total leaves it out. A copied message
+  of a person's was created before the fork, and is `inherited`. A fork
+  whose origin is no longer in the store says that the messages it copied
+  are listed nowhere.
+* Messages: only `user` messages can be a person's. opencode keeps what its
+  harness adds (instruction files it loaded, background shell results,
+  restarts, instruction updates) as `synthetic` and `system` messages,
+  which are no turns. An agent reply is the text blocks of an `assistant`
+  message; one that ended in an error is `failed`, its error message
+  standing for its text when it has none. A person can type into a
+  subagent session, so it is read, as a Claude subagent's transcript is. In
+  one, a `user` message is the prompt an agent wrote (`subagent`) when it
+  opens with "You are a subagent spawned by another session.", as opencode
+  opens each prompt its subagent tool or a command run as a subtask writes,
+  or when it has neither `files` nor `agents`: opencode's prompt box sends
+  both with whatever a person types, and its subagent tool neither.
+  Messages migrated from older opencode keep those only when not empty, so
+  in a migrated subagent session what a person typed may count as a prompt.
+  With `--since`, a session whose newest message is not after it is counted
+  in `unmodified_transcripts` and not read.
+* Secrets: a `user` message is `person`; an assistant's text and reasoning
+  blocks are `agent`; a tool block's `state.input` is `tool_input` and every
+  other field of its `state` is `tool_output`; everything else is `other`.
+  A message whose data is not JSON is a gap, and still scanned as text.
 
 ### Session headers
 
@@ -269,6 +335,8 @@ never adds a reasoning subcategory a second time.
 * Pi: reads assistant, compaction, branch-summary and standalone usage entries.
   Copied entry IDs across forks are counted once,
   with parent sessions processed first when available.
+* opencode: reads assistant and compaction responses (see [opencode](#opencode)).
+  opencode's output count leaves reasoning out, so Vessa adds it once.
 
 Unknown token counters stay `null`. Spending is not imported, calculated or
 displayed: no prices, rate cards, currency estimates, credits or billing fields.
@@ -277,7 +345,7 @@ Legacy cost fields in native transcripts and linked wrapper receipts are ignored
 
 ## Secret-shaped findings
 
-`vessa secrets` scans native Claude Code, Codex and pi records on demand,
+`vessa secrets` scans native Claude Code, Codex, pi and opencode records on demand,
 including subagent and headless transcripts, user/assistant text, tool inputs
 and tool outputs, for **the credentials this machine holds**. A finding is
 an alarm: one of your credentials reached an agent session, and so the
@@ -324,6 +392,7 @@ were every secret-shaped match, not held credentials. Each finding contains
 the native `agent` and `session`, optional `cwd` and `at` (with
 `at_inferred`), source path and line, `where` (`person`, `agent`,
 `tool_input`, `tool_output`, or `other`), detector `rule`, `held` and `count`.
+For opencode, the source is its store and the line is the message's `seq`.
 `person` denotes a native user-role input, not independent verification that
 a human authored it. Counts are matched occurrences in selected native
 records, not unique credentials; mirrored or copied records can repeat an
@@ -432,14 +501,12 @@ so memory holds one transcript at a time:
 * `coverage` says what was read and why each other user turn is not listed:
   `user_turns` is `human` plus every count in `excluded` plus `earlier` and
   `undated` (with `--since`, a message at or before it, or with no time).
-  Codex subagent transcripts and, with `--since`, transcripts last written
-  before it are counted and not read. `gaps` names sources Vessa knows of and
-  does not read. opencode keeps its sessions in SQLite
-  (`~/.local/share/opencode/opencode.db`), and Vessa takes no SQLite
-  dependency, so a default run where that store was written in the window is
-  partial. SQLite writes through the store's `-wal` file, so the window looks
-  at the newer of the two; one written before `--since` holds nothing after
-  it, and is no gap.
+  Codex subagent transcripts (`subagent_transcripts`) and, with `--since`,
+  transcripts last written before it are counted and not read; an opencode
+  store holds every session, so its sessions are placed by their newest
+  message instead. `gaps` names sources Vessa knows of and does not
+  read; every source it knows of is now read, so it stays empty, and remains
+  for consumers of the schema.
 * Exit 4 means the list is partial: a source warning, a gap, or a session
   limitation, each printed to stderr. Transcripts are read in path order, a
   Codex fork after the sessions it was forked from; messages in file order.
@@ -629,11 +696,12 @@ Each session also exports `totals`, calculated by Vessa from deduplicated
 records and grouped by provider/model. Consumers can display these beside work
 evidence without implementing accounting. Unknown categories remain null; older
 exports without this additive field still contain the original usage records.
-`synthetic_records` counts a Claude session's `<synthetic>` messages, read and
-known to hold no usage; it is 0 for other agents.
+`synthetic_records` counts a Claude session's `<synthetic>` messages, and an
+opencode session's responses that recorded no tokens, read and known to hold
+no usage; it is 0 for other agents.
 
 `totals` stays each transcript's own, so summing it across sessions counts
-every request once. Each session also names its Claude and Codex subagents in
+every request once. Each session also names its Claude, Codex and opencode subagents in
 `subagents` and sums itself with them in `totals_with_subagents`: the total to
 show for one session. Without subagents the list is empty and the two totals
 are equal. Subagents remain sessions of their own in the export.

@@ -132,6 +132,12 @@ impl Session {
         if self.agent == "codex" {
             return self.root.as_deref();
         }
+        // opencode keeps a subagent as a session of its own, whose parent
+        // is the session that started it; it counts to the session at the
+        // top of that chain.
+        if self.agent == "opencode" {
+            return self.root.as_deref();
+        }
         let parent = self.parent.as_deref()?;
         (self.agent == "claude" && self.id.strip_prefix(parent)?.starts_with('/')).then_some(parent)
     }
@@ -301,13 +307,18 @@ pub fn receipt(family: &Family) -> Result<serde_json::Value> {
             )
         };
         limitations.push(format!(
-            "Entries include {n} {} {} of this session, each read from its own transcript{named}",
-            if session.agent == "codex" {
-                "Codex"
-            } else {
-                "Claude"
+            "Entries include {n} {} {} of this session, each read from its own {}{named}",
+            match session.agent.as_str() {
+                "codex" => "Codex",
+                "opencode" => "opencode",
+                _ => "Claude",
             },
             if n == 1 { "subagent" } else { "subagents" },
+            if session.agent == "opencode" {
+                "session in opencode's store"
+            } else {
+                "transcript"
+            },
         ));
     }
     limitations.extend(family.limitations());

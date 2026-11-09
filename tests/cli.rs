@@ -1,3 +1,5 @@
+mod support;
+
 use serde_json::Value;
 use std::path::PathBuf;
 use std::process::{Command, Output};
@@ -3299,7 +3301,7 @@ fn messages_select_by_time_session_and_agent() {
             &["--session", "missing"][..],
             "native session missing not found",
         ),
-        (&["--agent", "opencode"][..], "SQLite"),
+        (&["--agent", "cursor"][..], "unsupported agent cursor"),
         (&["--since", "soon"][..], "expected RFC 3339"),
     ] {
         let out = cli(&[&["messages"], &all[..], args].concat());
@@ -3313,8 +3315,291 @@ fn messages_select_by_time_session_and_agent() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// An opencode store at `db`: session `ses_main`, which a person drove, and
+/// `ses_sub`, a subagent it started, which started `ses_grandchild`. A
+/// person also typed into `ses_sub`.
+fn opencode_store(db: &std::path::Path) {
+    use serde_json::json;
+    use support::at;
+    // What opencode's prompt box sends: `files` and `agents` always.
+    let user =
+        |text: &str| json!({"text":text,"time":{"created":0},"files":[],"agents":[]}).to_string();
+    // What its subagent tool sends: neither.
+    let prompt = |text: &str| json!({"text":text,"time":{"created":0}}).to_string();
+    let model = json!({"id":"deepseek-v4-pro","providerID":"deepseek","variant":"default"});
+    let tokens = |input: u64, output: u64, reasoning: u64, read: u64| json!({"input":input,"output":output,"reasoning":reasoning,"cache":{"read":read,"write":0}});
+    let reply = |text: &str, tokens: Value| {
+        json!({"agent":"build","content":[{"type":"text","text":text}],"model":model,"tokens":tokens,"finish":"stop","time":{"created":0}}).to_string()
+    };
+    support::store(
+        db,
+        support::LAYOUT,
+        &[
+            ("ses_main", None, "/demo/widget", at(0)),
+            ("ses_sub", Some("ses_main"), "/demo/widget", at(60)),
+            ("ses_grandchild", Some("ses_sub"), "/demo/widget", at(70)),
+        ],
+        &[
+            ("msg_1", "ses_main", "user", 0, at(1), user("Fix the parser please")),
+            ("msg_2", "ses_main", "synthetic", 1, at(2), json!({"text":"# AGENTS.md\nRules.","description":"Loaded AGENTS.md","metadata":{},"time":{"created":0}}).to_string()),
+            ("msg_3", "ses_main", "assistant", 2, at(3), json!({"agent":"build","content":[
+                {"type":"reasoning","text":"Look at the parser first."},
+                {"type":"text","text":"Parser fixed."},
+                {"type":"tool","id":"call_1","name":"bash","executed":true,"state":{"status":"completed","input":{"command":"cargo test"},"content":[{"type":"text","text":"ok"}],"metadata":{"exit":0}},"time":{}}
+            ],"model":model,"tokens":tokens(100, 20, 5, 50),"finish":"tool-calls","time":{"created":0}}).to_string()),
+            ("msg_4", "ses_main", "user", 3, at(4), user("Now add a test")),
+            ("msg_5", "ses_main", "assistant", 4, at(5), json!({"content":[],"model":model,"tokens":tokens(0, 0, 0, 0),"finish":"error","error":{"type":"api","message":"rate limited"},"time":{"created":0}}).to_string()),
+            ("msg_6", "ses_main", "user", 5, at(6), user("try again")),
+            ("msg_7", "ses_main", "compaction", 6, at(7), json!({"summary":"Parser fixed; a test is next.","model":model,"tokens":tokens(10, 3, 0, 0),"status":"done","time":{"created":0}}).to_string()),
+            ("msg_8", "ses_sub", "user", 0, at(61), prompt("You are a subagent spawned by another session.\nRead the parser and report.")),
+            ("msg_9", "ses_sub", "assistant", 1, at(62), reply("Report.", tokens(7, 2, 1, 3))),
+            ("msg_12", "ses_sub", "user", 2, at(63), user("Use lexer.rs instead.")),
+            // A subagent the tool resumes gets the bare prompt.
+            ("msg_10", "ses_grandchild", "user", 0, at(71), prompt("Count the tests.")),
+            ("msg_11", "ses_grandchild", "assistant", 1, at(72), reply("Three.", tokens(1, 1, 0, 0))),
+        ],
+    );
+}
+
 #[test]
-fn opencode_is_a_known_gap_in_the_default_sources() {
+fn opencode_sessions_are_read_from_its_store() {
+    let dir = temp("opencode");
+    let db = dir.join("opencode.db");
+    opencode_store(&db);
+    let input = db.to_str().unwrap();
+    let store = db.canonicalize().unwrap().display().to_string();
+
+    // Each model response with tokens is one request; reasoning is output,
+    // and an error that recorded no tokens is no request.
+    let usage = value(cli(&["usage", "--input", input, "--json"]));
+    let sessions = usage["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 3);
+    let main = sessions.iter().find(|s| s["id"] == "ses_main").unwrap();
+    assert_eq!(main["agent"], "opencode");
+    assert_eq!(main["cwd"], "/demo/widget");
+    assert_eq!(main["parent"], Value::Null);
+    assert_eq!(main["started_at"], "2026-09-30T09:00:00+00:00");
+    assert_eq!(main["limitations"], serde_json::json!([]));
+    let requests = main["usage"].as_array().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["id"], "msg_3");
+    assert_eq!(requests[0]["source"], store);
+    assert_eq!(requests[0]["line"], 2);
+    assert_eq!(requests[0]["at"], "2026-09-30T09:00:03+00:00");
+    assert_eq!(
+        requests[0]["entry"],
+        serde_json::json!({"provider":"deepseek","model":"deepseek-v4-pro","input_tokens":100,"output_tokens":25,"cache_read_tokens":50,"cache_write_tokens":0})
+    );
+    assert_eq!(requests[1]["id"], "msg_7");
+    let sub = sessions.iter().find(|s| s["id"] == "ses_sub").unwrap();
+    assert_eq!(sub["parent"], "ses_main");
+    let grandchild = sessions
+        .iter()
+        .find(|s| s["id"] == "ses_grandchild")
+        .unwrap();
+    assert_eq!(grandchild["parent"], "ses_sub");
+
+    // A subagent counts to the session at the top of its chain.
+    let status = value(cli(&[
+        "status",
+        "--input",
+        input,
+        "--session",
+        "ses_main",
+        "--json",
+    ]));
+    assert_eq!(
+        status["entries"],
+        serde_json::json!([{"provider":"deepseek","model":"deepseek-v4-pro","input_tokens":118,"output_tokens":32,"cache_read_tokens":53,"cache_write_tokens":0}])
+    );
+    assert_eq!(status["subagents"].as_array().unwrap().len(), 2);
+
+    let headers = value(cli(&["sessions", "--headers", "--input", input, "--json"]));
+    let header = headers["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == "ses_sub")
+        .unwrap();
+    assert_eq!(
+        header,
+        &serde_json::json!({"agent":"opencode","id":"ses_sub","parent":"ses_main","started_at":"2026-09-30T09:01:00+00:00","cwd":"/demo/widget","source":store,"entrypoint":null,"originator":null})
+    );
+
+    // A person writes only `user` messages; what the harness added is no
+    // turn, and in a subagent session neither is what an agent prompted.
+    let (v, code) = messages(&["--input", input]);
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(
+        texts(&v),
+        [
+            "Fix the parser please",
+            "Now add a test",
+            "try again",
+            "Use lexer.rs instead."
+        ]
+    );
+    let m = v["messages"].as_array().unwrap();
+    assert_eq!(m[0]["agent"], "opencode");
+    assert_eq!(m[0]["session"], "ses_main");
+    assert_eq!(m[0]["id"], "msg_1");
+    assert_eq!(m[0]["source"], store);
+    assert_eq!(m[0]["line"], 0);
+    assert_eq!(m[0]["at"], "2026-09-30T09:00:01+00:00");
+    assert_eq!(m[0]["reply"], Value::Null);
+    assert_eq!(m[1]["reply"]["text"], "Parser fixed.");
+    assert_eq!(m[1]["reply"]["line"], 2);
+    assert_eq!(m[2]["reply"]["text"], "rate limited");
+    assert_eq!(m[2]["reply"]["failed"], true);
+    assert_eq!(m[3]["session"], "ses_sub");
+    assert_eq!(m[3]["parent"], "ses_main");
+    assert_eq!(m[3]["reply"]["text"], "Report.");
+    assert_eq!(v["coverage"]["human"], 4);
+    assert_eq!(excluded(&v)["subagent"], 2);
+    assert_eq!(v["coverage"]["subagent_transcripts"], 0);
+
+    // opencode's sessions are selected as any agent's, and each message is
+    // placed in the window by its own time.
+    let (v, _) = messages(&[
+        "--input",
+        input,
+        "--agent",
+        "opencode",
+        "--session",
+        "ses_main",
+    ]);
+    assert_eq!(texts(&v).len(), 4);
+    let (v, code) = messages(&["--input", input, "--since", "2026-09-30T09:00:04Z"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(texts(&v), ["try again", "Use lexer.rs instead."]);
+    // A session with no message after the window starts is not read.
+    let (v, code) = messages(&["--input", input, "--since", "2026-09-30T10:00:00Z"]);
+    assert_eq!(code, Some(0));
+    assert!(texts(&v).is_empty());
+    assert_eq!(v["coverage"]["unmodified_transcripts"], 3);
+    assert_eq!(v["coverage"]["transcripts"], 0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn opencode_lineage_loops_forks_and_responses_without_tokens() {
+    use serde_json::json;
+    use support::at;
+    let dir = temp("opencode-edges");
+    let folder = dir.join("store");
+    let db = folder.join("opencode.db");
+    let said = |text: &str| json!({"text":text,"files":[],"agents":[]}).to_string();
+    let answer = |input: u64| {
+        json!({"content":[{"type":"text","text":"Done."}],"model":{"id":"m","providerID":"p"},"tokens":{"input":input,"output":1,"reasoning":0,"cache":{"read":0,"write":0}},"finish":"stop"}).to_string()
+    };
+    let tokenless = json!({"content":[],"model":{"id":"m","providerID":"p"},"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"finish":"error","error":{"message":"no key"}}).to_string();
+    support::store(
+        &db,
+        support::LAYOUT,
+        &[
+            ("ses_err", None, "/demo", at(0)),
+            ("ses_a", Some("ses_b"), "/demo", at(10)),
+            ("ses_b", Some("ses_a"), "/demo", at(20)),
+            ("ses_origin", None, "/demo", at(40)),
+            ("ses_fork", None, "/demo", at(50)),
+            ("ses_orphan", None, "/demo", at(60)),
+        ],
+        &[
+            ("m1", "ses_err", "user", 0, at(1), said("hello")),
+            ("m2", "ses_err", "assistant", 1, at(2), tokenless.clone()),
+            ("m3", "ses_a", "assistant", 0, at(11), tokenless.clone()),
+            ("m4", "ses_b", "assistant", 0, at(21), tokenless),
+            ("o1", "ses_origin", "user", 0, at(41), said("start here")),
+            ("o2", "ses_origin", "assistant", 1, at(42), answer(5)),
+            // opencode copies the origin into a fork: new ids, the same seq,
+            // creation time and data.
+            ("f1", "ses_fork", "user", 0, at(41), said("start here")),
+            ("f2", "ses_fork", "assistant", 1, at(42), answer(5)),
+            ("f3", "ses_fork", "user", 2, at(51), said("forked")),
+            ("f4", "ses_fork", "assistant", 3, at(52), answer(2)),
+            // A fork of a session no longer in the store.
+            ("g1", "ses_orphan", "user", 0, at(5), said("copied")),
+            ("g2", "ses_orphan", "user", 1, at(61), said("mine")),
+        ],
+    );
+    support::sql(
+        &db,
+        "UPDATE session_v2 SET fork_session_id = 'ses_origin', fork_boundary = '{\"messageID\":\"o2\",\"type\":\"after\"}' WHERE id = 'ses_fork';
+         UPDATE session_v2 SET fork_session_id = 'ses_gone', fork_boundary = '{\"messageID\":\"x\",\"type\":\"after\"}' WHERE id = 'ses_orphan';",
+    );
+    let (db, folder) = (db.to_str().unwrap(), folder.to_str().unwrap());
+
+    // The store in a folder given with --input is read. A response that
+    // recorded no tokens is a known record with no usage, not unknown usage.
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        folder,
+        "--session",
+        "ses_err",
+        "--json",
+    ]));
+    assert_eq!(v["sessions"][0]["synthetic_records"], 1);
+    assert_eq!(v["sessions"][0]["limitations"], json!([]));
+
+    // A lineage that loops has no root. Headers carry no limitation.
+    let headers = value(cli(&["sessions", "--headers", "--input", db, "--json"]));
+    let header = |id: &str| {
+        headers["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(headers["sessions"].as_array().unwrap().len(), 6);
+    // A fork's parent is the session it was forked from.
+    assert_eq!(header("ses_fork")["parent"], "ses_origin");
+    let out = cli(&["usage", "--input", db, "--json"]);
+    assert_eq!(out.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let session = |id: &str| {
+        v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert!(session("ses_a")["limitations"]
+        .to_string()
+        .contains("opencode subagent lineage loops"));
+    // A fork's copy of a response is counted once, with its origin.
+    let ids = |id: &str| -> Vec<String> {
+        session(id)["usage"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|u| u["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(ids("ses_origin"), ["o2"]);
+    assert_eq!(ids("ses_fork"), ["f4"]);
+
+    // A fork's copies are its origin's messages, created before it.
+    let (v, code) = messages(&["--input", db, "--session", "ses_fork"]);
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(texts(&v), ["forked"]);
+    assert_eq!(excluded(&v)["inherited"], 1);
+    // Of a fork whose origin is gone, the copies are listed nowhere: said.
+    let (v, code) = messages(&["--input", db, "--session", "ses_orphan"]);
+    assert_eq!(code, Some(4));
+    assert_eq!(texts(&v), ["mine"]);
+    assert!(v["coverage"]["limitations"]
+        .to_string()
+        .contains("opencode fork of ses_gone, which is not in the store"));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn opencode_is_read_from_the_default_sources() {
     let home = temp("home");
     for dir in [
         ".claude/projects/demo",
@@ -3329,58 +3614,107 @@ fn opencode_is_a_known_gap_in_the_default_sources() {
     )
     .unwrap();
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_vessa"))
+        let out = Command::new(env!("CARGO_BIN_EXE_vessa"))
             .args(args)
             .env("HOME", &home)
             .env_remove("XDG_DATA_HOME")
             .output()
-            .unwrap()
+            .unwrap();
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+        (v, out.status.code())
     };
-    let out = run(&["messages", "--json"]);
-    assert_eq!(out.status.code(), Some(0));
-    let db = home.join(".local/share/opencode");
-    std::fs::create_dir_all(&db).unwrap();
-    std::fs::write(db.join("opencode.db"), "").unwrap();
-    let out = run(&["messages", "--json"]);
-    assert_eq!(out.status.code(), Some(4));
-    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // No store: opencode is not installed here, which is no gap, unless it
+    // is asked for.
+    let (v, code) = run(&["messages", "--json"]);
+    assert_eq!(code, Some(0));
     assert_eq!(texts(&v).len(), 3);
-    assert!(v["coverage"]["gaps"][0]
+    assert_eq!(run(&["messages", "--agent", "opencode"]).1, Some(4));
+    let db = home.join(".local/share/opencode/opencode.db");
+    opencode_store(&db);
+    let (v, code) = run(&["messages", "--json"]);
+    assert_eq!(code, Some(0), "{v}");
+    assert_eq!(texts(&v).len(), 7);
+    assert!(v["coverage"]["gaps"].as_array().unwrap().is_empty());
+    let (v, code) = run(&["messages", "--json", "--agent", "opencode"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(texts(&v).len(), 4);
+    // An XDG_DATA_HOME that is not absolute is ignored, as opencode
+    // ignores it.
+    let out = Command::new(env!("CARGO_BIN_EXE_vessa"))
+        .args(["messages", "--json", "--agent", "opencode"])
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", "relative/data")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(texts(&v).len(), 4);
+    // A store that is no SQLite database is unreadable, never empty...
+    std::fs::write(&db, "").unwrap();
+    let (v, code) = run(&["messages", "--json"]);
+    assert_eq!(code, Some(4));
+    assert_eq!(texts(&v).len(), 3);
+    assert!(v["warnings"][0]
         .as_str()
         .unwrap()
-        .starts_with("opencode: "));
-    // Asked for one agent, the others are no gap.
-    assert_eq!(
-        run(&["messages", "--agent", "claude"]).status.code(),
-        Some(0)
-    );
-    // A store last written before the window holds nothing from it.
-    let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-    let age = |path: &std::path::Path| {
-        std::fs::File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(old)
-            .unwrap()
-    };
-    age(&db.join("opencode.db"));
-    let out = run(&["messages", "--json", "--since", "7d"]);
-    assert_eq!(out.status.code(), Some(0));
-    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert!(v["coverage"]["gaps"].as_array().unwrap().is_empty());
-    // SQLite writes through its WAL: a recent one is a gap.
-    std::fs::write(db.join("opencode.db-wal"), "").unwrap();
-    assert_eq!(
-        run(&["messages", "--json", "--since", "7d"]).status.code(),
-        Some(4)
-    );
-    age(&db.join("opencode.db-wal"));
-    assert_eq!(
-        run(&["messages", "--json", "--since", "7d"]).status.code(),
-        Some(0)
-    );
+        .contains("not a SQLite database"));
+    // ...and no gap in what another agent is asked for.
+    assert_eq!(run(&["messages", "--json", "--agent", "claude"]).1, Some(0));
+    assert_eq!(run(&["usage", "--json", "--agent", "claude"]).1, Some(0));
     std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn opencode_stores_vessa_cannot_read_are_said_to_be() {
+    let dir = temp("opencode-unreadable");
+    std::fs::create_dir_all(&dir).unwrap();
+    // The run of `command` on `db`: it is partial, and says why.
+    let said = |command: &str, db: &std::path::Path, path: Option<&str>| {
+        let mut run = Command::new(env!("CARGO_BIN_EXE_vessa"));
+        run.args([command, "--input"]).arg(db);
+        if let Some(path) = path {
+            run.env("PATH", path);
+        }
+        let out = run.output().unwrap();
+        assert_eq!(out.status.code(), Some(4), "{command} {}", db.display());
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let empty = dir.join("empty.db");
+    std::fs::write(&empty, "").unwrap();
+    let unrelated = dir.join("unrelated.db");
+    support::store(&unrelated, "CREATE TABLE notes (body text);", &[], &[]);
+    let changed = dir.join("changed.db");
+    support::store(
+        &changed,
+        &support::LAYOUT.replace("`data` text NOT NULL,", ""),
+        &[],
+        &[],
+    );
+    for command in ["usage", "messages", "sessions"] {
+        assert!(said(command, &empty, None).contains("not a SQLite database"));
+        assert!(said(command, &unrelated, None).contains("no session_v2 table"));
+        assert!(said(command, &changed, None).contains("session_message has no data"));
+    }
+    // Without sqlite3 the store cannot be read at all.
+    let db = dir.join("opencode.db");
+    opencode_store(&db);
+    for command in ["usage", "messages"] {
+        assert!(said(command, &db, Some("")).contains("sqlite3 not found on PATH"));
+    }
+    // Sessions only older opencode's table holds are in the store, unread.
+    let older = dir.join("older.db");
+    support::store(
+        &older,
+        &format!(
+            "{}{}INSERT INTO session VALUES ('ses_old', '/demo', 0);",
+            support::LAYOUT,
+            support::OLDER
+        ),
+        &[("ses_new", None, "/demo", support::at(0))],
+        &[],
+    );
+    assert!(said("usage", &older, None).contains("1 session(s) in opencode's older layout"));
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 /// Codex's question tool asking `questions` (title, options), as item `id`.

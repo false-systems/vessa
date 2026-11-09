@@ -37,6 +37,30 @@ jobs:
           toolchain: "1.98"
           components: clippy, rustfmt
 
+      # The opencode tests make and read SQLite stores with the sqlite3
+      # command, as Vessa reads opencode's store.
+      - name: Ensure sqlite3
+        run: |
+          if command -v sqlite3 >/dev/null 2>&1; then
+            sqlite3 --version
+            exit 0
+          fi
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::error::runner has no sqlite3 and no apt-get to install it"
+            exit 1
+          fi
+          sudo_cmd=""
+          if [ "$(id -u)" -ne 0 ]; then
+            if ! command -v sudo >/dev/null 2>&1; then
+              echo "::error::runner has no sqlite3 and needs sudo or root to install it"
+              exit 1
+            fi
+            sudo_cmd="sudo"
+          fi
+          $sudo_cmd apt-get update
+          $sudo_cmd apt-get install -y --no-install-recommends sqlite3
+          sqlite3 --version
+
       - name: Check formatting
         run: cargo fmt --check
 
