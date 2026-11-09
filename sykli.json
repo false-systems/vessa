@@ -1,0 +1,119 @@
+{
+  "schema": "sykli-contract.v1",
+  "tasks": [
+    {
+      "name": "fmt",
+      "run": "cargo fmt --check",
+      "inputs": [
+        ".github/workflows/ci.yml",
+        ".gitignore",
+        ".toimija/repo.yaml",
+        "AGENTS.md",
+        "Cargo.lock",
+        "Cargo.toml",
+        "README.md",
+        "examples/claude-subagent.jsonl",
+        "examples/claude.jsonl",
+        "examples/codex.jsonl",
+        "examples/pi.jsonl",
+        "examples/work.jsonl",
+        "rust-toolchain.toml",
+        "src/held.rs",
+        "src/import.rs",
+        "src/main.rs",
+        "src/metrics.rs",
+        "src/model.rs",
+        "src/opencode.rs",
+        "src/render.rs",
+        "src/scrub.rs",
+        "src/secrets.rs",
+        "src/work.rs",
+        "tests/cli.rs",
+        "tests/secrets.rs",
+        "tests/support/mod.rs"
+      ],
+      "env": {
+        "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+      }
+    },
+    {
+      "name": "clippy",
+      "run": "cargo clippy --workspace --all-targets -- -D warnings",
+      "after": [
+        "fmt"
+      ],
+      "inputs": [
+        ".github/workflows/ci.yml",
+        ".gitignore",
+        ".toimija/repo.yaml",
+        "AGENTS.md",
+        "Cargo.lock",
+        "Cargo.toml",
+        "README.md",
+        "examples/claude-subagent.jsonl",
+        "examples/claude.jsonl",
+        "examples/codex.jsonl",
+        "examples/pi.jsonl",
+        "examples/work.jsonl",
+        "rust-toolchain.toml",
+        "src/held.rs",
+        "src/import.rs",
+        "src/main.rs",
+        "src/metrics.rs",
+        "src/model.rs",
+        "src/opencode.rs",
+        "src/render.rs",
+        "src/scrub.rs",
+        "src/secrets.rs",
+        "src/work.rs",
+        "tests/cli.rs",
+        "tests/secrets.rs",
+        "tests/support/mod.rs"
+      ],
+      "env": {
+        "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+      }
+    },
+    {
+      "name": "test",
+      "run": "cargo test --workspace",
+      "after": [
+        "fmt"
+      ],
+      "inputs": [
+        ".github/workflows/ci.yml",
+        ".gitignore",
+        ".toimija/repo.yaml",
+        "AGENTS.md",
+        "Cargo.lock",
+        "Cargo.toml",
+        "README.md",
+        "examples/claude-subagent.jsonl",
+        "examples/claude.jsonl",
+        "examples/codex.jsonl",
+        "examples/pi.jsonl",
+        "examples/work.jsonl",
+        "rust-toolchain.toml",
+        "src/held.rs",
+        "src/import.rs",
+        "src/main.rs",
+        "src/metrics.rs",
+        "src/model.rs",
+        "src/opencode.rs",
+        "src/render.rs",
+        "src/scrub.rs",
+        "src/secrets.rs",
+        "src/work.rs",
+        "tests/cli.rs",
+        "tests/secrets.rs",
+        "tests/support/mod.rs"
+      ],
+      "env": {
+        "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
+        "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
+      }
+    }
+  ]
+}
