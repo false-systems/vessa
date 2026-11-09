@@ -748,6 +748,44 @@ fn scan_secrets(cli: &Cli, from: Option<&str>) -> Result<i32> {
                 "scan incomplete (exit 4)"
             }
         );
+        let (opaque, unknown) =
+            findings
+                .iter()
+                .try_fold((0u64, 0u64), |(opaque, unknown), finding| -> Result<_> {
+                    if finding["opaque_count"].is_null() {
+                        Ok((
+                            opaque,
+                            unknown
+                                .checked_add(
+                                    finding["count"].as_u64().context("finding without count")?,
+                                )
+                                .context("unknown-context count overflow")?,
+                        ))
+                    } else {
+                        Ok((
+                            opaque
+                                .checked_add(
+                                    finding["opaque_count"]
+                                        .as_u64()
+                                        .context("invalid context count")?,
+                                )
+                                .context("context count overflow")?,
+                            unknown,
+                        ))
+                    }
+                })?;
+        println!("  Unconfirmed occurrences, not distinct credentials.");
+        if unknown == 0 {
+            println!("  {opaque} in signature/encrypted fields.");
+        } else {
+            println!("  At least {opaque} in signature/encrypted fields; context unknown for {unknown} occurrences.");
+        }
+        let undated = value["undated_records"]
+            .as_u64()
+            .context("missing timestamp coverage")?;
+        if undated > 0 {
+            println!("  {undated} finding record(s) have no timestamp; they remain included.");
+        }
         for f in findings {
             let text = |key: &str| render::for_terminal(f[key].as_str().unwrap_or("unknown"));
             println!(

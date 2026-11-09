@@ -41,6 +41,141 @@ impl Drop for Fixture {
 fn key() -> String {
     ["s", "k-", &"a1".repeat(12)].concat()
 }
+
+#[test]
+fn explicit_secret_labels_survive_the_native_scan_without_changing_redaction() {
+    let f = Fixture::new();
+    let value = ["Ab3dE5gH7jK9mN1pQ3sT", "5vW7yZ9bC1dF3hJ5kL7mN9p"].concat();
+    let path = f.file("labelled-codex.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"labelled-codex","cwd":"/fixture"}}),
+        json!({"type":"event_msg","timestamp":"2026-10-01T00:00:01Z","payload":{"type":"user_message","message":format!("password: {value}")}}),
+        json!({"type":"event_msg","timestamp":"2026-10-01T00:00:02Z","payload":{"type":"user_message","message":value}})
+    ]);
+    let output = f.run(&path, &["--json"]);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(&value));
+    let doc = document(&output, 0);
+    let rows = doc["findings"].as_array().unwrap();
+    for rule in ["named_secret", "mixed_token"] {
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["rule"] == rule)
+                .map(|row| row["count"].as_u64().unwrap())
+                .sum::<u64>(),
+            1,
+            "{doc}"
+        );
+    }
+    assert_eq!(rows.len(), 2, "{doc}");
+}
+
+#[test]
+fn opaque_transport_matches_are_counted_without_hiding_key_shaped_values() {
+    let f = Fixture::new();
+    let at = "2026-10-01T00:00:01Z";
+    let opaque = "Q7hB4mR9vT2kN8pS6xA3dF5jL1cE0uWz";
+    let claude = f.file("opaque-claude.jsonl", &[
+        json!({"type":"assistant","sessionId":"opaque-claude","cwd":"/fixture","timestamp":at,"message":{"role":"assistant","content":[{"type":"thinking","thinking":key(),"signature":opaque}]}})
+    ]);
+    let codex = f.file("opaque-codex.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"opaque-codex","cwd":"/fixture"}}),
+        json!({"type":"response_item","timestamp":at,"payload":{"type":"reasoning","summary":[],"encrypted_content":opaque}}),
+        json!({"type":"response_item","timestamp":at,"payload":{"type":"reasoning","summary":[],"encrypted_content":key()}})
+    ]);
+    for path in [claude, codex] {
+        let value = document(&f.run(&path, &["--json"]), 0);
+        let rows = value["findings"].as_array().unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row["count"].as_u64().unwrap())
+                .sum::<u64>(),
+            2
+        );
+        let opaque_count: u64 = rows
+            .iter()
+            .map(|row| {
+                row["opaque_count"]
+                    .as_u64()
+                    .expect("every new finding reports context coverage")
+            })
+            .sum();
+        assert!(
+            rows.iter().all(|row| row["opaque_native"] == true),
+            "decoded context is explicitly native-position verified: {value}"
+        );
+        assert_eq!(
+            opaque_count,
+            if path.ends_with("opaque-claude.jsonl") {
+                1
+            } else {
+                2
+            }
+        );
+        assert!(rows.iter().any(|row| row["rule"] == "openai"));
+        assert!(!String::from_utf8_lossy(&f.run(&path, &["--json"]).stdout).contains(opaque));
+    }
+}
+
+#[test]
+fn user_supplied_or_unknown_blocks_cannot_claim_native_opaque_context() {
+    let f = Fixture::new();
+    let opaque = "Q7hB4mR9vT2kN8pS6xA3dF5jL1cE0uWz";
+    let at = "2026-10-01T00:00:01Z";
+    let claude = f.file("user-claude.jsonl", &[
+        json!({"type":"user","sessionId":"user-claude","cwd":"/fixture","timestamp":at,"message":{"role":"user","content":[{"type":"thinking","signature":opaque}]}})
+    ]);
+    let codex = f.file("user-codex.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"user-codex","cwd":"/fixture"}}),
+        json!({"type":"response_item","timestamp":at,"payload":{"type":"message","role":"user","content":[{"type":"reasoning","encrypted_content":opaque}]}}),
+        json!({"type":"reasoning","timestamp":at,"encrypted_content":opaque})
+    ]);
+    for path in [claude, codex] {
+        let value = document(&f.run(&path, &["--json"]), 0);
+        let rows = value["findings"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter()
+                .all(|row| row["count"] == 1 && row["opaque_count"] == 0),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn nested_file_history_times_are_honored_without_inventing_times_for_unknown_records() {
+    let f = Fixture::new();
+    let path = f.file("history.jsonl", &[
+        json!({"type":"user","sessionId":"history","cwd":"/fixture","timestamp":"2026-10-01T00:00:00Z","message":{"role":"user","content":"Synthetic header"}}),
+        json!({"type":"file-history-snapshot","snapshot":{"timestamp":"2026-09-30T00:00:00Z","data":key()}}),
+        json!({"type":"file-history-snapshot","snapshot":{"timestamp":"2026-10-01T00:00:01Z","data":key()}}),
+        json!({"type":"future_record","snapshot":{"timestamp":"2026-10-01T00:00:01Z"},"data":key()})
+    ]);
+    let value = document(
+        &f.run(&path, &["--json", "--since", "2026-10-01T00:00:00Z"]),
+        4,
+    );
+    let rows = value["findings"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{value}");
+    assert_eq!(rows.iter().filter(|row| row["at"].is_null()).count(), 1);
+    assert_eq!(value["undated_records"], 1);
+    assert_eq!(value["unreadable"].as_array().unwrap().len(), 1);
+    assert_eq!(value["complete"], false);
+}
+
+#[test]
+fn nested_history_times_are_not_borrowed_by_other_native_formats() {
+    let f = Fixture::new();
+    let path = f.file("codex-unknown-history.jsonl", &[
+        json!({"type":"session_meta","payload":{"id":"unknown-history","cwd":"/fixture"}}),
+        json!({"type":"file-history-snapshot","snapshot":{"timestamp":"2026-09-30T00:00:00Z","data":key()}})
+    ]);
+    let value = document(
+        &f.run(&path, &["--json", "--since", "2026-10-01T00:00:00Z"]),
+        4,
+    );
+    assert_eq!(value["findings"].as_array().unwrap().len(), 1);
+    assert!(value["findings"][0]["at"].is_null());
+    assert_eq!(value["undated_records"], 1);
+}
 fn document(out: &Output, expected: i32) -> Value {
     assert_eq!(
         out.status.code(),
@@ -152,6 +287,16 @@ fn secrets_keep_good_records_and_unknown_times_without_claiming_complete_coverag
     assert_eq!(value["complete"], false);
     assert_eq!(value["findings"].as_array().unwrap().len(), 3, "{value}");
     assert_eq!(value["unreadable"].as_array().unwrap().len(), 3, "{value}");
+    let damaged = value["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["line"] == 5)
+        .unwrap();
+    assert!(
+        damaged["opaque_count"].is_null(),
+        "damaged records have unknown structured context: {value}"
+    );
     assert!(value["findings"]
         .as_array()
         .unwrap()

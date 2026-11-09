@@ -283,6 +283,13 @@ and tool outputs. It uses the same detector as message redaction. These are
 heuristic matches, not proof that a credential is valid or that an archive
 contains no other kind of secret. Nothing is stored; no network is used.
 
+Rule names describe the evidence, not severity or confirmation. Recognised key
+formats take precedence, then explicit secret labels (`password`, `api_key`,
+`token`, and similar words), then the generic long mixed-string heuristic.
+A long labelled value is `named_secret`, not merely `mixed_token`; the value
+is redacted once either way. Generic matches alone can also be identifiers,
+encoded data or examples. Every occurrence and coverage gap is still reported.
+
 ```sh
 cargo run -- secrets --input examples/codex.jsonl --json
 cargo run -- secrets --since 7d --agent claude
@@ -296,6 +303,23 @@ The `vessa-secrets.v1` document carries `complete`, `since`, `transcripts`,
 a human authored it. Counts are matched occurrences in selected native
 records, not unique credentials; mirrored or copied records can repeat an
 occurrence. Canonical source paths are read only once per invocation.
+Each finding also reports `opaque_count`: a measured subset of `count` in
+native Claude thinking-signature or Codex encrypted-reasoning fields. These
+fields are still scanned, including for provider-shaped keys; their context
+is not an exemption or a claim that their contents are safe. Older producers
+may omit this field, which means unknown, not zero. Retained matches from
+damaged records carry null context because their native fields could not be
+decoded; summaries keep known counts as lower bounds.
+`opaque_native: true` explicitly verifies that positive opaque subsets were
+classified at native transport positions: Claude assistant thinking blocks
+or Codex response-item reasoning payloads. User blocks, tool content, unknown
+records and merely matching field names do not gain that context. Older
+reports without this marker are unverified; they must not be used to dismiss
+credential alerts. Detection and redaction still include every occurrence.
+`undated_records` counts readable finding records that produced a timestamp
+coverage warning under `--since`; it is not a count of unreadable files.
+Known file-history snapshots use their nested native timestamp. Missing or
+invalid times in unknown record formats remain unknown and partial.
 No value, message text or fingerprint is emitted. Metadata is scrubbed too,
 including native IDs and path components. There is no `--raw` mode.
 
