@@ -1,3 +1,5 @@
+mod support;
+
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -447,7 +449,127 @@ fn secrets_report_unsupported_and_empty_sources_as_partial() {
     assert!(value["unreadable"][0]["why"]
         .as_str()
         .unwrap()
-        .contains("SQLite"));
+        .contains("not a SQLite database"));
+}
+
+#[test]
+fn secrets_are_found_in_opencode_sessions() {
+    let f = Fixture::new();
+    let db = f.0.join("opencode.db");
+    let tool = json!({"type":"tool","id":"call_1","name":"bash","executed":true,"state":{
+        "status":"completed",
+        "input":{"command":format!("curl -H 'X-Api-Key: {}' https://example.invalid", key())},
+        "content":[{"type":"text","text":format!("FIXTURE_API_KEY={}", key())}],
+        "metadata":{"exit":0}
+    }});
+    support::store(
+        &db,
+        support::LAYOUT,
+        &[("ses_main", None, "/fixture", support::at(0))],
+        &[
+            (
+                "msg_1",
+                "ses_main",
+                "user",
+                0,
+                support::at(1),
+                json!({"text":format!("Use {} for the API.", key())}).to_string(),
+            ),
+            (
+                "msg_2",
+                "ses_main",
+                "assistant",
+                1,
+                support::at(2),
+                json!({"content":[{"type":"text","text":"Calling it."}, tool]}).to_string(),
+            ),
+            (
+                "msg_3",
+                "ses_main",
+                "synthetic",
+                2,
+                support::at(3),
+                json!({"text":"Loaded AGENTS.md"}).to_string(),
+            ),
+            (
+                "msg_4",
+                "ses_main",
+                "assistant",
+                3,
+                support::at(4),
+                format!("{{\"content\": [\"{}\"", key()),
+            ),
+        ],
+    );
+    let sqlite3 = support::sqlite3_dir();
+    let env = [
+        ("FIXTURE_API_KEY", key()),
+        ("PATH", sqlite3.display().to_string()),
+    ];
+    let env: Vec<(&str, &str)> = env.iter().map(|(n, v)| (*n, v.as_str())).collect();
+    // The damaged message is a gap; what it holds is still found.
+    let v = document(&f.run_with(&db, &["--json"], &env), 4);
+    assert_eq!(v["transcripts"], 1);
+    let store = db.canonicalize().unwrap().display().to_string();
+    let found: Vec<(u64, &str, u64, &str)> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            assert_eq!(f["agent"], "opencode");
+            assert_eq!(f["session"], "ses_main");
+            assert_eq!(f["cwd"], "/fixture");
+            assert_eq!(f["source"], store);
+            assert_eq!(f["held"], "environment variable FIXTURE_API_KEY");
+            (
+                f["line"].as_u64().unwrap(),
+                f["where"].as_str().unwrap(),
+                f["count"].as_u64().unwrap(),
+                f["at"].as_str().unwrap_or("none"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        found,
+        [
+            (0, "person", 1, "2026-09-30T09:00:01+00:00"),
+            (1, "tool_input", 1, "2026-09-30T09:00:02+00:00"),
+            (1, "tool_output", 1, "2026-09-30T09:00:02+00:00"),
+            (3, "other", 1, "none"),
+        ]
+    );
+    let gaps = v["unreadable"].as_array().unwrap();
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0]["line"], 3);
+    assert!(gaps[0]["why"].as_str().unwrap().contains("malformed JSON"));
+    // Each message is placed in the window by its own time.
+    let v = document(
+        &f.run_with(&db, &["--json", "--since", "2026-09-30T09:00:01Z"], &env),
+        4,
+    );
+    let lines: Vec<u64> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["line"].as_u64().unwrap())
+        .collect();
+    assert_eq!(lines, [1, 1, 3]);
+    // Without sqlite3 the store cannot be read: a gap, never an all-clear.
+    // (With no PATH at all, the system's default search path still finds
+    // /usr/bin's; an empty one finds nothing.)
+    let v = document(
+        &f.run_with(
+            &db,
+            &["--json"],
+            &[("FIXTURE_API_KEY", &key()), ("PATH", "")],
+        ),
+        4,
+    );
+    assert_eq!(v["transcripts"], 0);
+    assert!(v["unreadable"][0]["why"]
+        .as_str()
+        .unwrap()
+        .contains("sqlite3 not found on PATH"));
 }
 
 #[test]

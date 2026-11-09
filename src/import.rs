@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 pub fn read(paths: &[PathBuf]) -> Result<Report> {
     // ponytail: selected transcripts are held in memory; stream compact
     // summaries if archive size makes this one-shot reader too expensive.
-    let (mut report, wrappers) = sessions(paths, parse_file);
+    let (mut report, wrappers) = sessions(paths, parse_file, true);
     roots(&mut report.sessions.iter_mut().collect::<Vec<_>>(), true);
     deduplicate(&mut report);
     link(&mut report, wrappers);
@@ -20,7 +20,7 @@ pub fn read(paths: &[PathBuf]) -> Result<Report> {
 /// of its records as settle them (see [`Scan::settled`]). No usage is read,
 /// so the sessions carry no usage and no limitations.
 pub fn headers(paths: &[PathBuf]) -> Result<Report> {
-    let (mut report, wrappers) = sessions(paths, header_file);
+    let (mut report, wrappers) = sessions(paths, header_file, false);
     // Headers carry no limitations: a looping lineage stands alone silently.
     roots(&mut report.sessions.iter_mut().collect::<Vec<_>>(), false);
     report.schema = "vessa-session-headers.v1".into();
@@ -31,13 +31,35 @@ pub fn headers(paths: &[PathBuf]) -> Result<Report> {
 /// Every transcript under `paths`, read with `parse`, one session per native
 /// identity, parents first; with the ohjaa wrapper records selected. Both
 /// readers start here, so they list the same sessions in the same order.
-fn sessions(paths: &[PathBuf], parse: fn(&Path) -> Result<Parsed>) -> (Report, Vec<Value>) {
+/// An opencode store's sessions come with them, their usage read when
+/// `usage`.
+fn sessions(
+    paths: &[PathBuf],
+    parse: fn(&Path) -> Result<Parsed>,
+    usage: bool,
+) -> (Report, Vec<Value>) {
     let mut report = Report {
         schema: "vessa-usage.v2".into(),
         ..Default::default()
     };
-    let files = transcripts(paths, &mut report.warnings);
+    let Sources { files, stores, .. } = transcripts(paths, &mut report.warnings);
     let mut wrappers = Vec::new();
+    for store in stores {
+        match crate::opencode::sessions(&store) {
+            Ok((mut sessions, warnings)) => {
+                report.warnings.extend(warnings);
+                if usage {
+                    for s in &mut sessions {
+                        opencode_usage(&store, s);
+                    }
+                }
+                report.sessions.extend(sessions);
+            }
+            Err(error) => report
+                .warnings
+                .push(format!("{}: {error:#}", store.display())),
+        }
+    }
     for file in files {
         match parse(&file) {
             Ok(Parsed::Session(session)) => report.sessions.push(*session),
@@ -111,27 +133,37 @@ fn roots(sessions: &mut [&mut Session], limit: bool) {
 }
 
 /// Every file under `paths` that may be a transcript or an ohjaa export, in
-/// path order, once each; what could not be listed is a warning.
-fn transcripts(paths: &[PathBuf], warnings: &mut Vec<String>) -> Vec<PathBuf> {
-    let sources = transcript_sources(paths);
+/// path order, once each, and the opencode stores given; what could not be
+/// listed is a warning.
+fn transcripts(paths: &[PathBuf], warnings: &mut Vec<String>) -> Sources {
+    let mut sources = transcript_sources(paths);
     warnings.extend(
-        sources
-            .gaps
+        std::mem::take(&mut sources.gaps)
             .into_iter()
             .map(|(path, why)| format!("{}: {why}", path.display())),
     );
-    sources.files
+    sources
 }
 
 struct Sources {
     files: Vec<PathBuf>,
+    /// opencode stores: SQLite databases, each holding many sessions.
+    stores: Vec<PathBuf>,
     gaps: Vec<(PathBuf, String)>,
 }
 
 fn transcript_sources(paths: &[PathBuf]) -> Sources {
     let mut files = Vec::new();
+    let mut stores = Vec::new();
     let mut gaps = Vec::new();
     for path in paths {
+        if crate::opencode::is_store(path) {
+            match path.canonicalize() {
+                Ok(store) => stores.push(store),
+                Err(error) => gaps.push((path.clone(), error.to_string())),
+            }
+            continue;
+        }
         if let Err(error) = discover(path, &mut files) {
             gaps.push((path.clone(), error.to_string()));
         }
@@ -149,7 +181,13 @@ fn transcript_sources(paths: &[PathBuf]) -> Sources {
     }
     files.sort();
     files.dedup();
-    Sources { files, gaps }
+    stores.sort();
+    stores.dedup();
+    Sources {
+        files,
+        stores,
+        gaps,
+    }
 }
 
 /// Secret-shaped occurrences, including tool traffic and subagent transcripts.
@@ -166,6 +204,7 @@ pub fn secrets(
     }
     for path in paths {
         if path.is_file()
+            && !crate::opencode::is_store(path)
             && !matches!(
                 path.extension().and_then(|s| s.to_str()),
                 Some("jsonl" | "json")
@@ -179,6 +218,17 @@ pub fn secrets(
         }
     }
     let mut headers = Vec::new();
+    for store in sources.stores {
+        match crate::opencode::sessions(&store) {
+            Ok((sessions, warnings)) => {
+                for warning in warnings {
+                    report.gap(&store.display().to_string(), None, warning);
+                }
+                headers.extend(sessions.into_iter().map(|s| (store.clone(), s)));
+            }
+            Err(error) => report.gap(&store.display().to_string(), None, format!("{error:#}")),
+        }
+    }
     for path in sources.files {
         if path.extension().is_some_and(|s| s == "json") {
             report.gap(
@@ -214,7 +264,25 @@ pub fn secrets(
         }
     }
     for (path, session) in headers.into_iter().filter(|(_, s)| chosen(s)) {
-        crate::secrets::scan_file(&path, &session, select.since, held, &mut report);
+        if session.agent == "opencode" {
+            match crate::opencode::records(&path, &session.id) {
+                Ok(records) => crate::secrets::scan_records(
+                    &path,
+                    &session,
+                    records,
+                    select.since,
+                    held,
+                    &mut report,
+                ),
+                Err(error) => report.gap(
+                    &path.display().to_string(),
+                    None,
+                    format!("opencode session {}: {error:#}", session.id),
+                ),
+            }
+        } else {
+            crate::secrets::scan_file(&path, &session, select.since, held, &mut report);
+        }
     }
     report
 }
@@ -1177,6 +1245,75 @@ fn codex(
     Ok(())
 }
 
+/// An opencode session's usage, read from its messages in `store`: each
+/// model response (an assistant message, or the summary a compaction asks
+/// for) with tokens is one request. opencode counts reasoning apart from
+/// output; it is output, as Codex's `output_tokens` counts it. Input is
+/// uncached, as opencode keeps it. A message that records no tokens at all
+/// is no request.
+fn opencode_usage(store: &Path, s: &mut Session) {
+    let records = match crate::opencode::records(store, &s.id) {
+        Ok(records) => records,
+        Err(error) => {
+            s.limitations
+                .push(format!("messages unreadable, so no usage read: {error:#}"));
+            return;
+        }
+    };
+    for (line, v) in records {
+        if let Some(why) = v["malformed"].as_str() {
+            s.limitations
+                .push(format!("message {line}: malformed JSON: {why}"));
+            continue;
+        }
+        if let Err(error) = opencode(&v, line, s) {
+            s.limitations.push(format!("message {line}: {error:#}"));
+        }
+    }
+}
+
+fn opencode(v: &Value, line: usize, s: &mut Session) -> Result<()> {
+    let d = &v["data"];
+    let t = &d["tokens"];
+    if !matches!(v["type"].as_str(), Some("assistant" | "compaction")) || !t.is_object() {
+        return Ok(());
+    }
+    let named = |key: &str| {
+        d["model"][key]
+            .as_str()
+            .filter(|n| !n.is_empty())
+            .unwrap_or("unknown")
+            .to_owned()
+    };
+    let mut entry = base(named("providerID"), named("id"));
+    entry.input_tokens = count(t, "input")?;
+    entry.output_tokens = match (count(t, "output")?, count(t, "reasoning")?) {
+        (Some(output), reasoning) => Some(
+            output
+                .checked_add(reasoning.unwrap_or(0))
+                .context("output and reasoning tokens overflow")?,
+        ),
+        (None, _) => None,
+    };
+    entry.cache_read_tokens = count(&t["cache"], "read")?;
+    entry.cache_write_tokens = count(&t["cache"], "write")?;
+    let counts = [
+        entry.input_tokens,
+        entry.output_tokens,
+        entry.cache_read_tokens,
+        entry.cache_write_tokens,
+    ];
+    if counts.iter().all(|n| n.unwrap_or(0) == 0) {
+        return Ok(());
+    }
+    let id = v["id"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| fallback(s, line));
+    add(s, v, line, id, entry);
+    Ok(())
+}
+
 /// Codex cache writes, zero when the counter predates the field.
 fn cache_writes(usage: &Value) -> Result<u64> {
     Ok(count(usage, "cache_write_input_tokens")?.unwrap_or(0))
@@ -1269,9 +1406,20 @@ pub fn messages(
         since: select.since.map(|t| t.to_rfc3339()),
         ..Default::default()
     };
-    // Each transcript's header, read as `sessions --headers` reads it.
+    // Each transcript's header, read as `sessions --headers` reads it, and
+    // each opencode session, with the store that holds it.
     let mut headers = Vec::new();
-    for file in transcripts(paths, &mut warnings) {
+    let Sources { files, stores, .. } = transcripts(paths, &mut warnings);
+    for store in stores {
+        match crate::opencode::sessions(&store) {
+            Ok((sessions, said)) => {
+                warnings.extend(said);
+                headers.extend(sessions.into_iter().map(|s| (store.clone(), s)));
+            }
+            Err(error) => warnings.push(format!("{}: {error:#}", store.display())),
+        }
+    }
+    for file in files {
         if file.extension().is_some_and(|s| s == "json") {
             warnings.push(format!(
                 "{}: a wrapper export holds no messages; not read",
@@ -1331,8 +1479,10 @@ pub fn messages(
             continue;
         }
         // A transcript last written before `since` holds no message from
-        // after it.
-        if let Some(since) = select.since {
+        // after it. An opencode store holds every session, and its newest
+        // writes may be in its `-wal` file, so each of its messages is
+        // placed by its own time instead.
+        if let Some(since) = select.since.filter(|_| s.agent != "opencode") {
             let modified = std::fs::metadata(path).and_then(|m| m.modified());
             if modified.is_ok_and(|m| chrono::DateTime::<chrono::Utc>::from(m) < since) {
                 coverage.unmodified_transcripts += 1;
@@ -1541,6 +1691,12 @@ impl Turns {
 /// agent turn's text is cut to its tail as its record is read, scrubbed
 /// first when `scrub`.
 fn turns(path: &Path, s: &Session, scrub: bool) -> Result<Turns> {
+    if s.agent == "opencode" {
+        return Ok(opencode_turns(
+            crate::opencode::records(path, &s.id)?,
+            scrub,
+        ));
+    }
     let file = BufReader::new(std::fs::File::open(path)?);
     let mut read = Turns::default();
     let (mut copying, mut exec, mut interactive) = (false, false, false);
@@ -1801,6 +1957,50 @@ fn codex_answers(text: &str, questions: &HashMap<String, Value>) -> Option<Vec<T
         }
     }
     Some(words)
+}
+
+/// An opencode session's turns. Only its `user` messages can be a person's:
+/// opencode keeps what its harness adds (instruction files it loaded,
+/// background shell results, restarts) as `synthetic` and `system`
+/// messages, which are no turns. An assistant message's prose is its text
+/// blocks; reasoning and tool calls are not.
+fn opencode_turns(records: Vec<(usize, Value)>, scrub: bool) -> Turns {
+    let mut read = Turns::default();
+    for (line, v) in records {
+        if let Some(why) = v["malformed"].as_str() {
+            read.limitations
+                .push(format!("message {line}: malformed JSON: {why}"));
+            continue;
+        }
+        let d = &v["data"];
+        let turn = match v["type"].as_str() {
+            Some("user") => Some(Turn {
+                id: v["id"].as_str().map(str::to_owned),
+                ..Turn::user(string(d, "text"), None)
+            }),
+            Some("assistant") => {
+                let failed = d["finish"] == "error" || d["error"].is_object();
+                let mut text = content(&d["content"]);
+                if failed && text.trim().is_empty() {
+                    text = d["error"]["message"]
+                        .as_str()
+                        .unwrap_or("error reply without text")
+                        .to_owned();
+                }
+                Turn::agent(text, failed)
+            }
+            _ => None,
+        };
+        if let Some(mut turn) = turn {
+            if !turn.user {
+                turn.cut(scrub);
+            }
+            turn.line = line;
+            turn.at = timestamp(&v);
+            read.turns.push(turn);
+        }
+    }
+    read
 }
 
 fn pi_turn(v: &Value) -> Option<Turn> {

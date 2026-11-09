@@ -2,6 +2,7 @@ mod held;
 mod import;
 mod metrics;
 mod model;
+mod opencode;
 mod render;
 mod scrub;
 mod secrets;
@@ -21,8 +22,9 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
-    /// Native JSONL file/directory, or a wrapper's ohjaa-sessions.v1 JSON
-    /// export; repeatable.
+    /// Native JSONL file/directory, opencode's SQLite store (read with the
+    /// sqlite3 command), or a wrapper's ohjaa-sessions.v1 JSON export;
+    /// repeatable.
     #[arg(long, global = true)]
     input: Vec<PathBuf>,
     #[arg(long, global = true)]
@@ -497,12 +499,14 @@ fn inputs(cli: &Cli) -> Result<(Vec<PathBuf>, Vec<String>)> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME unavailable; pass --input")?);
     let mut paths = Vec::new();
     let mut warnings = Vec::new();
-    for (agent, folder) in [
-        ("claude", ".claude/projects"),
-        ("codex", ".codex/sessions"),
-        ("pi", ".pi/agent/sessions"),
-    ] {
-        let path = home.join(folder);
+    let sources = [
+        ("claude", home.join(".claude/projects")),
+        ("codex", home.join(".codex/sessions")),
+        ("pi", home.join(".pi/agent/sessions")),
+    ]
+    .into_iter()
+    .chain(opencode::default_store().map(|store| ("opencode", store)));
+    for (agent, path) in sources {
         // Any other failure to look, such as a folder that cannot be read,
         // is still read and reported.
         let missing = std::fs::symlink_metadata(&path)
@@ -521,38 +525,10 @@ fn inputs(cli: &Cli) -> Result<(Vec<PathBuf>, Vec<String>)> {
 
 fn supported(agent: &str) -> Result<()> {
     ensure!(
-        agent != "opencode",
-        "unsupported agent opencode: it keeps its sessions in SQLite, which Vessa does not read"
-    );
-    ensure!(
-        ["claude", "codex", "pi"].contains(&agent),
+        ["claude", "codex", "pi", "opencode"].contains(&agent),
         "unsupported agent {agent}"
     );
     Ok(())
-}
-
-/// opencode's session store, when it was written in the window: a known
-/// source Vessa does not read. SQLite writes through its `-wal` file, so
-/// either may be the newer; a time that cannot be read counts as written.
-fn opencode(since: Option<chrono::DateTime<chrono::FixedOffset>>) -> Option<PathBuf> {
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
-    let db = data.join("opencode/opencode.db");
-    if !db.exists() {
-        return None;
-    }
-    let Some(since) = since else {
-        return Some(db);
-    };
-    let wal = db.with_file_name("opencode.db-wal");
-    let written = |path: &std::path::Path| {
-        path.exists()
-            && std::fs::metadata(path)
-                .and_then(|m| m.modified())
-                .map_or(true, |t| chrono::DateTime::<chrono::Utc>::from(t) > since)
-    };
-    (written(&db) || written(&wal)).then_some(db)
 }
 
 /// `--since`: RFC 3339, a UTC date, or an age in days or hours.
@@ -729,15 +705,6 @@ fn scan_secrets(cli: &Cli, from: Option<&str>) -> Result<i32> {
     for warning in warnings {
         report.gap("requested source", None, warning);
     }
-    if cli.input.is_empty() && cli.agent.is_none() {
-        if let Some(path) = opencode(select.since) {
-            report.gap(
-                &path.display().to_string(),
-                None,
-                "opencode uses SQLite, which Vessa does not read".into(),
-            );
-        }
-    }
     let complete = report.complete;
     let mut value = serde_json::to_value(report)?;
     // Metadata can itself contain a matched value (including a native ID).
@@ -855,19 +822,6 @@ fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
         since: from.map(since).transpose()?,
     };
     let (paths, not_installed) = inputs(cli)?;
-    // The default sources hold every agent Vessa reads; one it knows of and
-    // does not read, written in the window, leaves the list partial.
-    let gap = if cli.input.is_empty() && cli.agent.is_none() {
-        opencode(select.since)
-    } else {
-        None
-    };
-    let gaps = gap.into_iter().map(|db| {
-        format!(
-            "opencode: {} not read; opencode keeps its sessions in SQLite, which Vessa does not read",
-            db.display()
-        )
-    });
     // What is redacted, by rule; None under `--raw`, which redacts nothing.
     // Each message is scrubbed as it is printed, after it was read, so the
     // rules that tell a person's messages apart see the words as written.
@@ -884,7 +838,6 @@ fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
         });
         match read {
             Ok(mut listing) => {
-                listing.coverage.gaps.extend(gaps);
                 listing.warnings.extend(not_installed);
                 scrubbed(&mut listing, found.as_mut());
                 doc.finish(&listing, found.as_ref())?;
@@ -899,7 +852,6 @@ fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
         let mut listing = import::messages(&paths, &select, !raw, &mut |m| {
             plain(&mut out, m, found.as_mut())
         })?;
-        listing.coverage.gaps.extend(gaps);
         listing.warnings.extend(not_installed);
         scrubbed(&mut listing, found.as_mut());
         let c = &listing.coverage;
@@ -911,7 +863,7 @@ fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
             .join(", ");
         writeln!(
             out,
-            "{} from {} ({} headless) · {} other user turns not listed{} · {} Codex subagent transcripts not read",
+            "{} from {} ({} headless) · {} other user turns not listed{} · {} Codex and opencode subagent sessions not read",
             render::many(c.human, "message"),
             render::many(
                 listing.sessions.iter().filter(|s| s.messages > 0).count(),

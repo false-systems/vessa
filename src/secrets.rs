@@ -138,38 +138,100 @@ pub fn scan_file(
         }
     };
     report.transcripts += 1;
-    // The time of the last record that had one: a transcript is appended
-    // to, so a record without a time was written at or after it.
-    let mut previous: Option<(String, DateTime<FixedOffset>)> = None;
+    let mut scan = Scan::new(source, session, since, held);
     for (index, line) in BufReader::new(file).split(b'\n').enumerate() {
         let number = index + 1;
         let bytes = match line {
             Ok(bytes) => bytes,
             Err(error) => {
-                report.gap(&source, Some(number), error.to_string());
+                report.gap(&scan.source, Some(number), error.to_string());
                 break;
             }
         };
         if bytes.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let record: Value = match serde_json::from_slice(&bytes) {
-            Ok(record) => record,
-            Err(error) => {
-                report.gap(
-                    &source,
-                    Some(number),
-                    format!("malformed JSON/UTF-8: {error}"),
-                );
-                // Retain a detectable occurrence even in a damaged record; its
-                // role and time are unknown, never silently assigned to a window.
-                let text = String::from_utf8_lossy(&bytes);
-                let mut marks = BTreeMap::new();
-                count(&text, "other", None, held, &mut marks, report);
-                append(report, session, &source, number, (None, false), marks);
-                continue;
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(record) => scan.record(number, &record, report),
+            Err(error) => scan.damaged(
+                number,
+                &String::from_utf8_lossy(&bytes),
+                format!("malformed JSON/UTF-8: {error}"),
+                report,
+            ),
+        }
+    }
+}
+
+/// One opencode session's messages, as [`crate::opencode::records`] reads
+/// them from `store`: each scanned as a transcript's record is, its `seq`
+/// for a line. A message whose data is no JSON is scanned as text.
+pub fn scan_records(
+    store: &Path,
+    session: &Session,
+    records: Vec<(usize, Value)>,
+    since: Option<DateTime<FixedOffset>>,
+    held: &Held,
+    report: &mut Report,
+) {
+    report.transcripts += 1;
+    let mut scan = Scan::new(store.display().to_string(), session, since, held);
+    for (seq, record) in records {
+        match (record["malformed"].as_str(), record["data"].as_str()) {
+            (Some(why), Some(text)) => {
+                scan.damaged(seq, text, format!("malformed JSON: {why}"), report)
             }
-        };
+            _ => scan.record(seq, &record, report),
+        }
+    }
+}
+
+/// One transcript's scan, record by record, in the order it was written.
+struct Scan<'a> {
+    source: String,
+    session: &'a Session,
+    since: Option<DateTime<FixedOffset>>,
+    held: &'a Held,
+    /// The time of the last record that had one: a transcript is appended
+    /// to, so a record without a time was written at or after it.
+    previous: Option<(String, DateTime<FixedOffset>)>,
+}
+
+impl<'a> Scan<'a> {
+    fn new(
+        source: String,
+        session: &'a Session,
+        since: Option<DateTime<FixedOffset>>,
+        held: &'a Held,
+    ) -> Self {
+        Scan {
+            source,
+            session,
+            since,
+            held,
+            previous: None,
+        }
+    }
+
+    /// A record that could not be read: a gap. A detectable occurrence in it
+    /// is still kept; its role and time are unknown, never silently assigned
+    /// to a window.
+    fn damaged(&mut self, number: usize, text: &str, why: String, report: &mut Report) {
+        report.gap(&self.source, Some(number), why);
+        let mut marks = BTreeMap::new();
+        count(text, "other", None, self.held, &mut marks, report);
+        append(
+            report,
+            self.session,
+            &self.source,
+            number,
+            (None, false),
+            marks,
+        );
+    }
+
+    fn record(&mut self, number: usize, record: &Value, report: &mut Report) {
+        let session = self.session;
         let stamp = record.get("timestamp").or_else(|| {
             (session.agent == "claude" && record["type"] == "file-history-snapshot")
                 .then(|| record["snapshot"].get("timestamp"))
@@ -187,10 +249,11 @@ pub fn scan_file(
         let parsed = at
             .as_deref()
             .and_then(|t| DateTime::parse_from_rfc3339(t).ok());
-        let before = previous.take();
-        previous = at.clone().zip(parsed).or(before.clone());
+        let before = self.previous.take();
+        self.previous = at.clone().zip(parsed).or(before.clone());
+        let since = self.since;
         if since.zip(parsed).is_some_and(|(from, at)| at <= from) {
-            continue;
+            return;
         }
         // No time of its own: the record before's, when that places it.
         // After `since` it places this one there too; before, it cannot.
@@ -200,19 +263,19 @@ pub fn scan_file(
             (None, _) => (None, false),
         };
         let mut marks = BTreeMap::new();
-        for (place, value, opaque_field) in pieces(&session.agent, &record) {
-            count_piece(value, place, opaque_field, held, &mut marks, report);
+        for (place, value, opaque_field) in pieces(&session.agent, record) {
+            count_piece(value, place, opaque_field, self.held, &mut marks, report);
         }
         if !marks.is_empty() && since.is_some() && at.0.is_none() {
             report.gap(
-                &source,
+                &self.source,
                 Some(number),
                 "finding has no valid time; it is included but cannot be placed after --since"
                     .into(),
             );
             report.undated_records += 1;
         }
-        append(report, session, &source, number, at, marks);
+        append(report, session, &self.source, number, at, marks);
     }
 }
 
@@ -413,9 +476,56 @@ fn blocks<'a>(
     }
 }
 
+/// An opencode message's pieces. A person writes `user` messages; an
+/// assistant message's text and reasoning blocks are the agent's, and a tool
+/// block's `state` holds the call's `input` and, in every other field, what
+/// came back. Everything else, harness messages included, is `other`.
+fn opencode_pieces<'a>(record: &'a Value, out: &mut Vec<Piece<'a>>) {
+    let d = &record["data"];
+    let fields = |value: &'a Value| value.as_object().into_iter().flatten();
+    match record["type"].as_str() {
+        Some("user") => out.push(("person", d, None)),
+        Some("assistant") if d.is_object() => {
+            for (key, value) in fields(d) {
+                if key != "content" {
+                    out.push(("other", value, None));
+                    continue;
+                }
+                for block in value.as_array().into_iter().flatten() {
+                    match block["type"].as_str() {
+                        Some("text" | "reasoning") => out.push(("agent", block, None)),
+                        Some("tool") => {
+                            for (key, value) in fields(block) {
+                                if key != "state" {
+                                    out.push(("other", value, None));
+                                } else if value.is_object() {
+                                    for (key, value) in fields(value) {
+                                        let place = if key == "input" {
+                                            "tool_input"
+                                        } else {
+                                            "tool_output"
+                                        };
+                                        out.push((place, value, None));
+                                    }
+                                } else {
+                                    out.push(("tool_output", value, None));
+                                }
+                            }
+                        }
+                        _ => out.push(("other", block, None)),
+                    }
+                }
+            }
+        }
+        _ => out.push(("other", d, None)),
+    }
+}
+
 fn pieces<'a>(agent: &str, record: &'a Value) -> Vec<Piece<'a>> {
     let mut out = Vec::new();
-    if agent == "codex" && record["type"] == "response_item" {
+    if agent == "opencode" {
+        opencode_pieces(record, &mut out);
+    } else if agent == "codex" && record["type"] == "response_item" {
         let p = &record["payload"];
         match p["type"].as_str() {
             Some("message") => blocks(&p["content"], role(p["role"].as_str()), false, &mut out),

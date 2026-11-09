@@ -19,6 +19,8 @@ cannot become an all-clear. Its optional JSON output creates no dependency
 on any consumer.
 
 No runtime dependency on sibling repositories. No database, daemon or implicit
-network calls. Never commit real transcripts or reports; use synthetic fixtures.
+network calls. opencode's SQLite store is read with the `sqlite3` command,
+read-only; Vessa takes no SQLite dependency. Tests that make such a store
+need `sqlite3` on PATH, and CI installs it. Never commit real transcripts or reports; use synthetic fixtures.
 Validate with cargo fmt --check, cargo clippy --all-targets -- -D warnings,
 and cargo test. Run the binary on a fixture before claiming completion.
