@@ -126,35 +126,50 @@ whose `session_meta` names no other session stands alone.
 ### opencode
 
 opencode keeps every session in one SQLite database. Vessa takes no SQLite
-dependency: it reads the store with the `sqlite3` command (`-readonly`), one
-session's messages at a time, and keeps nothing. A store is a file given
-with `--input` that is a SQLite database or ends in `.db`, or the default
-one. Vessa reads opencode's current layout, the `session_v2` and
-`session_message` tables; a store in any other (a missing table or column,
-or a file that is no SQLite database) is a source warning, never an empty
-store, and so is a store when `sqlite3` is not on `PATH`. Older opencode kept
-sessions in a `session` table, which newer opencode copies into `session_v2`;
-one it has not copied is a warning, and not read.
+dependency: it reads the store with the `sqlite3` command (3.33 or newer,
+for `-json`), read-only and with `-init /dev/null`, so a person's
+`~/.sqliterc` cannot change what it prints; it keeps nothing. A store is a
+file given with `--input` that is a SQLite database or ends in `.db`, a file
+named `opencode.db` in a folder given with `--input`, or the default one,
+which is read unless `--agent` asks for another agent. An `XDG_DATA_HOME`
+that is empty or relative is ignored, as the XDG specification says. Vessa
+reads opencode's current layout, the `session_v2` and `session_message`
+tables; a store in any other (a missing table or column, or a file that is
+no SQLite database) is a source warning, never an empty store, and so is a
+store when `sqlite3` is not on `PATH` or cannot print JSON. Older opencode
+kept sessions in a `session` table, which newer opencode copies into
+`session_v2`; one it has not copied is a warning, and not read.
 
 * A session is a row of `session_v2`: its `id`, its `directory` for `cwd`,
   and its creation for `started_at`; `source` is the store. A message's
-  `seq` stands for its line.
+  `seq` stands for its line. Warnings and gaps about one session's messages
+  name the session, since every session counts from 0.
 * Usage: each `assistant` message, and each `compaction` (the summary
   opencode asks a model for), that records tokens is one request, under its
-  message id. opencode counts reasoning apart from output; Vessa counts it as
-  output, as Codex's `output_tokens` does. Input is uncached, as opencode
-  keeps it. A message that records no tokens at all, such as an error before
-  any, is no request. opencode's `cost` is not read.
+  message id, read for the whole store in one query. opencode counts
+  reasoning apart from output; Vessa counts it as output, as Codex's
+  `output_tokens` does. Input is uncached, as opencode keeps it. A response
+  that records no tokens at all, such as an error before any, is no request:
+  a known record with no usage, counted in `synthetic_records`. opencode's
+  `cost` is not read.
 * A session with a `parent_id` is a subagent: opencode keeps one as a session
-  of its own. It counts to the session at the top of its chain, by the rules
-  of [Codex subagents](#codex-subagents); a chain that loops has no top, and
-  each session in it stands alone, with a limitation.
+  of its own. It counts to the session at the top of its chain, followed as
+  [Codex subagents](#codex-subagents)' lineages are; a chain that loops has
+  no top, and each session in it stands alone, with a limitation.
+* A session with a `fork_session_id` is a fork. Vessa does not know whether
+  opencode copies the history it was forked from into it, so its usage and
+  messages carry a limitation saying they may count that history twice.
 * Messages: only `user` messages of a session no agent started can be a
   person's. opencode keeps what its harness adds (instruction files it
   loaded, background shell results, restarts, instruction updates) as
   `synthetic` and `system` messages, which are no turns. An agent reply is
   the text blocks of an `assistant` message; one that ended in an error is
-  `failed`, its error message standing for its text when it has none.
+  `failed`, its error message standing for its text when it has none. A
+  subagent's messages are its agent's prompts, and opencode records nothing
+  that would tell a person's apart, so a subagent session is counted in
+  `subagent_transcripts` and not read. With `--since`, a session whose
+  newest message is not after it is counted in `unmodified_transcripts` and
+  not read.
 * Secrets: a `user` message is `person`; an assistant's text and reasoning
   blocks are `agent`; a tool block's `state.input` is `tool_input` and every
   other field of its `state` is `tool_output`; everything else is `other`.
@@ -308,6 +323,8 @@ never adds a reasoning subcategory a second time.
 * Pi: reads assistant, compaction, branch-summary and standalone usage entries.
   Copied entry IDs across forks are counted once,
   with parent sessions processed first when available.
+* opencode: reads assistant and compaction responses (see [opencode](#opencode)).
+  opencode's output count leaves reasoning out, so Vessa adds it once.
 
 Unknown token counters stay `null`. Spending is not imported, calculated or
 displayed: no prices, rate cards, currency estimates, credits or billing fields.
@@ -316,7 +333,7 @@ Legacy cost fields in native transcripts and linked wrapper receipts are ignored
 
 ## Secret-shaped findings
 
-`vessa secrets` scans native Claude Code, Codex and pi records on demand,
+`vessa secrets` scans native Claude Code, Codex, pi and opencode records on demand,
 including subagent and headless transcripts, user/assistant text, tool inputs
 and tool outputs, for **the credentials this machine holds**. A finding is
 an alarm: one of your credentials reached an agent session, and so the
@@ -667,8 +684,9 @@ Each session also exports `totals`, calculated by Vessa from deduplicated
 records and grouped by provider/model. Consumers can display these beside work
 evidence without implementing accounting. Unknown categories remain null; older
 exports without this additive field still contain the original usage records.
-`synthetic_records` counts a Claude session's `<synthetic>` messages, read and
-known to hold no usage; it is 0 for other agents.
+`synthetic_records` counts a Claude session's `<synthetic>` messages, and an
+opencode session's responses that recorded no tokens, read and known to hold
+no usage; it is 0 for other agents.
 
 `totals` stays each transcript's own, so summing it across sessions counts
 every request once. Each session also names its Claude, Codex and opencode subagents in

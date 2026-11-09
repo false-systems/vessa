@@ -541,7 +541,10 @@ fn secrets_are_found_in_opencode_sessions() {
     let gaps = v["unreadable"].as_array().unwrap();
     assert_eq!(gaps.len(), 1);
     assert_eq!(gaps[0]["line"], 3);
-    assert!(gaps[0]["why"].as_str().unwrap().contains("malformed JSON"));
+    assert!(gaps[0]["why"]
+        .as_str()
+        .unwrap()
+        .contains("opencode session ses_main: malformed JSON"));
     // Each message is placed in the window by its own time.
     let v = document(
         &f.run_with(&db, &["--json", "--since", "2026-09-30T09:00:01Z"], &env),

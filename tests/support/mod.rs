@@ -51,11 +51,11 @@ pub type Session<'a> = (&'a str, Option<&'a str>, &'a str, i64);
 /// data as written.
 pub type Message<'a> = (&'a str, &'a str, &'a str, i64, i64, String);
 
-/// Writes a store at `db`: `sql` first (a layout), then `sessions` and
+/// Writes a store at `db`: `layout` first, then `sessions` and
 /// `messages`.
-pub fn store(db: &Path, sql: &str, sessions: &[Session], messages: &[Message]) {
+pub fn store(db: &Path, layout: &str, sessions: &[Session], messages: &[Message]) {
     let quote = |text: &str| format!("'{}'", text.replace('\'', "''"));
-    let mut script = sql.to_owned();
+    let mut script = layout.to_owned();
     for (id, parent, directory, at) in sessions {
         script += &format!(
             "INSERT INTO session_v2 (id, project_id, parent_id, slug, directory, version, time_created, time_updated) VALUES ({}, 'project', {}, 'slug', {}, '1.0.0', {at}, {at});\n",
@@ -74,6 +74,11 @@ pub fn store(db: &Path, sql: &str, sessions: &[Session], messages: &[Message]) {
         );
     }
     std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    sql(db, &script);
+}
+
+/// Runs `script` against the store at `db`.
+pub fn sql(db: &Path, script: &str) {
     let mut child = Command::new(sqlite3_dir().join("sqlite3"))
         .arg(db)
         .stdin(Stdio::piped())

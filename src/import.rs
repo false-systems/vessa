@@ -42,23 +42,36 @@ fn sessions(
         schema: "vessa-usage.v2".into(),
         ..Default::default()
     };
-    let Sources { files, stores, .. } = transcripts(paths, &mut report.warnings);
+    let (files, stores) = transcripts(paths, &mut report.warnings);
     let mut wrappers = Vec::new();
-    for store in stores {
-        match crate::opencode::sessions(&store) {
-            Ok((mut sessions, warnings)) => {
-                report.warnings.extend(warnings);
-                if usage {
-                    for s in &mut sessions {
-                        opencode_usage(&store, s);
+    // Each store's model responses, read once, for all its sessions.
+    let mut responses: HashMap<PathBuf, Result<crate::opencode::BySession, String>> =
+        HashMap::new();
+    for (store, stored) in opencode_sessions(&stores, &mut warn(&mut report.warnings)) {
+        let mut s = stored.session;
+        if usage {
+            let read = responses.entry(store.clone()).or_insert_with(|| {
+                crate::opencode::responses(&store).map_err(|error| format!("{error:#}"))
+            });
+            match read {
+                Ok(by_session) => {
+                    for (line, v) in by_session.remove(&s.id).unwrap_or_default() {
+                        if let Some(why) = v["malformed"].as_str() {
+                            s.limitations.push(format!("message {line}: {why}"));
+                        } else if let Err(error) = opencode(&v, line, &mut s) {
+                            s.limitations.push(format!("message {line}: {error:#}"));
+                        }
                     }
                 }
-                report.sessions.extend(sessions);
+                Err(why) => s
+                    .limitations
+                    .push(format!("messages unreadable, so no usage read: {why}")),
             }
-            Err(error) => report
-                .warnings
-                .push(format!("{}: {error:#}", store.display())),
+            if let Some(fork) = &stored.fork {
+                s.limitations.push(fork_note(fork));
+            }
         }
+        report.sessions.push(s);
     }
     for file in files {
         match parse(&file) {
@@ -97,22 +110,25 @@ fn sessions(
 /// Points each Codex subagent at the session at its root, through the
 /// threads read. Newer Codex names the root itself (`session_id`); older
 /// Codex names only the thread a subagent came from, which may be another
-/// subagent. A lineage that loops has no root: each thread in it stands
-/// alone, and with `limit` says so in its limitations.
+/// subagent. An opencode subagent names the session that started it, which
+/// may be another subagent, and is followed the same way. A lineage that
+/// loops has no root: each thread in it stands alone, and with `limit` says
+/// so in its limitations.
 fn roots(sessions: &mut [&mut Session], limit: bool) {
-    let links: HashMap<String, String> = sessions
+    let walked = |s: &Session| matches!(s.agent.as_str(), "codex" | "opencode");
+    let links: HashMap<(String, String), String> = sessions
         .iter()
-        .filter(|s| s.agent == "codex")
-        .filter_map(|s| Some((s.id.clone(), s.root.clone()?)))
+        .filter(|s| walked(s))
+        .filter_map(|s| Some(((s.agent.clone(), s.id.clone()), s.root.clone()?)))
         .collect();
-    for session in sessions.iter_mut().filter(|s| s.agent == "codex") {
+    for session in sessions.iter_mut().filter(|s| walked(s)) {
         let Some(mut root) = session.root.take() else {
             continue;
         };
         // The threads walked so far; reaching one again is a loop.
         let mut path = vec![session.id.clone()];
         let looped = loop {
-            let Some(next) = links.get(&root) else {
+            let Some(next) = links.get(&(session.agent.clone(), root.clone())) else {
                 break false;
             };
             let again = path.contains(&root);
@@ -125,7 +141,8 @@ fn roots(sessions: &mut [&mut Session], limit: bool) {
             session.root = Some(root);
         } else if limit {
             session.limitations.push(format!(
-                "Codex subagent lineage loops ({}); its root session is unknown, so it counts as a session of its own",
+                "{} subagent lineage loops ({}); its root session is unknown, so it counts as a session of its own",
+                if session.agent == "codex" { "Codex" } else { "opencode" },
                 path.join(" -> ")
             ));
         }
@@ -135,14 +152,15 @@ fn roots(sessions: &mut [&mut Session], limit: bool) {
 /// Every file under `paths` that may be a transcript or an ohjaa export, in
 /// path order, once each, and the opencode stores given; what could not be
 /// listed is a warning.
-fn transcripts(paths: &[PathBuf], warnings: &mut Vec<String>) -> Sources {
-    let mut sources = transcript_sources(paths);
+fn transcripts(paths: &[PathBuf], warnings: &mut Vec<String>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let sources = transcript_sources(paths);
     warnings.extend(
-        std::mem::take(&mut sources.gaps)
+        sources
+            .gaps
             .into_iter()
             .map(|(path, why)| format!("{}: {why}", path.display())),
     );
-    sources
+    (sources.files, sources.stores)
 }
 
 struct Sources {
@@ -164,7 +182,7 @@ fn transcript_sources(paths: &[PathBuf]) -> Sources {
             }
             continue;
         }
-        if let Err(error) = discover(path, &mut files) {
+        if let Err(error) = discover(path, &mut files, &mut stores) {
             gaps.push((path.clone(), error.to_string()));
         }
         // Claude Code keeps a session's subagent transcripts beside it, in
@@ -174,7 +192,7 @@ fn transcript_sources(paths: &[PathBuf]) -> Sources {
         if path.extension().is_some_and(|s| s == "jsonl")
             && std::fs::symlink_metadata(&subagents).is_ok()
         {
-            if let Err(error) = discover(&subagents, &mut files) {
+            if let Err(error) = discover(&subagents, &mut files, &mut stores) {
                 gaps.push((subagents, error.to_string()));
             }
         }
@@ -217,18 +235,13 @@ pub fn secrets(
             );
         }
     }
-    let mut headers = Vec::new();
-    for store in sources.stores {
-        match crate::opencode::sessions(&store) {
-            Ok((sessions, warnings)) => {
-                for warning in warnings {
-                    report.gap(&store.display().to_string(), None, warning);
-                }
-                headers.extend(sessions.into_iter().map(|s| (store.clone(), s)));
-            }
-            Err(error) => report.gap(&store.display().to_string(), None, format!("{error:#}")),
-        }
-    }
+    let mut headers: Vec<(PathBuf, Session)> =
+        opencode_sessions(&sources.stores, &mut |store, why| {
+            report.gap(&store.display().to_string(), None, why)
+        })
+        .into_iter()
+        .map(|(store, stored)| (store, stored.session))
+        .collect();
     for path in sources.files {
         if path.extension().is_some_and(|s| s == "json") {
             report.gap(
@@ -681,7 +694,10 @@ fn difference(old: &Entry, new: &Entry) -> String {
     parts.join(", ")
 }
 
-fn discover(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+/// The transcripts under `path` into `out`, and the opencode stores in the
+/// folders under it (each named `opencode.db`, as opencode names its own)
+/// into `stores`. A store given as a file is taken before this.
+fn discover(path: &Path, out: &mut Vec<PathBuf>, stores: &mut Vec<PathBuf>) -> Result<()> {
     let meta = std::fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() {
         bail!("symlink not followed; provide its real path");
@@ -689,10 +705,15 @@ fn discover(path: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     if meta.is_dir() {
         for item in std::fs::read_dir(path)? {
             let item = item?;
+            let kind = item.file_type()?;
+            if kind.is_file() && item.file_name() == "opencode.db" {
+                stores.push(item.path().canonicalize()?);
+                continue;
+            }
             // Native session directories also hold JSON metadata, not usage
             // exports. JSON exports must be selected explicitly with --input.
-            if item.file_type()?.is_dir() || item.path().extension().is_some_and(|s| s == "jsonl") {
-                discover(&item.path(), out)?;
+            if kind.is_dir() || item.path().extension().is_some_and(|s| s == "jsonl") {
+                discover(&item.path(), out, stores)?;
             }
         }
     } else if meta.is_file()
@@ -1245,33 +1266,44 @@ fn codex(
     Ok(())
 }
 
-/// An opencode session's usage, read from its messages in `store`: each
-/// model response (an assistant message, or the summary a compaction asks
-/// for) with tokens is one request. opencode counts reasoning apart from
-/// output; it is output, as Codex's `output_tokens` counts it. Input is
-/// uncached, as opencode keeps it. A message that records no tokens at all
-/// is no request.
-fn opencode_usage(store: &Path, s: &mut Session) {
-    let records = match crate::opencode::records(store, &s.id) {
-        Ok(records) => records,
-        Err(error) => {
-            s.limitations
-                .push(format!("messages unreadable, so no usage read: {error:#}"));
-            return;
-        }
-    };
-    for (line, v) in records {
-        if let Some(why) = v["malformed"].as_str() {
-            s.limitations
-                .push(format!("message {line}: malformed JSON: {why}"));
-            continue;
-        }
-        if let Err(error) = opencode(&v, line, s) {
-            s.limitations.push(format!("message {line}: {error:#}"));
+/// The sessions of each opencode store, with the store that holds each;
+/// what a store could not say is handed to `gap`, with the store.
+fn opencode_sessions(
+    stores: &[PathBuf],
+    gap: &mut dyn FnMut(&Path, String),
+) -> Vec<(PathBuf, crate::opencode::Stored)> {
+    let mut all = Vec::new();
+    for store in stores {
+        match crate::opencode::sessions(store) {
+            Ok((sessions, said)) => {
+                said.into_iter().for_each(|why| gap(store, why));
+                all.extend(sessions.into_iter().map(|s| (store.clone(), s)));
+            }
+            Err(error) => gap(store, format!("{error:#}")),
         }
     }
+    all
 }
 
+/// A warning about `path`, as the readers word one.
+fn warn(warnings: &mut Vec<String>) -> impl FnMut(&Path, String) + '_ {
+    |path, why| warnings.push(format!("{}: {why}", path.display()))
+}
+
+/// What Vessa cannot say of an opencode fork: whether opencode copies the
+/// history of the session it was forked from into it, as Codex does.
+fn fork_note(fork: &str) -> String {
+    format!(
+        "opencode fork of {fork}: Vessa does not know whether opencode copies the history it was forked from into it, so copied requests and messages may be counted twice"
+    )
+}
+
+/// One opencode model response (an assistant message, or the summary a
+/// compaction asks for): one request, when it records tokens. opencode
+/// counts reasoning apart from output; it is output, as Codex's
+/// `output_tokens` counts it. Input is uncached, as opencode keeps it. A
+/// response that records no tokens at all, such as an error before any, is
+/// a known record with no usage, as Claude Code's `<synthetic>` replies are.
 fn opencode(v: &Value, line: usize, s: &mut Session) -> Result<()> {
     let d = &v["data"];
     let t = &d["tokens"];
@@ -1303,13 +1335,14 @@ fn opencode(v: &Value, line: usize, s: &mut Session) -> Result<()> {
         entry.cache_read_tokens,
         entry.cache_write_tokens,
     ];
-    if counts.iter().all(|n| n.unwrap_or(0) == 0) {
-        return Ok(());
-    }
     let id = v["id"]
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| fallback(s, line));
+    if counts.iter().all(|n| n.unwrap_or(0) == 0) {
+        s.synthetic.insert(id);
+        return Ok(());
+    }
     add(s, v, line, id, entry);
     Ok(())
 }
@@ -1409,15 +1442,13 @@ pub fn messages(
     // Each transcript's header, read as `sessions --headers` reads it, and
     // each opencode session, with the store that holds it.
     let mut headers = Vec::new();
-    let Sources { files, stores, .. } = transcripts(paths, &mut warnings);
-    for store in stores {
-        match crate::opencode::sessions(&store) {
-            Ok((sessions, said)) => {
-                warnings.extend(said);
-                headers.extend(sessions.into_iter().map(|s| (store.clone(), s)));
-            }
-            Err(error) => warnings.push(format!("{}: {error:#}", store.display())),
-        }
+    let (files, stores) = transcripts(paths, &mut warnings);
+    // Of each opencode session: when its newest message was created, and
+    // the session it was forked from.
+    let mut stored: HashMap<(PathBuf, String), (Option<i64>, Option<String>)> = HashMap::new();
+    for (store, s) in opencode_sessions(&stores, &mut warn(&mut warnings)) {
+        stored.insert((store.clone(), s.session.id.clone()), (s.last, s.fork));
+        headers.push((store, s.session));
     }
     for file in files {
         if file.extension().is_some_and(|s| s == "json") {
@@ -1479,12 +1510,20 @@ pub fn messages(
             continue;
         }
         // A transcript last written before `since` holds no message from
-        // after it. An opencode store holds every session, and its newest
-        // writes may be in its `-wal` file, so each of its messages is
-        // placed by its own time instead.
-        if let Some(since) = select.since.filter(|_| s.agent != "opencode") {
-            let modified = std::fs::metadata(path).and_then(|m| m.modified());
-            if modified.is_ok_and(|m| chrono::DateTime::<chrono::Utc>::from(m) < since) {
+        // after it. An opencode store holds every session, so a session of
+        // one is placed by its newest message instead: none created after
+        // `since`, none listed.
+        if let Some(since) = select.since {
+            let unmodified = if s.agent == "opencode" {
+                stored
+                    .get(&(path.clone(), s.id.clone()))
+                    .is_some_and(|(last, _)| last.is_none_or(|ms| ms <= since.timestamp_millis()))
+            } else {
+                std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|m| chrono::DateTime::<chrono::Utc>::from(m) < since)
+            };
+            if unmodified {
                 coverage.unmodified_transcripts += 1;
                 continue;
             }
@@ -1530,13 +1569,24 @@ pub fn messages(
     let mut seen = std::collections::HashSet::new();
     let mut sessions: BTreeMap<(String, String), Conversation> = BTreeMap::new();
     for (path, s) in work {
-        let read = match turns(path, s, scrub) {
+        let mut read = match turns(path, s, scrub) {
             Ok(read) => read,
+            Err(error) if s.agent == "opencode" => {
+                warnings.push(format!(
+                    "{}: opencode session {}: {error:#}",
+                    path.display(),
+                    s.id
+                ));
+                continue;
+            }
             Err(error) => {
                 warnings.push(format!("{}: {error:#}", path.display()));
                 continue;
             }
         };
+        if let Some((_, Some(fork))) = stored.get(&(path.clone(), s.id.clone())) {
+            read.limitations.push(fork_note(fork));
+        }
         coverage.transcripts += 1;
         if wanted.contains(&s.id) {
             parents

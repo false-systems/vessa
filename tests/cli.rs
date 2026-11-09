@@ -3457,6 +3457,97 @@ fn opencode_sessions_are_read_from_its_store() {
     let (v, code) = messages(&["--input", input, "--since", "2026-09-30T09:00:04Z"]);
     assert_eq!(code, Some(0));
     assert_eq!(texts(&v), ["try again"]);
+    // A session with no message after the window starts is not read.
+    let (v, code) = messages(&["--input", input, "--since", "2026-09-30T10:00:00Z"]);
+    assert_eq!(code, Some(0));
+    assert!(texts(&v).is_empty());
+    assert_eq!(v["coverage"]["unmodified_transcripts"], 1);
+    assert_eq!(v["coverage"]["transcripts"], 0);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn opencode_lineage_loops_forks_and_responses_without_tokens() {
+    use serde_json::json;
+    use support::at;
+    let dir = temp("opencode-edges");
+    let folder = dir.join("store");
+    let db = folder.join("opencode.db");
+    let tokenless = json!({"content":[],"model":{"id":"m","providerID":"p"},"tokens":{"input":0,"output":0,"reasoning":0,"cache":{"read":0,"write":0}},"finish":"error","error":{"message":"no key"}}).to_string();
+    support::store(
+        &db,
+        support::LAYOUT,
+        &[
+            ("ses_err", None, "/demo", at(0)),
+            ("ses_a", Some("ses_b"), "/demo", at(10)),
+            ("ses_b", Some("ses_a"), "/demo", at(20)),
+            ("ses_fork", None, "/demo", at(30)),
+        ],
+        &[
+            (
+                "m1",
+                "ses_err",
+                "user",
+                0,
+                at(1),
+                json!({"text":"hello"}).to_string(),
+            ),
+            ("m2", "ses_err", "assistant", 1, at(2), tokenless.clone()),
+            ("m3", "ses_a", "assistant", 0, at(11), tokenless.clone()),
+            ("m4", "ses_b", "assistant", 0, at(21), tokenless),
+            (
+                "m5",
+                "ses_fork",
+                "user",
+                0,
+                at(31),
+                json!({"text":"forked"}).to_string(),
+            ),
+        ],
+    );
+    support::sql(
+        &db,
+        "UPDATE session_v2 SET fork_session_id = 'ses_err' WHERE id = 'ses_fork';",
+    );
+    let (db, folder) = (db.to_str().unwrap(), folder.to_str().unwrap());
+
+    // The store in a folder given with --input is read. A response that
+    // recorded no tokens is a known record with no usage, not unknown usage.
+    let v = value(cli(&[
+        "usage",
+        "--input",
+        folder,
+        "--session",
+        "ses_err",
+        "--json",
+    ]));
+    assert_eq!(v["sessions"][0]["synthetic_records"], 1);
+    assert_eq!(v["sessions"][0]["limitations"], json!([]));
+
+    // A lineage that loops has no root. Headers carry no limitation.
+    let headers = value(cli(&["sessions", "--headers", "--input", db, "--json"]));
+    assert_eq!(headers["sessions"].as_array().unwrap().len(), 4);
+    let out = cli(&["usage", "--input", db, "--json"]);
+    assert_eq!(out.status.code(), Some(4));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let limits = |id: &str| {
+        v["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap()["limitations"]
+            .to_string()
+    };
+    assert!(limits("ses_a").contains("opencode subagent lineage loops"));
+    // Whether opencode copies a fork's history into it is not known: said.
+    assert!(limits("ses_fork").contains("opencode fork of ses_err"));
+    let (v, code) = messages(&["--input", db, "--session", "ses_fork"]);
+    assert_eq!(code, Some(4));
+    assert_eq!(texts(&v), ["forked"]);
+    assert!(v["coverage"]["limitations"]
+        .to_string()
+        .contains("opencode fork of ses_err"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -3500,7 +3591,18 @@ fn opencode_is_read_from_the_default_sources() {
     let (v, code) = run(&["messages", "--json", "--agent", "opencode"]);
     assert_eq!(code, Some(0));
     assert_eq!(texts(&v).len(), 3);
-    // A store that is no SQLite database is unreadable, never empty.
+    // An XDG_DATA_HOME that is not absolute is ignored, as opencode
+    // ignores it.
+    let out = Command::new(env!("CARGO_BIN_EXE_vessa"))
+        .args(["messages", "--json", "--agent", "opencode"])
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", "relative/data")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(texts(&v).len(), 3);
+    // A store that is no SQLite database is unreadable, never empty...
     std::fs::write(&db, "").unwrap();
     let (v, code) = run(&["messages", "--json"]);
     assert_eq!(code, Some(4));
@@ -3509,6 +3611,9 @@ fn opencode_is_read_from_the_default_sources() {
         .as_str()
         .unwrap()
         .contains("not a SQLite database"));
+    // ...and no gap in what another agent is asked for.
+    assert_eq!(run(&["messages", "--json", "--agent", "claude"]).1, Some(0));
+    assert_eq!(run(&["usage", "--json", "--agent", "claude"]).1, Some(0));
     std::fs::remove_dir_all(home).unwrap();
 }
 

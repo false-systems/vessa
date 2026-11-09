@@ -486,7 +486,8 @@ fn run_once(cli: Cli) -> Result<i32> {
     Ok(0)
 }
 
-/// The paths given with `--input`, else the agents' own session folders.
+/// The paths given with `--input`, else the agents' own session folders,
+/// and opencode's store unless `--agent` asks for another agent.
 /// A default folder that does not exist is an agent not installed here, or
 /// one that has kept no session yet: nothing to read, and no gap. A path
 /// given with `--input` that does not exist is a warning, and so is the
@@ -507,6 +508,12 @@ fn inputs(cli: &Cli) -> Result<(Vec<PathBuf>, Vec<String>)> {
     .into_iter()
     .chain(opencode::default_store().map(|store| ("opencode", store)));
     for (agent, path) in sources {
+        // opencode's store is read apart from the folders: asked for another
+        // agent, it is not read, so what is wrong with it cannot leave that
+        // answer partial.
+        if agent == "opencode" && cli.agent.as_deref().is_some_and(|asked| asked != agent) {
+            continue;
+        }
         // Any other failure to look, such as a folder that cannot be read,
         // is still read and reported.
         let missing = std::fs::symlink_metadata(&path)

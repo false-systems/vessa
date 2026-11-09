@@ -176,6 +176,8 @@ pub fn scan_records(
 ) {
     report.transcripts += 1;
     let mut scan = Scan::new(store.display().to_string(), session, since, held);
+    // A store holds many sessions, each counting its messages from 0.
+    scan.about = format!("opencode session {}: ", session.id);
     for (seq, record) in records {
         match (record["malformed"].as_str(), record["data"].as_str()) {
             (Some(why), Some(text)) => {
@@ -195,6 +197,9 @@ struct Scan<'a> {
     /// The time of the last record that had one: a transcript is appended
     /// to, so a record without a time was written at or after it.
     previous: Option<(String, DateTime<FixedOffset>)>,
+    /// What a gap says first, where `source` and the line alone do not
+    /// place it.
+    about: String,
 }
 
 impl<'a> Scan<'a> {
@@ -210,6 +215,7 @@ impl<'a> Scan<'a> {
             since,
             held,
             previous: None,
+            about: String::new(),
         }
     }
 
@@ -217,7 +223,7 @@ impl<'a> Scan<'a> {
     /// is still kept; its role and time are unknown, never silently assigned
     /// to a window.
     fn damaged(&mut self, number: usize, text: &str, why: String, report: &mut Report) {
-        report.gap(&self.source, Some(number), why);
+        report.gap(&self.source, Some(number), format!("{}{why}", self.about));
         let mut marks = BTreeMap::new();
         count(text, "other", None, self.held, &mut marks, report);
         append(
@@ -270,8 +276,10 @@ impl<'a> Scan<'a> {
             report.gap(
                 &self.source,
                 Some(number),
-                "finding has no valid time; it is included but cannot be placed after --since"
-                    .into(),
+                format!(
+                    "{}finding has no valid time; it is included but cannot be placed after --since",
+                    self.about
+                ),
             );
             report.undated_records += 1;
         }
