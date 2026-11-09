@@ -156,20 +156,32 @@ kept sessions in a `session` table, which newer opencode copies into
   of its own. It counts to the session at the top of its chain, followed as
   [Codex subagents](#codex-subagents)' lineages are; a chain that loops has
   no top, and each session in it stands alone, with a limitation.
-* A session with a `fork_session_id` is a fork. Vessa does not know whether
-  opencode copies the history it was forked from into it, so its usage and
-  messages carry a limitation saying they may count that history twice.
-* Messages: only `user` messages of a session no agent started can be a
-  person's. opencode keeps what its harness adds (instruction files it
-  loaded, background shell results, restarts, instruction updates) as
-  `synthetic` and `system` messages, which are no turns. An agent reply is
-  the text blocks of an `assistant` message; one that ended in an error is
-  `failed`, its error message standing for its text when it has none. A
-  subagent's messages are its agent's prompts, and opencode records nothing
-  that would tell a person's apart, so a subagent session is counted in
-  `subagent_transcripts` and not read. With `--since`, a session whose
-  newest message is not after it is counted in `unmodified_transcripts` and
-  not read.
+* A session with a `fork_session_id` is a fork, and that session is its
+  `parent`, as a Codex fork's is. opencode copies the messages of the
+  session it was forked from up to the fork into it, each under a new id but
+  with its `seq`, creation time and data. A message of the fork whose origin
+  holds one at its `seq` created at the same time is a copy: a copied
+  response counts under the id of the one it copies, so it is counted once,
+  with the origin, and the fork's own total leaves it out. A copied message
+  of a person's was created before the fork, and is `inherited`. A fork
+  whose origin is no longer in the store says that the messages it copied
+  are listed nowhere.
+* Messages: only `user` messages can be a person's. opencode keeps what its
+  harness adds (instruction files it loaded, background shell results,
+  restarts, instruction updates) as `synthetic` and `system` messages,
+  which are no turns. An agent reply is the text blocks of an `assistant`
+  message; one that ended in an error is `failed`, its error message
+  standing for its text when it has none. A person can type into a
+  subagent session, so it is read, as a Claude subagent's transcript is. In
+  one, a `user` message is the prompt an agent wrote (`subagent`) when it
+  opens with "You are a subagent spawned by another session.", as opencode
+  opens each prompt its subagent tool or a command run as a subtask writes,
+  or when it has neither `files` nor `agents`: opencode's prompt box sends
+  both with whatever a person types, and its subagent tool neither.
+  Messages migrated from older opencode keep those only when not empty, so
+  in a migrated subagent session what a person typed may count as a prompt.
+  With `--since`, a session whose newest message is not after it is counted
+  in `unmodified_transcripts` and not read.
 * Secrets: a `user` message is `person`; an assistant's text and reasoning
   blocks are `agent`; a tool block's `state.input` is `tool_input` and every
   other field of its `state` is `tool_output`; everything else is `other`.
@@ -489,10 +501,10 @@ so memory holds one transcript at a time:
 * `coverage` says what was read and why each other user turn is not listed:
   `user_turns` is `human` plus every count in `excluded` plus `earlier` and
   `undated` (with `--since`, a message at or before it, or with no time).
-  Codex and opencode subagent sessions (`subagent_transcripts`) and, with
-  `--since`, transcripts last written before it are counted and not read; an
-  opencode store holds every session, so each of its messages is placed by
-  its own time instead. `gaps` names sources Vessa knows of and does not
+  Codex subagent transcripts (`subagent_transcripts`) and, with `--since`,
+  transcripts last written before it are counted and not read; an opencode
+  store holds every session, so its sessions are placed by their newest
+  message instead. `gaps` names sources Vessa knows of and does not
   read; every source it knows of is now read, so it stays empty, and remains
   for consumers of the schema.
 * Exit 4 means the list is partial: a source warning, a gap, or a session

@@ -55,7 +55,13 @@ fn sessions(
             });
             match read {
                 Ok(by_session) => {
-                    for (line, v) in by_session.remove(&s.id).unwrap_or_default() {
+                    for (line, mut v) in by_session.remove(&s.id).unwrap_or_default() {
+                        // A fork's copy of a response is that response: under
+                        // its id, it is counted once, with the session forked
+                        // from, which comes first as a fork's parent.
+                        if let Some(origin) = stored.facts.copied.get(&line) {
+                            v["id"] = origin.as_str().into();
+                        }
                         if let Some(why) = v["malformed"].as_str() {
                             s.limitations.push(format!("message {line}: {why}"));
                         } else if let Err(error) = opencode(&v, line, &mut s) {
@@ -66,9 +72,6 @@ fn sessions(
                 Err(why) => s
                     .limitations
                     .push(format!("messages unreadable, so no usage read: {why}")),
-            }
-            if let Some(fork) = &stored.fork {
-                s.limitations.push(fork_note(fork));
             }
         }
         report.sessions.push(s);
@@ -1290,14 +1293,6 @@ fn warn(warnings: &mut Vec<String>) -> impl FnMut(&Path, String) + '_ {
     |path, why| warnings.push(format!("{}: {why}", path.display()))
 }
 
-/// What Vessa cannot say of an opencode fork: whether opencode copies the
-/// history of the session it was forked from into it, as Codex does.
-fn fork_note(fork: &str) -> String {
-    format!(
-        "opencode fork of {fork}: Vessa does not know whether opencode copies the history it was forked from into it, so copied requests and messages may be counted twice"
-    )
-}
-
 /// One opencode model response (an assistant message, or the summary a
 /// compaction asks for): one request, when it records tokens. opencode
 /// counts reasoning apart from output; it is output, as Codex's
@@ -1443,11 +1438,10 @@ pub fn messages(
     // each opencode session, with the store that holds it.
     let mut headers = Vec::new();
     let (files, stores) = transcripts(paths, &mut warnings);
-    // Of each opencode session: when its newest message was created, and
-    // the session it was forked from.
-    let mut stored: HashMap<(PathBuf, String), (Option<i64>, Option<String>)> = HashMap::new();
+    // What each opencode store says of its sessions besides their headers.
+    let mut stored: HashMap<(PathBuf, String), crate::opencode::Facts> = HashMap::new();
     for (store, s) in opencode_sessions(&stores, &mut warn(&mut warnings)) {
-        stored.insert((store.clone(), s.session.id.clone()), (s.last, s.fork));
+        stored.insert((store.clone(), s.session.id.clone()), s.facts);
         headers.push((store, s.session));
     }
     for file in files {
@@ -1503,9 +1497,10 @@ pub fn messages(
         if !chosen(s) {
             continue;
         }
-        // A person can write to a Claude subagent, so its transcript is
-        // read for that. Nothing in a Codex subagent's says a person wrote.
-        if s.subagent && s.agent != "claude" {
+        // A person can write to a Claude or opencode subagent, so its
+        // transcript is read for that. Nothing in a Codex subagent's says a
+        // person wrote.
+        if s.subagent && !matches!(s.agent.as_str(), "claude" | "opencode") {
             coverage.subagent_transcripts += 1;
             continue;
         }
@@ -1517,7 +1512,7 @@ pub fn messages(
             let unmodified = if s.agent == "opencode" {
                 stored
                     .get(&(path.clone(), s.id.clone()))
-                    .is_some_and(|(last, _)| last.is_none_or(|ms| ms <= since.timestamp_millis()))
+                    .is_some_and(|facts| facts.last.is_none_or(|ms| ms <= since.timestamp_millis()))
             } else {
                 std::fs::metadata(path)
                     .and_then(|m| m.modified())
@@ -1584,8 +1579,11 @@ pub fn messages(
                 continue;
             }
         };
-        if let Some((_, Some(fork))) = stored.get(&(path.clone(), s.id.clone())) {
-            read.limitations.push(fork_note(fork));
+        if let Some(note) = stored
+            .get(&(path.clone(), s.id.clone()))
+            .and_then(crate::opencode::Facts::unlisted)
+        {
+            read.limitations.push(note);
         }
         coverage.transcripts += 1;
         if wanted.contains(&s.id) {
@@ -1745,6 +1743,7 @@ fn turns(path: &Path, s: &Session, scrub: bool) -> Result<Turns> {
         return Ok(opencode_turns(
             crate::opencode::records(path, &s.id)?,
             scrub,
+            s.subagent,
         ));
     }
     let file = BufReader::new(std::fs::File::open(path)?);
@@ -2014,7 +2013,13 @@ fn codex_answers(text: &str, questions: &HashMap<String, Value>) -> Option<Vec<T
 /// background shell results, restarts) as `synthetic` and `system`
 /// messages, which are no turns. An assistant message's prose is its text
 /// blocks; reasoning and tool calls are not.
-fn opencode_turns(records: Vec<(usize, Value)>, scrub: bool) -> Turns {
+///
+/// In a `subagent` session a `user` message is the prompt an agent wrote
+/// (`subagent`) when it opens as opencode opens every such prompt, or when
+/// it names neither `files` nor `agents`: opencode's prompt box sends both
+/// with whatever a person types, and its subagent tool neither. What a
+/// person types into a subagent session is theirs.
+fn opencode_turns(records: Vec<(usize, Value)>, scrub: bool, subagent: bool) -> Turns {
     let mut read = Turns::default();
     for (line, v) in records {
         if let Some(why) = v["malformed"].as_str() {
@@ -2024,10 +2029,16 @@ fn opencode_turns(records: Vec<(usize, Value)>, scrub: bool) -> Turns {
         }
         let d = &v["data"];
         let turn = match v["type"].as_str() {
-            Some("user") => Some(Turn {
-                id: v["id"].as_str().map(str::to_owned),
-                ..Turn::user(string(d, "text"), None)
-            }),
+            Some("user") => {
+                let text = string(d, "text");
+                let prompted = subagent
+                    && (text.starts_with(crate::opencode::SUBAGENT_PROMPT)
+                        || (d.get("files").is_none() && d.get("agents").is_none()));
+                Some(Turn {
+                    id: v["id"].as_str().map(str::to_owned),
+                    ..Turn::user(text, prompted.then_some("subagent"))
+                })
+            }
             Some("assistant") => {
                 let failed = d["finish"] == "error" || d["error"].is_object();
                 let mut text = content(&d["content"]);

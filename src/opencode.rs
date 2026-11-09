@@ -53,12 +53,42 @@ pub struct Stored {
     /// Its header, no usage read. A subagent's `root` is the session that
     /// started it, which [`crate::import`] follows to the top of the chain.
     pub session: Session,
+    pub facts: Facts,
+}
+
+/// What a store says of a session besides its header.
+#[derive(Default)]
+pub struct Facts {
     /// When its newest message was created, in milliseconds; none when it
     /// has none.
     pub last: Option<i64>,
-    /// The session it was forked from.
-    pub fork: Option<String>,
+    /// Of a fork, the messages opencode copied into it from the session it
+    /// was forked from: by `seq`, the id of the message each copies.
+    /// opencode copies that session's messages up to the fork, each under a
+    /// new id but with its `seq`, creation time and data, so a message of
+    /// the fork whose origin holds one at its `seq` created at the same
+    /// time is a copy of that one.
+    pub copied: BTreeMap<usize, String>,
+    /// Of a fork whose origin is not in the store: that origin.
+    pub lost_origin: Option<String>,
 }
+
+impl Facts {
+    /// What `messages` cannot list of the session, if anything: a fork's
+    /// copies are its origin's messages, created before it, and listed with
+    /// the origin, which here is not in the store.
+    pub fn unlisted(&self) -> Option<String> {
+        self.lost_origin.as_ref().map(|origin| {
+            format!(
+                "opencode fork of {origin}, which is not in the store: the messages opencode copied from it are its, created before the fork, and listed with it, so here not at all"
+            )
+        })
+    }
+}
+
+/// The opening opencode gives every prompt one agent writes to a subagent
+/// it starts, from a tool call or a command run as a subtask.
+pub const SUBAGENT_PROMPT: &str = "You are a subagent spawned by another session.";
 
 /// The sessions in the store, with what the store holds that Vessa does not
 /// read. A store whose layout is not the one Vessa knows is an error: it
@@ -110,26 +140,53 @@ pub fn sessions(store: &Path) -> Result<(Vec<Stored>, Vec<String>)> {
             ));
         }
     }
-    let fork = if tables["session_v2"].contains("fork_session_id") {
-        "fork_session_id"
-    } else {
-        "null"
-    };
+    let forks = tables["session_v2"].contains("fork_session_id");
+    let fork = if forks { "fork_session_id" } else { "null" };
+    // Each fork's copies: its messages its origin holds at the same `seq`,
+    // created at the same time, with the id of the one each copies.
+    let mut copied: BTreeMap<String, BTreeMap<usize, String>> = BTreeMap::new();
+    if forks {
+        for row in query(
+            store,
+            "select f.session_id as sid, f.seq as seq, o.id as origin from session_message f join session_v2 s on s.id = f.session_id join session_message o on o.session_id = s.fork_session_id and o.seq = f.seq and o.time_created = f.time_created where s.fork_session_id is not null",
+        )? {
+            let seq = row["seq"]
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .context("a message without a valid seq")?;
+            copied
+                .entry(text(&row, "sid")?)
+                .or_default()
+                .insert(seq, text(&row, "origin")?);
+        }
+    }
     let mut sessions = Vec::new();
     for row in query(
         store,
         &format!(
-            "select s.id, s.parent_id, s.directory, s.time_created, {fork} as fork, (select max(m.time_created) from session_message m where m.session_id = s.id) as last from session_v2 s order by s.time_created, s.id"
+            "select s.id, s.parent_id, s.directory, s.time_created, {fork} as fork, {fork} in (select id from session_v2) as found, (select max(m.time_created) from session_message m where m.session_id = s.id) as last from session_v2 s order by s.time_created, s.id"
         ),
     )? {
         let id = text(&row, "id")?;
         ensure!(!id.is_empty(), "a session without an id");
-        let parent = row["parent_id"].as_str().map(str::to_owned);
+        // A subagent's parent started it; a fork's is the session it was
+        // forked from, as a Codex fork's is.
+        let started_by = row["parent_id"].as_str().map(str::to_owned);
+        let parent = started_by.clone().or_else(|| row["fork"].as_str().map(str::to_owned));
+        let facts = Facts {
+            last: row["last"].as_i64(),
+            copied: copied.remove(&id).unwrap_or_default(),
+            lost_origin: row["fork"]
+                .as_str()
+                .filter(|_| row["found"].as_i64() != Some(1))
+                .map(str::to_owned),
+        };
         sessions.push(Stored {
+            facts,
             session: Session {
                 agent: "opencode".into(),
-                subagent: parent.is_some(),
-                root: parent.clone(),
+                subagent: started_by.is_some(),
+                root: started_by,
                 id,
                 parent,
                 started_at: row["time_created"]
@@ -149,8 +206,6 @@ pub fn sessions(store: &Path) -> Result<(Vec<Stored>, Vec<String>)> {
                 synthetic: Default::default(),
                 partly_sidechain: false,
             },
-            last: row["last"].as_i64(),
-            fork: row["fork"].as_str().map(str::to_owned),
         });
     }
     Ok((sessions, warnings))

@@ -870,7 +870,7 @@ fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
             .join(", ");
         writeln!(
             out,
-            "{} from {} ({} headless) · {} other user turns not listed{} · {} Codex and opencode subagent sessions not read",
+            "{} from {} ({} headless) · {} other user turns not listed{} · {} Codex subagent transcripts not read",
             render::many(c.human, "message"),
             render::many(
                 listing.sessions.iter().filter(|s| s.messages > 0).count(),
