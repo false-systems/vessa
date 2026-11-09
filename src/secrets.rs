@@ -1,5 +1,11 @@
 //! On-demand metadata only. Values exist only while a native record is scanned.
-use crate::{model::Session, scrub::Redactions};
+//!
+//! A finding is an alarm: one of the credentials this machine holds
+//! ([`crate::held`]) appeared in a transcript. Every other secret-shaped
+//! string is counted by rule (`candidates`), the plain placeholders among
+//! them apart (`placeholders`), and never listed.
+use crate::held::{self, Held};
+use crate::{model::Session, scrub};
 use chrono::{DateTime, FixedOffset};
 use serde::Serialize;
 use serde_json::Value;
@@ -15,8 +21,15 @@ pub struct Report {
     pub transcripts: usize,
     /// Readable finding records which produced a missing-timestamp warning.
     pub undated_records: usize,
+    /// Each held credential that appeared: the alarms.
     pub findings: Vec<Finding>,
     pub unreadable: Vec<Gap>,
+    /// Where this machine's credentials were looked for, by name.
+    pub compared_with: Vec<held::Source>,
+    /// Secret-shaped strings that are none of them, by rule: counted only.
+    pub candidates: BTreeMap<&'static str, usize>,
+    /// Of `candidates`, those that are plainly placeholders.
+    pub placeholders: usize,
 }
 
 #[derive(Serialize)]
@@ -27,10 +40,15 @@ pub struct Finding {
     source: String,
     line: usize,
     at: Option<String>,
+    /// `at` is the time of the record before, as this one has none.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    at_inferred: bool,
     #[serde(rename = "where")]
     place: &'static str,
     rule: &'static str,
     count: usize,
+    /// Which of this machine's credentials it is, by its source's name.
+    held: String,
     /// A measured subset of count, in native signature/encrypted-content fields.
     opaque_count: Option<usize>,
     /// Positive opaque subsets were attributed at verified native positions.
@@ -54,6 +72,25 @@ impl Report {
             undated_records: 0,
             findings: Vec::new(),
             unreadable: Vec::new(),
+            compared_with: Vec::new(),
+            candidates: BTreeMap::new(),
+            placeholders: 0,
+        }
+    }
+
+    /// Where `held` looked: a source that exists but could not be read
+    /// leaves the comparison partial, never an all-clear.
+    pub fn compared(&mut self, held: &mut Held) {
+        for source in std::mem::take(&mut held.sources) {
+            if source.status == "unreadable" {
+                let why = source.why.clone().unwrap_or_default();
+                self.gap(
+                    &source.source,
+                    None,
+                    format!("credentials could not be read to compare with: {why}"),
+                );
+            }
+            self.compared_with.push(source);
         }
     }
     pub fn gap(&mut self, path: &str, line: Option<usize>, why: String) {
@@ -72,7 +109,7 @@ impl Report {
 pub fn scrub_metadata(value: &mut Value) {
     match value {
         Value::String(text) => {
-            let mut scrub = Redactions::default();
+            let mut scrub = scrub::Redactions::default();
             let whole = scrub.text(text);
             *text = whole
                 .split_inclusive(['/', '\\'])
@@ -89,6 +126,7 @@ pub fn scan_file(
     path: &Path,
     session: &Session,
     since: Option<DateTime<FixedOffset>>,
+    held: &Held,
     report: &mut Report,
 ) {
     let source = path.display().to_string();
@@ -100,6 +138,9 @@ pub fn scan_file(
         }
     };
     report.transcripts += 1;
+    // The time of the last record that had one: a transcript is appended
+    // to, so a record without a time was written at or after it.
+    let mut previous: Option<(String, DateTime<FixedOffset>)> = None;
     for (index, line) in BufReader::new(file).split(b'\n').enumerate() {
         let number = index + 1;
         let bytes = match line {
@@ -124,8 +165,8 @@ pub fn scan_file(
                 // role and time are unknown, never silently assigned to a window.
                 let text = String::from_utf8_lossy(&bytes);
                 let mut marks = BTreeMap::new();
-                count(&text, "other", None, &mut marks);
-                append(report, session, &source, number, None, marks);
+                count(&text, "other", None, held, &mut marks, report);
+                append(report, session, &source, number, (None, false), marks);
                 continue;
             }
         };
@@ -146,15 +187,23 @@ pub fn scan_file(
         let parsed = at
             .as_deref()
             .and_then(|t| DateTime::parse_from_rfc3339(t).ok());
+        let before = previous.take();
+        previous = at.clone().zip(parsed).or(before.clone());
         if since.zip(parsed).is_some_and(|(from, at)| at <= from) {
             continue;
         }
-        let at = parsed.and(at);
+        // No time of its own: the record before's, when that places it.
+        // After `since` it places this one there too; before, it cannot.
+        let at = match (parsed.and(at), before) {
+            (Some(at), _) => (Some(at), false),
+            (None, Some((at, t))) if since.is_none_or(|from| t > from) => (Some(at), true),
+            (None, _) => (None, false),
+        };
         let mut marks = BTreeMap::new();
         for (place, value, opaque_field) in pieces(&session.agent, &record) {
-            count_piece(value, place, opaque_field, &mut marks);
+            count_piece(value, place, opaque_field, held, &mut marks, report);
         }
-        if !marks.is_empty() && since.is_some() && at.is_none() {
+        if !marks.is_empty() && since.is_some() && at.0.is_none() {
             report.gap(
                 &source,
                 Some(number),
@@ -179,34 +228,68 @@ impl Default for Counts {
         }
     }
 }
-type Marks = BTreeMap<(&'static str, &'static str), Counts>;
+/// The held credentials found in one record, by where, rule and source.
+type Marks = BTreeMap<(&'static str, &'static str, String), Counts>;
 
-fn count_piece(value: &Value, place: &'static str, field: Option<&'static str>, marks: &mut Marks) {
+fn count_piece(
+    value: &Value,
+    place: &'static str,
+    field: Option<&'static str>,
+    held: &Held,
+    marks: &mut Marks,
+    report: &mut Report,
+) {
     if let Some((field, text)) =
         field.and_then(|field| value[field].as_str().map(|text| (field, text)))
     {
         // Keep scanning both portions. Context is not an exemption: even a
         // provider-shaped key in a metadata field remains a finding.
-        count(text, place, Some(true), marks);
+        count(text, place, Some(true), held, marks, report);
         let mut rest = value.clone();
         rest.as_object_mut()
             .expect("a field belongs to an object")
             .remove(field);
         let mut text = String::new();
         flatten(&rest, &mut text);
-        count(&text, place, Some(false), marks);
+        count(&text, place, Some(false), held, marks, report);
     } else {
         let mut text = String::new();
         flatten(value, &mut text);
-        count(&text, place, Some(false), marks);
+        count(&text, place, Some(false), held, marks, report);
     }
 }
 
-fn count(text: &str, place: &'static str, opaque: Option<bool>, marks: &mut Marks) {
-    let mut found = Redactions::default();
-    let _ = found.text(text);
-    for (&rule, &n) in found.by_rule() {
-        let counts = marks.entry((place, rule)).or_default();
+/// `text`, as a terminal shows it: each credential this machine holds that
+/// stands in it is marked for a finding, under the rule the detector gives
+/// it there (`no_known_shape` where it gives none, as for a value only a
+/// label makes look secret); every other secret-shaped string is counted
+/// by its rule, and as a placeholder when it plainly is one.
+fn count(
+    text: &str,
+    place: &'static str,
+    opaque: Option<bool>,
+    held: &Held,
+    marks: &mut Marks,
+    report: &mut Report,
+) {
+    let shown = scrub::shown(text);
+    let found = scrub::found(&shown);
+    for (rule, value) in &found {
+        if held.which(value).is_none() {
+            *report.candidates.entry(rule).or_default() += 1;
+            report.placeholders += usize::from(placeholder(value));
+        }
+    }
+    for (value, source) in held.each() {
+        let n = held::occurrences(&shown, value);
+        if n == 0 {
+            continue;
+        }
+        let rule = found
+            .iter()
+            .find(|(_, v)| v == value)
+            .map_or("no_known_shape", |(rule, _)| rule);
+        let counts = marks.entry((place, rule, source.to_owned())).or_default();
         counts.total += n;
         match (counts.opaque.as_mut(), opaque) {
             (Some(count), Some(true)) => *count += n,
@@ -216,15 +299,32 @@ fn count(text: &str, place: &'static str, opaque: Option<bool>, marks: &mut Mark
     }
 }
 
+/// A secret-shaped string that is plainly no secret: made of a few
+/// characters repeated (`sk-a1a1a1…`), holding a straight run of the
+/// alphabet or of digits (`ABCDEF…`), or ending as AWS's documentation
+/// examples do (`…EXAMPLE`, `…EXAMPLEKEY`). A real key is random, and is
+/// none of these.
+fn placeholder(value: &str) -> bool {
+    let alnum: Vec<u8> = value.bytes().filter(u8::is_ascii_alphanumeric).collect();
+    let distinct = alnum
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let run = alnum
+        .windows(6)
+        .any(|w| w.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    distinct < 10 || run || value.ends_with("EXAMPLE") || value.ends_with("EXAMPLEKEY")
+}
+
 fn append(
     report: &mut Report,
     session: &Session,
     source: &str,
     line: usize,
-    at: Option<String>,
+    (at, at_inferred): (Option<String>, bool),
     marks: Marks,
 ) {
-    for ((place, rule), counts) in marks {
+    for ((place, rule, held), counts) in marks {
         report.findings.push(Finding {
             agent: session.agent.clone(),
             session: session.id.clone(),
@@ -232,9 +332,11 @@ fn append(
             source: source.into(),
             line,
             at: at.clone(),
+            at_inferred: at.is_some() && at_inferred,
             place,
             rule,
             count: counts.total,
+            held,
             opaque_count: counts.opaque,
             opaque_native: counts.opaque.map(|_| true),
         });
