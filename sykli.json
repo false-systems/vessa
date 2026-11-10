@@ -33,6 +33,7 @@
         "src/secrets.rs",
         "src/work.rs",
         "tests/cli.rs",
+        "tests/instructions.rs",
         "tests/secrets.rs",
         "tests/support/mod.rs"
       ],
@@ -76,6 +77,7 @@
         "src/secrets.rs",
         "src/work.rs",
         "tests/cli.rs",
+        "tests/instructions.rs",
         "tests/secrets.rs",
         "tests/support/mod.rs"
       ],
@@ -95,6 +97,7 @@
         ".gitignore",
         ".toimija/repo.yaml",
         "AGENTS.md",
+        "CLAUDE.md",
         "Cargo.lock",
         "Cargo.toml",
         "LICENSE",
@@ -119,6 +122,7 @@
         "src/secrets.rs",
         "src/work.rs",
         "tests/cli.rs",
+        "tests/instructions.rs",
         "tests/secrets.rs",
         "tests/support/mod.rs"
       ],
