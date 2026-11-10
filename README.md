@@ -42,6 +42,9 @@ cd vessa
 cargo install --path .
 ```
 
+vessa is not on crates.io yet. Once it is published, `cargo install vessa`
+installs it with Rust 1.98 or newer; until then, use the commands above.
+
 Reading opencode sessions also needs the `sqlite3` command (3.33 or newer)
 on your `PATH`. The other agents need nothing extra.
 
