@@ -175,10 +175,10 @@ fn report_explains_usage_and_command_evidence() {
     assert!(html.contains("Uncached input</th>"));
     assert!(html.contains("Cached input read</th>"));
     assert!(html.contains("Savings are not measured here."));
-    assert!(html.contains("Do not nest a second wrapper."));
+    assert!(html.contains("Do not trim safety instructions or skip checks to save tokens."));
     assert!(!html.contains("Please run the existing local checks"));
     // Vessa describes itself, naming no other tool, in what it renders. The
-    // wrapper export it imports is named by its schema alone.
+    // file of linked session records it reads is named by its schema alone.
     let help = [
         &["--help"][..],
         &["report", "--help"],
@@ -187,10 +187,10 @@ fn report_explains_usage_and_command_evidence() {
     .iter()
     .map(|args| String::from_utf8(cli(args).stdout).unwrap())
     .collect::<String>();
-    // Given a wrapper's export, with a linked, an unmatched and an unreadable
+    // Given such a file, with a linked, an unmatched and an unreadable
     // session, the report and what is said on stderr still name no tool.
     let receipt = value(cli(&["receipt", "--input", "examples/pi.jsonl"]));
-    let export = temp("wrapper-export.json");
+    let export = temp("linked-records.json");
     let wrappers = serde_json::json!({"schema":"ohjaa-sessions.v1","sessions":[{"id":"oh-fixture","agent":"pi","usage":[receipt]},{"id":"oh-unmatched","agent":"pi","usage":[]}],"unreadable":["oh-gone"]});
     std::fs::write(&export, serde_json::to_vec(&wrappers).unwrap()).unwrap();
     let linked = temp("linked.html");
@@ -205,14 +205,15 @@ fn report_explains_usage_and_command_evidence() {
     ]);
     assert_eq!(out.status.code(), Some(4));
     let linked_html = std::fs::read_to_string(&linked).unwrap();
-    assert!(linked_html
-        .contains("wrapper session oh-unmatched has no explicit matching native transcript"));
-    assert!(linked_html.contains("the wrapper export could not read session"));
-    assert!(linked_html.contains("Explicitly linked wrapper session records"));
+    assert!(
+        linked_html.contains("linked session record oh-unmatched names no session that was read")
+    );
+    assert!(linked_html.contains("the linked records file says it could not read session"));
+    assert!(linked_html.contains("Explicitly linked session records"));
     let said = String::from_utf8(out.stderr).unwrap();
     let messages = cli(&["messages", "--input", export.to_str().unwrap()]);
     let said_messages = String::from_utf8(messages.stderr).unwrap();
-    assert!(said_messages.contains("a wrapper export holds no messages"));
+    assert!(said_messages.contains("a file of linked session records holds no messages"));
     for (what, text) in [
         ("report", &html),
         ("help", &help),
@@ -221,7 +222,7 @@ fn report_explains_usage_and_command_evidence() {
         ("messages stderr", &said_messages),
     ] {
         let text = text.to_lowercase().replace("ohjaa-sessions.v1", "");
-        for name in ["ohjaa", "toimija", "seula"] {
+        for name in ["ohjaa", "toimija", "sykli", "faija", "wrapper"] {
             assert!(!text.contains(name), "{what} names {name}: {text}");
         }
     }
@@ -1373,7 +1374,7 @@ fn claude_status_totals_include_subagents_with_a_breakdown() {
     assert_eq!(v["entries"][0]["input_tokens"], 1206);
     assert_eq!(v["entries"][0]["output_tokens"], 1675);
     assert_eq!(v["main_entries"][0]["output_tokens"], 300);
-    // `entries` is the session with its subagents (since vessa#4), and
+    // `entries` is the session with its subagents, and
     // `main_entries` its own transcript: each count is theirs summed.
     for key in [
         "input_tokens",
@@ -1475,7 +1476,7 @@ fn usage_export_links_subagents_to_their_session_additively() {
     assert_eq!(sub["parent"], "claude-demo");
     assert_eq!(sub["subagents"], serde_json::json!([]));
     assert_eq!(sub["totals_with_subagents"], sub["totals"]);
-    // Every session says it, so an older vessa is told apart from none.
+    // Every session says it: a session without subagents has an empty list.
     let v = value(cli(&["usage", "--input", "examples/pi.jsonl", "--json"]));
     assert_eq!(v["sessions"][0]["subagents"], serde_json::json!([]));
     assert_eq!(
@@ -2168,7 +2169,7 @@ fn listing(args: &[&str]) -> (Value, Option<i32>) {
 fn session_headers_differ_from_the_full_listing_only_where_documented() {
     // The header reader stops at a transcript's header, trusting how the
     // agents write. Where a file breaks that, the modes differ, as the
-    // README says, and these pin how.
+    // reference (docs/reference.md) says, and these pin how.
     let dir = temp("header-differences");
     std::fs::create_dir_all(&dir).unwrap();
     let opening = |id: &str| {
@@ -4140,7 +4141,7 @@ fn a_launch_task_is_what_the_person_typed_without_the_briefing() {
         ),
         // The launcher's alerts come before the framing.
         launch_prompt(true, Some("check the gate"), Some(&briefing)),
-        // Before ohjaa passed its briefing apart, it was the task: alone, or
+        // A briefing with no sentinel can be the task line itself: alone, or
         // after the typed task and a blank line.
         launch_prompt(false, Some(&briefing), None),
         launch_prompt(false, Some(&format!("ship it\n\n{briefing}")), None),
@@ -4190,14 +4191,12 @@ fn every_opening_of_an_older_briefing_ends_the_task() {
     assert_eq!(texts(&v), tasks);
 }
 
-/// ohjaa's `BRIEFING_SENTINEL` (false-systems/ohjaa, src/main.rs, since
-/// ohjaa#56): the first line of the briefing ohjaa gives every launch. ohjaa
-/// pins it in its own tests/cli.rs and vessa pins it here, where ohjaa's
-/// briefing is built with it, so a change on either side fails a test.
-/// vessa ends a task at a line of any version of it.
+/// The first line of the briefing ohjaa gives a launch. vessa pins it here,
+/// where ohjaa's briefing is built with it, and ends a task at a line of
+/// any version of it.
 const OHJAA_BRIEFING_SENTINEL: &str = "<!-- ohjaa-briefing v1 -->";
 
-/// ohjaa's briefing as ohjaa writes it since #56: the sentinel line, the
+/// ohjaa's briefing with its sentinel: the sentinel line, the
 /// unproven branch flag, then the other parts, all joined by a newline.
 fn ohjaa_briefing_v1() -> String {
     [
@@ -4249,8 +4248,7 @@ fn a_launch_task_ends_at_ohjaas_briefing_sentinel() {
             // The briefing with no task, or an empty one, is harness text.
             launch_prompt(false, None, Some(&briefing)),
             launch_prompt(false, Some(""), Some(&briefing)),
-            // An older ohjaa's briefing has no sentinel: still cut at its
-            // first part.
+            // A briefing with no sentinel is still cut at its first part.
             launch_prompt(false, Some("ship it"), Some(&ohjaa_briefing(true))),
         ],
     );
@@ -4354,8 +4352,7 @@ fn fake_anthropic() -> String {
         "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5kL7",
     ])
 }
-/// A signed evidence token in the shape habitat writes one: an evidence
-/// export's JSON in hex (`7b22` is `{"`), a dot, and a 64-byte signature in
+/// A signed evidence token: an evidence export's JSON in hex (`7b22` is `{"`), a dot, and a 64-byte signature in
 /// hex. Evidence, not a secret.
 fn evidence_token() -> String {
     let export = r#"{"anomalies":[],"effects":[],"evidence":[],"exported_at":1793000000500,"lease_generation":1,"operation_id":"op-demo","results":[],"status":"active","version":1}"#;
@@ -4511,10 +4508,10 @@ fn what_messages_says_of_its_sources_carries_no_secret() {
 const REDACTED_TOKEN: &str = "[redacted]";
 
 #[test]
-fn usage_commands_scrub_their_warnings_limitations_and_wrapper_records() {
+fn usage_commands_scrub_their_warnings_limitations_and_linked_records() {
     let key = fake_github();
-    // A wrapper's session record holds what it was asked and what it
-    // handed over, in words; its export names an unreadable session.
+    // A linked session record holds what a session was asked and what it
+    // handed over, in words; its file names an unreadable session.
     let receipt = value(cli(&["receipt", "--input", "examples/pi.jsonl"]));
     let export = temp("secret-export.json");
     let wrappers = serde_json::json!({"schema":"ohjaa-sessions.v1","sessions":[{"id":"oh-fixture","agent":"pi","intent":"ship it","task":format!("Deploy with {key} tonight."),"usage":[receipt]}],"unreadable":[key]});
@@ -4774,7 +4771,7 @@ fn an_error_vessa_prints_carries_no_secret() {
     );
 }
 
-/// All structured token views must omit money, including legacy wrapper entries.
+/// All structured token views must omit money, including linked records' entries.
 fn assert_token_only(value: &Value) {
     match value {
         Value::Object(fields) => {
@@ -4847,7 +4844,7 @@ fn spending_is_absent_from_every_usage_view_and_the_removed_flag_is_rejected() {
 }
 
 #[test]
-fn legacy_costs_are_ignored_without_losing_tokens_or_wrapper_identity() {
+fn cost_fields_are_ignored_without_losing_tokens_or_the_linked_record() {
     let input = temp("ignored-cost.jsonl");
     let rows = include_str!("../examples/pi.jsonl").replace("0.002", "-99999999999.0");
     std::fs::write(&input, rows).unwrap();
@@ -4855,11 +4852,11 @@ fn legacy_costs_are_ignored_without_losing_tokens_or_wrapper_identity() {
     assert_eq!(receipt["entries"][0]["input_tokens"], 220);
     assert_token_only(&receipt);
     receipt["entries"][0]["estimated_usd_micros"] = 999999.into();
-    receipt["entries"][0]["estimate_basis"] = "legacy pricing".into();
+    receipt["entries"][0]["estimate_basis"] = "some pricing".into();
     receipt["entries"][0]["billed"] = serde_json::json!({"micros":999,"unit":"USD"});
     receipt["entries"][0]["credits"] = serde_json::json!({"micros":999,"unit":"credit"});
-    let export = temp("legacy-wrapper.json");
-    std::fs::write(&export, serde_json::json!({"schema":"ohjaa-sessions.v1","sessions":[{"id":"oh-legacy","agent":"pi","usage":[receipt]}],"unreadable":[]}).to_string()).unwrap();
+    let export = temp("priced-records.json");
+    std::fs::write(&export, serde_json::json!({"schema":"ohjaa-sessions.v1","sessions":[{"id":"oh-priced","agent":"pi","usage":[receipt]}],"unreadable":[]}).to_string()).unwrap();
     let v = value(cli(&[
         "usage",
         "--input",
@@ -4869,7 +4866,7 @@ fn legacy_costs_are_ignored_without_losing_tokens_or_wrapper_identity() {
         "--json",
     ]));
     assert_eq!(v["schema"], "vessa-usage.v2");
-    assert_eq!(v["sessions"][0]["ohjaa"][0]["id"], "oh-legacy");
+    assert_eq!(v["sessions"][0]["ohjaa"][0]["id"], "oh-priced");
     assert_eq!(
         v["sessions"][0]["ohjaa"][0]["usage"][0]["entries"][0]["input_tokens"],
         220
@@ -4892,7 +4889,7 @@ fn legacy_costs_are_ignored_without_losing_tokens_or_wrapper_identity() {
         "estimate_basis",
         "billed",
         "credits",
-        "legacy pricing",
+        "some pricing",
         "spending",
         "Estimated waste",
         "$",

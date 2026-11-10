@@ -23,13 +23,13 @@ struct Cli {
     #[command(subcommand)]
     command: Cmd,
     /// Native JSONL file/directory, opencode's SQLite store (read with the
-    /// sqlite3 command), or a wrapper's ohjaa-sessions.v1 JSON export;
-    /// repeatable.
+    /// sqlite3 command), or an ohjaa-sessions.v1 JSON file of linked session
+    /// records; repeatable.
     #[arg(long, global = true)]
     input: Vec<PathBuf>,
     #[arg(long, global = true)]
     agent: Option<String>,
-    /// Native session ID, not wrapper session ID.
+    /// The agent's own session ID, not a linked record's ID.
     #[arg(long, global = true)]
     session: Option<String>,
     #[arg(long, global = true)]
@@ -71,8 +71,7 @@ enum Cmd {
         #[arg(long)]
         output: PathBuf,
     },
-    /// Emit one session's usage as an agent-usage.v1 receipt, for a wrapper
-    /// to import.
+    /// Emit one session's usage as an agent-usage.v1 receipt.
     Receipt,
     /// Current recorded usage for exactly one explicitly selected session.
     Status,
@@ -199,8 +198,9 @@ fn run_once(cli: Cli) -> Result<i32> {
         .count();
     let incomplete = source_warnings > 0 || limited > 0;
     // Every command below prints the report's warnings and limitations, and
-    // the report and exports its wrapper records: words from transcripts and
-    // a wrapper, scrubbed of secrets as `messages` scrubs its own.
+    // the report and exports its linked session records: words from
+    // transcripts and those records, scrubbed of secrets as `messages`
+    // scrubs its own.
     let found = scrub::report(&mut report);
     // Imported names are untrusted terminal content, on stderr too.
     use render::for_terminal as clean;

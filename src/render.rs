@@ -86,7 +86,7 @@ fn overview(out: &mut String, report: &Report) -> Result<()> {
             Ok((i, f.main, f.subagents.len(), records))
         })
         .collect::<Result<Vec<_>>>()?;
-    out.push_str("<h3>Sessions and subagents</h3><div class=\"scroll\"><table><thead><tr><th scope=\"col\">Session</th><th scope=\"col\">Usage records</th><th scope=\"col\">Linked wrapper records</th></tr></thead><tbody>");
+    out.push_str("<h3>Sessions and subagents</h3><div class=\"scroll\"><table><thead><tr><th scope=\"col\">Session</th><th scope=\"col\">Usage records</th><th scope=\"col\">Linked session records</th></tr></thead><tbody>");
     for (i, s, subagents, records) in sessions {
         let with = match subagents {
             0 => String::new(),
@@ -95,7 +95,7 @@ fn overview(out: &mut String, report: &Report) -> Result<()> {
         let _ = write!(out, "<tr><th scope=\"row\"><a href=\"#s{i}\">{} · {}</a>{with}</th><td>{records}</td><td>{}</td></tr>", escape(&s.agent), escape(&s.id), s.ohjaa.len());
     }
     out.push_str("</tbody></table></div><h3>What the token categories mean</h3><p>Uncached input is new input processing; cached input read is reused input processing. Cache writes and output are counted separately. Output already includes reasoning where the source counts it. These categories do not identify which file or instruction caused the usage.</p></section>");
-    out.push_str("<section aria-labelledby=\"reduce\"><h2 id=\"reduce\">Reduce repeated work</h2><ol><li>Start each bounded task in its repository through one launching wrapper that hands the agent what is already known and the previous handover. Do not nest a second wrapper.</li><li>Use the working set and read order it delivers instead of scanning the repository again. Read additional files only for a concrete missing dependency; refresh when Git facts become stale.</li><li>Use recorded decisions and the handover instead of rediscovering accepted choices. Record remaining work at completion, not after every reply. Do not trim safety instructions or skip checks to save tokens.</li><li>Attach a Vessa receipt (<code>vessa receipt</code>) to the explicit wrapper session and include the wrapper's session export in this report. Compare similar tasks with the same model and validation: uncached input, output, cache usage and completion evidence, not token totals alone.</li></ol><p><strong>Savings are not measured here.</strong> A linked wrapper record proves association, not that its briefing was used or that it saved tokens. A before/after comparison needs comparable task and outcome evidence; launch overhead alone is not net savings.</p></section>");
+    out.push_str("<section aria-labelledby=\"reduce\"><h2 id=\"reduce\">Reduce repeated work</h2><ol><li>Start each bounded task with what is already known: the facts of its repository, the decisions already recorded and the previous session's handover. An agent that is handed these does not spend tokens finding them again.</li><li>Read additional files only for a concrete missing dependency, instead of scanning the repository again.</li><li>Record remaining work at completion, not after every reply. Do not trim safety instructions or skip checks to save tokens.</li><li>Compare similar tasks with the same model and validation: uncached input, output, cache usage and completion evidence, not token totals alone.</li></ol><p><strong>Savings are not measured here.</strong> A linked session record proves association, not that anything in it was used or that it saved tokens. A before/after comparison needs comparable task and outcome evidence; launch overhead alone is not net savings.</p></section>");
     Ok(())
 }
 pub fn html(report: &Report) -> Result<String> {
@@ -178,9 +178,7 @@ pub fn html(report: &Report) -> Result<String> {
             escape(&crate::work::text(&insights)), escape(insights.basis)
         );
         if !s.ohjaa.is_empty() {
-            out.push_str(
-                "<details><summary>Explicitly linked wrapper session records</summary><pre>",
-            );
+            out.push_str("<details><summary>Explicitly linked session records</summary><pre>");
             out.push_str(&escape(&serde_json::to_string_pretty(&s.ohjaa)?));
             out.push_str("</pre></details>");
         }
