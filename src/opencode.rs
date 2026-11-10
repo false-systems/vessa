@@ -295,13 +295,14 @@ fn message(row: &Value) -> Result<(usize, Value)> {
 }
 
 /// The rows `sql` selects, through `sqlite3 -readonly -json`. No rows print
-/// nothing, which is an empty list. `-init /dev/null` keeps the person's
+/// nothing, which is an empty list. `-init <the null device>` keeps the person's
 /// `~/.sqliterc` (`.timer on`, `.echo on`) out of the output.
 fn query(store: &Path, sql: &str) -> Result<Vec<Value>> {
     let output = Command::new("sqlite3")
         .args([
             "-init",
-            "/dev/null",
+            // The null device: no start-up file is read.
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
             "-batch",
             "-readonly",
             "-bail",
