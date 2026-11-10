@@ -75,7 +75,6 @@ one works alone.
 - **sykli**: declared checks, and proof that they ran.
 - **ohjaa**: what agents are told, decided by a person.
 - **vessa**: what agents used.
-- **faija**: the words they share.
 
 ## What it does not do
 
