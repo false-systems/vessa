@@ -15,23 +15,21 @@ your machine, and the files it reads are never changed.
 ## See it
 
 ```console
-$ vessa stats --period year
-Calendar usage · UTC · selected local records
-2026 claude · 48 sessions · 253 subagents · 36981 usage records
-  anthropic/claude-opus-5-5 in=72986 out=22914244 cache-read=10809505589 cache-write=316461626
-  anthropic/claude-sonnet-5-5 in=178 out=121297 cache-read=6526679 cache-write=717275
-  ...
-2026 codex · 335 sessions · 404 subagents · 104759 usage records
-  openai/gpt-5.5 in=124952943 out=7211705 cache-read=3134139264 cache-write=0
-  ...
-2026 pi · 32 sessions · 5889 usage records
-  zai/glm-5.3 in=26009337 out=3694531 cache-read=1132067712 cache-write=0
-vessa: partial usage evidence (exit 4): 47 sessions with limitations, 0 source warnings
+$ vessa usage --by-agent --input examples
+Deduplicated agent totals
+claude
+  anthropic/demo-model in=1206 out=1675 cache-read=3300 cache-write=180
+codex
+  openai/demo-codex in=800 out=200 cache-read=700 cache-write=0
+pi
+  test/demo in=700 out=250 cache-read=800 cache-write=0
+  zai/demo-glm in=220 out=110 cache-read=400 cache-write=0
 ```
 
-This is a real run, trimmed where `...` stands. The last line is the point:
-some sessions could not be read in full, so vessa says the result is partial
-and exits with code 4, and lists each limitation above that line.
+This runs on the sample sessions in `examples/`, so you can repeat it in a
+clone. Each line is what that agent recorded for one model: input, output and
+cache tokens, kept apart. When a session cannot be read in full, vessa says
+the result is partial, names each limitation and exits with code 4.
 
 ## Install
 
