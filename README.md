@@ -44,8 +44,9 @@ the result is partial, names each limitation and exits with code 4.
 
 ## Install
 
-vessa runs on macOS and Linux. Windows is not supported: under WSL it runs as
-the Linux program, and reads the sessions of agents that run inside WSL.
+vessa runs on macOS, Linux and Windows. On Windows its whole test suite
+passes, but it does not yet find the agents' folders by itself: pass
+`--input PATH`. Under WSL it runs as the Linux program.
 
 Today vessa builds from source with Rust. The toolchain version is pinned in
 `rust-toolchain.toml` (1.98), and `rustup` installs it on the first build.
