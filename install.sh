@@ -1,0 +1,61 @@
+#!/bin/sh
+set -eu
+
+tag=${1:-}
+case "$tag" in
+  v[0-9]* ) ;;
+  * ) echo "usage: install.sh v<version>" >&2; exit 2 ;;
+esac
+case "$tag" in
+  *[!A-Za-z0-9._-]* ) echo "invalid tag: $tag" >&2; exit 2 ;;
+esac
+
+case "$(uname -s)" in
+  Linux) platform=linux ;;
+  Darwin) platform=macos ;;
+  MINGW*|MSYS*|CYGWIN*) platform=windows ;;
+  *) echo "unsupported platform: $(uname -s)" >&2; exit 2 ;;
+esac
+case "$(uname -m)" in
+  x86_64|amd64) arch=x86_64 ;;
+  aarch64|arm64) arch=aarch64 ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 2 ;;
+esac
+if [ "$platform" = windows ] && [ "$arch" = aarch64 ]; then
+  echo "no Windows ARM release is built; install the x86_64 zip (it runs under emulation) or use cargo install" >&2
+  exit 2
+fi
+
+repository=${VESSA_REPOSITORY:-false-systems/vessa}
+install_dir=${VESSA_INSTALL_DIR:-"$HOME/.local/bin"}
+binary=vessa
+extension=tar.gz
+if [ "$platform" = windows ]; then
+  binary=vessa.exe
+  extension=zip
+fi
+archive="vessa-$tag-$platform-$arch.$extension"
+url="https://github.com/$repository/releases/download/$tag"
+temporary=$(mktemp -d)
+trap 'rm -rf "$temporary"' EXIT HUP INT TERM
+
+curl -fsSLo "$temporary/$archive" "$url/$archive"
+curl -fsSLo "$temporary/SHA256SUMS" "$url/SHA256SUMS"
+(
+  cd "$temporary"
+  grep "  $archive\$" SHA256SUMS > "$archive.sha256"
+  if [ "$platform" = macos ]; then
+    shasum -a 256 -c "$archive.sha256"
+  else
+    sha256sum -c "$archive.sha256"
+  fi
+  if [ "$platform" = windows ]; then
+    # Git for Windows' sh has no unzip; Windows itself has one.
+    powershell.exe -NoProfile -Command "Expand-Archive -Force -LiteralPath '$(cygpath -w "$temporary/$archive")' -DestinationPath '$(cygpath -w "$temporary")'"
+  else
+    tar -xzf "$archive"
+  fi
+)
+install -d "$install_dir"
+install -m 0755 "$temporary/$binary" "$install_dir/$binary"
+echo "installed vessa $tag to $install_dir/$binary"

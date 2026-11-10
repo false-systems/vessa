@@ -6,6 +6,7 @@
       "run": "cargo fmt --check",
       "inputs": [
         ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
         ".gitignore",
         ".toimija/repo.yaml",
         "AGENTS.md",
@@ -21,6 +22,8 @@
         "examples/codex.jsonl",
         "examples/pi.jsonl",
         "examples/work.jsonl",
+        "install.sh",
+        "installer/test.sh",
         "rust-toolchain.toml",
         "src/held.rs",
         "src/import.rs",
@@ -50,6 +53,7 @@
       ],
       "inputs": [
         ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
         ".gitignore",
         ".toimija/repo.yaml",
         "AGENTS.md",
@@ -65,6 +69,8 @@
         "examples/codex.jsonl",
         "examples/pi.jsonl",
         "examples/work.jsonl",
+        "install.sh",
+        "installer/test.sh",
         "rust-toolchain.toml",
         "src/held.rs",
         "src/import.rs",
@@ -94,6 +100,7 @@
       ],
       "inputs": [
         ".github/workflows/ci.yml",
+        ".github/workflows/release.yml",
         ".gitignore",
         ".toimija/repo.yaml",
         "AGENTS.md",
@@ -110,6 +117,8 @@
         "examples/codex.jsonl",
         "examples/pi.jsonl",
         "examples/work.jsonl",
+        "install.sh",
+        "installer/test.sh",
         "rust-toolchain.toml",
         "src/held.rs",
         "src/import.rs",
@@ -130,6 +139,14 @@
         "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
         "CARGO_BUILD_BUILD_DIR": "${worktree_cache}/cargo-build"
       }
+    },
+    {
+      "name": "installer",
+      "run": "sh -n install.sh && sh installer/test.sh",
+      "inputs": [
+        "install.sh",
+        "installer/test.sh"
+      ]
     }
   ]
 }
