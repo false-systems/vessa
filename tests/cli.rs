@@ -2747,10 +2747,9 @@ fn messages_lists_what_a_person_typed_with_the_reply_it_follows() {
     }
     assert!(m["parent"].is_null());
     assert_eq!(m["line"], 4);
-    assert!(m["source"]
-        .as_str()
-        .unwrap()
-        .ends_with("examples/claude.jsonl"));
+    // Compared as a path, so the separator of the platform does not matter.
+    assert!(std::path::Path::new(m["source"].as_str().unwrap())
+        .ends_with(std::path::Path::new("examples").join("claude.jsonl")));
     assert_eq!(m["reply"]["text"], "The implementation is ready.");
     assert_eq!(m["reply"]["line"], 3);
     assert_eq!(m["reply"]["failed"], false);

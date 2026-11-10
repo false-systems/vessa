@@ -5,11 +5,18 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// The sqlite3 command's file name on this platform.
+pub fn sqlite3_name() -> String {
+    format!("sqlite3{}", std::env::consts::EXE_SUFFIX)
+}
+
 /// The folder of the sqlite3 command on this PATH. opencode's store can be
 /// neither made nor read without it, so these tests require it.
 pub fn sqlite3_dir() -> PathBuf {
     std::env::var_os("PATH")
-        .and_then(|path| std::env::split_paths(&path).find(|dir| dir.join("sqlite3").is_file()))
+        .and_then(|path| {
+            std::env::split_paths(&path).find(|dir| dir.join(sqlite3_name()).is_file())
+        })
         .expect("the opencode tests need the sqlite3 command on PATH")
 }
 
@@ -79,7 +86,7 @@ pub fn store(db: &Path, layout: &str, sessions: &[Session], messages: &[Message]
 
 /// Runs `script` against the store at `db`.
 pub fn sql(db: &Path, script: &str) {
-    let mut child = Command::new(sqlite3_dir().join("sqlite3"))
+    let mut child = Command::new(sqlite3_dir().join(sqlite3_name()))
         .arg(db)
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
