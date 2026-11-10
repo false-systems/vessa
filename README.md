@@ -630,8 +630,8 @@ harness's words:
 * **Rejecting a tool call.** Claude Code writes the reason after a fixed
   sentence that ends "To tell you how to proceed, the user said:". The reason
   is listed as `rejection`; a rejection with no reason stays a `tool_result`.
-* **A task in a launch prompt.** A launching wrapper (`ohjaa run`, through
-  toimija) composes the launch prompt as the launcher's alerts, if any
+* **A task in a launch prompt.** A launching wrapper (`toimija run`)
+  composes the launch prompt as the launcher's alerts, if any
   (`## Before anything else (from the launcher)`), the fixed framing and the
   session packet, then `\nTask: <task>\n`, then its briefing as
   `\n<briefing>\n`. Since ohjaa#56 the briefing's first line is
@@ -716,10 +716,12 @@ The programs exchange files; neither links or launches the other.
 
 ```sh
 vessa receipt --input /path/to/session.jsonl > /tmp/usage.json
-ohjaa usage import /tmp/usage.json --session oh-EXISTING-ID
-ohjaa usage export > /tmp/ohjaa.json
-vessa report --input /path/to/session.jsonl --input /tmp/ohjaa.json --output /tmp/work.html
+vessa report --input /path/to/session.jsonl --input /path/to/export.json --output /tmp/work.html
 ```
+
+No tool writes an `ohjaa-sessions.v1` export today: ohjaa's `usage import`,
+`usage export` and `run` were removed in 2026-11. Vessa still reads one it is
+given.
 
 `receipt` requires exactly one native session and emits `agent-usage.v1`.
 A Claude or Codex session's receipt includes its subagents and names them in
@@ -729,8 +731,6 @@ usage only when that explicit native-session association exists. Directory
 and time-window guesses never establish identity. Unmatched wrapper records
 are reported. Receipt totals and native totals are not added together.
 
-With `ohjaa run --usage-file /fresh/receipt.json`, a launched wrapper can write
-the receipt to `OHJAA_USAGE_FILE` before exiting, to be imported at leaving.
 Native agents do not emit this normalized receipt by themselves.
 
 ## UI and privacy
