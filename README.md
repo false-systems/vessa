@@ -71,13 +71,15 @@ means the command failed.
 
 ## How it fits
 
-vessa is one of a family of small tools for working with coding agents. Each
-one works alone.
+vessa is one of four small tools for working with coding agents. Each one works
+alone.
 
-- **toimija**: facts about a repository, for agents.
-- **sykli**: declared checks, and proof that they ran.
-- **ohjaa**: what agents are told, decided by a person.
-- **vessa**: what agents used.
+<img src="docs/assets/loop.svg" alt="A piece of work moves through five steps: start, check, review, land, deploy. toimija starts it, sykli does the other four, ohjaa holds what agents know, and vessa counts what agents used." width="100%">
+
+- **toimija** starts the session and gives the agent the facts of the repository.
+- **sykli** runs the declared checks, keeps the proof, and reviews, lands and deploys the work.
+- **ohjaa** holds what agents are told. A person decides it.
+- **vessa** counts what agents used.
 
 ## What it does not do
 
@@ -92,6 +94,6 @@ one works alone.
 
 ## More
 
-- [Reference](docs/reference.md): every command, the JSON formats, and how
-  each agent's records are counted.
+- [Reference](docs/reference.md): every command, the JSON formats, and how each agent's records are counted.
+- [Agent guide](AGENTS.md): for agents that work on vessa itself.
 - [Licence](LICENSE): MIT.
