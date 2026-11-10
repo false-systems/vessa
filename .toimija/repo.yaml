@@ -9,6 +9,7 @@ repo:
 context:
   important_docs:
     - README.md
+    - docs/reference.md
     - AGENTS.md
   safe_to_ignore:
     - target/

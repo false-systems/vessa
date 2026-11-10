@@ -2168,7 +2168,7 @@ fn listing(args: &[&str]) -> (Value, Option<i32>) {
 fn session_headers_differ_from_the_full_listing_only_where_documented() {
     // The header reader stops at a transcript's header, trusting how the
     // agents write. Where a file breaks that, the modes differ, as the
-    // README says, and these pin how.
+    // reference (docs/reference.md) says, and these pin how.
     let dir = temp("header-differences");
     std::fs::create_dir_all(&dir).unwrap();
     let opening = |id: &str| {
