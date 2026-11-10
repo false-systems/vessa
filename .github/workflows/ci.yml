@@ -77,3 +77,31 @@ jobs:
           --input examples/codex.jsonl
           --input examples/pi.jsonl
           --json
+
+  # vessa is released for Windows too, so its tests run there. This job uses a
+  # GitHub-hosted runner; while the repository is private those minutes are billed.
+  windows:
+    name: Tests (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: "1"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.98"
+
+      - name: Is sqlite3 here?
+        continue-on-error: true
+        run: sqlite3 --version
+
+      - name: Test
+        run: cargo test --locked
