@@ -29,7 +29,7 @@ pub fn headers(paths: &[PathBuf]) -> Result<Report> {
 }
 
 /// Every transcript under `paths`, read with `parse`, one session per native
-/// identity, parents first; with the ohjaa wrapper records selected. Both
+/// identity, parents first; with the linked session records given. Both
 /// readers start here, so they list the same sessions in the same order.
 /// An opencode store's sessions come with them, their usage read when
 /// `usage`.
@@ -250,7 +250,7 @@ pub fn secrets(
             report.gap(
                 &path.display().to_string(),
                 None,
-                "a wrapper export contains no native conversation content".into(),
+                "a file of linked session records contains no conversation content".into(),
             );
             continue;
         }
@@ -595,7 +595,7 @@ fn copy_depth(
     depth
 }
 
-/// Attaches each ohjaa wrapper record to the sessions it explicitly names,
+/// Attaches each linked session record to the sessions it explicitly names,
 /// and says which name none, or that no session was found at all.
 fn link(report: &mut Report, wrappers: Vec<Value>) {
     for session in &mut report.sessions {
@@ -606,8 +606,8 @@ fn link(report: &mut Report, wrappers: Vec<Value>) {
                     .any(|r| r["agent"] == session.agent && r["session_id"] == session.id)
             }) {
                 let mut record = wrapper.clone();
-                // Old wrapper exports may carry spending fields. Preserve
-                // their token evidence, but do not re-export money data.
+                // A linked record may carry spending fields. Keep its
+                // token evidence, but do not export money data.
                 if let Some(receipts) = record["usage"].as_array_mut() {
                     for receipt in receipts {
                         if let Some(entries) = receipt["entries"].as_array_mut() {
@@ -637,7 +637,7 @@ fn link(report: &mut Report, wrappers: Vec<Value>) {
             .any(|s| s.ohjaa.iter().any(|w| w["id"] == wrapper["id"]))
         {
             report.warnings.push(format!(
-                "wrapper session {} has no explicit matching native transcript",
+                "linked session record {} names no session that was read",
                 wrapper["id"].as_str().unwrap_or("unknown")
             ));
         }
@@ -735,8 +735,8 @@ enum Parsed {
     Wrappers(Vec<Value>, Vec<String>),
 }
 
-/// An ohjaa `.json` export: its wrapper session records, and what it could
-/// not read.
+/// An `ohjaa-sessions.v1` file: its session records, and the sessions it
+/// says it could not read.
 fn parse_export(path: &Path) -> Result<Parsed> {
     let value: Value = serde_json::from_reader(std::fs::File::open(path)?)?;
     ensure!(
@@ -751,7 +751,7 @@ fn parse_export(path: &Path) -> Result<Parsed> {
         .as_array()
         .context("missing unreadable coverage")?
         .iter()
-        .map(|id| format!("the wrapper export could not read session {id}"))
+        .map(|id| format!("the linked records file says it could not read session {id}"))
         .collect();
     Ok(Parsed::Wrappers(records, warnings))
 }
@@ -823,8 +823,8 @@ struct Opening {
     originator: Option<String>,
     subagent_source: bool,
     /// The session a Codex thread belongs to: `session_id`, which a child
-    /// thread shares with the session at its root; else, as older Codex
-    /// writes, the thread it was spawned or forked from.
+    /// thread shares with the session at its root; else, where Codex writes
+    /// none, the thread it was spawned or forked from.
     root: Option<String>,
 }
 
@@ -1200,10 +1200,10 @@ fn codex(
         let [Some(input), Some(output), Some(cached)] = values else {
             bail!("missing cumulative token categories; cannot safely derive request usage");
         };
-        // Newer Codex also counts cache writes. Vessa assumes that, like cached
-        // reads, they are part of the inclusive input; every real value seen so
-        // far is zero, so a non-zero one is reported until that is confirmed.
-        // Older Codex omits them: OpenAI prompt caching has no write category.
+        // Codex can also count cache writes. Vessa assumes that, like cached
+        // reads, they are part of the inclusive input. Nothing confirms it,
+        // so a non-zero one is reported. A counter without the field records
+        // none: OpenAI prompt caching has no write category.
         let written = cache_writes(total)?;
         if written > 0 {
             let note = "cache_write_input_tokens is non-zero: Vessa assumes cache writes are part of input_tokens, which no transcript has confirmed; uncached input may be undercounted";
@@ -1447,7 +1447,7 @@ pub fn messages(
     for file in files {
         if file.extension().is_some_and(|s| s == "json") {
             warnings.push(format!(
-                "{}: a wrapper export holds no messages; not read",
+                "{}: a file of linked session records holds no messages; not read",
                 file.display()
             ));
             continue;
@@ -2348,8 +2348,7 @@ fn without_reminders(text: &str) -> std::borrow::Cow<'_, str> {
 
 /// Elements a harness writes into a user turn: startup context,
 /// notifications, slash-command records, interruptions, and Codex's review,
-/// skill, recovery and plugin envelopes. Seula's set, which followed ohjaa
-/// intake's.
+/// skill, recovery and plugin envelopes.
 const ENVELOPE_TAGS: [&str; 17] = [
     "environment_context",
     "user_instructions",
@@ -2382,8 +2381,8 @@ const CONTINUATION: &str =
 const INIT: &str =
     "Generate a file named AGENTS.md that serves as a contributor guide for this repository.";
 /// The fixed openings of toimija's launch prompts, inside and outside a
-/// repository, which `ohjaa run` gives an agent as its first message. A
-/// person's task, when there is one, follows the harness text.
+/// repository, which an agent gets as its first message. A person's task,
+/// when there is one, follows the harness text.
 const LAUNCH: [&str; 2] = [
     "Your toimija session packet is below. It is your workset contract:",
     "You are in a toimija session outside any Git repository (",
@@ -2394,12 +2393,9 @@ const ALERTS: &str = "## Before anything else (from the launcher)\n";
 /// branch flag, validation, still-running, orphaned and warned sessions,
 /// Knowledge (whose preamble also opens scoped knowledge), the last session
 /// here, how the session works, sibling worktrees, and the system perimeter.
-/// In false-systems/ohjaa (main at d08e2d4, 2026-10-27) they are written by
-/// `src/mark.rs`, `src/integrated.rs`, `src/sessions.rs` (still running,
-/// orphaned, warned, last session), `src/knowledge.rs`, `src/main.rs` (how
-/// the session works, sibling worktrees) and `src/system.rs`.
-/// toimija appends the briefing after the task, so in a prompt from an ohjaa
-/// before its sentinel the first of these after a blank line ends the task.
+/// toimija appends the briefing after the task, so in a prompt whose
+/// briefing has no sentinel line the first of these after a blank line ends
+/// the task.
 const BRIEFING: [&str; 10] = [
     "FLAG: ",
     "Validation here (sykli's word, asked at launch;",
@@ -2412,8 +2408,8 @@ const BRIEFING: [&str; 10] = [
     "Sessions in the other worktrees of this clone at launch",
     "System perimeter (derived by ohjaa at launch;",
 ];
-/// How the line ohjaa's briefing opens with since ohjaa#56 begins and ends.
-/// ohjaa writes `<!-- ohjaa-briefing v1 -->` (its `BRIEFING_SENTINEL`) to say
+/// How the line ohjaa's briefing opens with begins and ends. ohjaa writes
+/// `<!-- ohjaa-briefing v1 -->` to say
 /// where its words begin. A line of this form, after trimming, ends the task
 /// in any version: the version tells what follows, not where it starts.
 const SENTINEL_OPENS: &str = "<!-- ohjaa-briefing ";
@@ -2435,11 +2431,11 @@ fn launched(text: &str) -> bool {
 }
 
 /// The task a person typed into a launch prompt. toimija writes the packet,
-/// then `\nTask: <task>\n`, then `\n<briefing>\n`; before ohjaa 7ba9a68 the
-/// task line held `<task>\n\n<briefing>`, or the briefing alone. The task is
-/// what lies between the last `Task:` line and ohjaa's briefing: its
-/// sentinel line, or in a prompt from an older ohjaa the first part of it.
-/// None when nothing typed is left.
+/// then `\nTask: <task>\n`, then `\n<briefing>\n`. A task line can also
+/// hold `<task>\n\n<briefing>`, or the briefing alone. The task is what
+/// lies between the last `Task:` line and ohjaa's briefing: its sentinel
+/// line, or where there is none the first part of it. None when nothing
+/// typed is left.
 fn launch_task(text: &str) -> Option<String> {
     let task = match sentinel_line(text) {
         Some(end) => text[..end].rsplit_once("\n\nTask: ")?.1,
@@ -2450,8 +2446,8 @@ fn launch_task(text: &str) -> Option<String> {
                 .min()
                 .unwrap_or(text.len());
             let (_, task) = text[..end].rsplit_once("\n\nTask: ")?;
-            // Before ohjaa passed its briefing apart (7ba9a68), the briefing
-            // was the task itself when no task was typed: `Task: <briefing>`.
+            // A briefing with no sentinel can be the task line itself, when
+            // no task was typed: `Task: <briefing>`.
             if BRIEFING.iter().any(|opening| task.starts_with(opening)) {
                 return None;
             }
