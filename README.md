@@ -92,4 +92,4 @@ one works alone.
 
 - [Reference](docs/reference.md): every command, the JSON formats, and how
   each agent's records are counted.
-- [Licence](LICENSE): Apache-2.0.
+- [Licence](LICENSE): MIT.
