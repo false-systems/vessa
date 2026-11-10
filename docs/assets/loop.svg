@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" fill="none" role="img" aria-labelledby="t d">
+<title id="t">How the four tools fit</title>
+<desc id="d">A piece of work moves left to right through five steps: start, check, review, land, deploy. toimija starts it; sykli checks, reviews, lands and deploys it. Above the row, ohjaa holds what agents know. Below it, vessa counts what agents used. The part that vessa does is filled in.</desc>
+<rect width="1200" height="300" fill="#f1ebdc"/>
+<g stroke="#171715" stroke-width="2">
+<path d="M64 36H1136V84H64Z" stroke-dasharray="6 8" stroke="#171715"/>
+<path d="M148 84V112"/>
+<path d="M232 152H290M458 152H516M684 152H742M910 152H968"/>
+<path d="M64 112H232V192H64Z" fill="none"/>
+<path d="M290 112H458V192H290Z" fill="none"/>
+<path d="M516 112H684V192H516Z" fill="none"/>
+<path d="M742 112H910V192H742Z" fill="none"/>
+<path d="M968 112H1136V192H968Z" fill="none"/>
+<path d="M64 246H1136" stroke="#b9b3a5"/>
+<path d="M64 246H700" stroke-width="8" stroke="#c75b36"/>
+</g>
+<g font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="20" fill="#171715" text-anchor="middle">
+<text x="148" y="159">START</text><text x="374" y="159">CHECK</text><text x="600" y="159">REVIEW</text><text x="826" y="159">LAND</text><text x="1052" y="159">DEPLOY</text>
+</g>
+<g font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="16" fill="#57594f">
+<text x="80" y="66" fill="#57594f">OHJAA · WHAT AGENTS KNOW</text>
+<text x="64" y="218">TOIMIJA</text><text x="290" y="218">SYKLI</text>
+<text x="64" y="278" fill="#c75b36">VESSA · WHAT AGENTS USED</text>
+</g>
+<path d="M290 226H1136" stroke="#b9b3a5" stroke-width="2"/>
+</svg>

@@ -1,5 +1,11 @@
 //! On-demand metadata only. Values exist only while a native record is scanned.
-use crate::{model::Session, scrub::Redactions};
+//!
+//! A finding is an alarm: one of the credentials this machine holds
+//! ([`crate::held`]) appeared in a transcript. Every other secret-shaped
+//! string is counted by rule (`candidates`), the plain placeholders among
+//! them apart (`placeholders`), and never listed.
+use crate::held::{self, Held};
+use crate::{model::Session, scrub};
 use chrono::{DateTime, FixedOffset};
 use serde::Serialize;
 use serde_json::Value;
@@ -13,8 +19,17 @@ pub struct Report {
     since: Option<String>,
     pub complete: bool,
     pub transcripts: usize,
+    /// Readable finding records which produced a missing-timestamp warning.
+    pub undated_records: usize,
+    /// Each held credential that appeared: the alarms.
     pub findings: Vec<Finding>,
     pub unreadable: Vec<Gap>,
+    /// Where this machine's credentials were looked for, by name.
+    pub compared_with: Vec<held::Source>,
+    /// Secret-shaped strings that are none of them, by rule: counted only.
+    pub candidates: BTreeMap<&'static str, usize>,
+    /// Of `candidates`, those that are plainly placeholders.
+    pub placeholders: usize,
 }
 
 #[derive(Serialize)]
@@ -25,10 +40,19 @@ pub struct Finding {
     source: String,
     line: usize,
     at: Option<String>,
+    /// `at` is the time of the record before, as this one has none.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    at_inferred: bool,
     #[serde(rename = "where")]
     place: &'static str,
     rule: &'static str,
     count: usize,
+    /// Which of this machine's credentials it is, by its source's name.
+    held: String,
+    /// A measured subset of count, in native signature/encrypted-content fields.
+    opaque_count: Option<usize>,
+    /// Positive opaque subsets were attributed at verified native positions.
+    opaque_native: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -45,8 +69,28 @@ impl Report {
             since: since.map(|t| t.to_rfc3339()),
             complete: true,
             transcripts: 0,
+            undated_records: 0,
             findings: Vec::new(),
             unreadable: Vec::new(),
+            compared_with: Vec::new(),
+            candidates: BTreeMap::new(),
+            placeholders: 0,
+        }
+    }
+
+    /// Where `held` looked: a source that exists but could not be read
+    /// leaves the comparison partial, never an all-clear.
+    pub fn compared(&mut self, held: &mut Held) {
+        for source in std::mem::take(&mut held.sources) {
+            if source.status == "unreadable" {
+                let why = source.why.clone().unwrap_or_default();
+                self.gap(
+                    &source.source,
+                    None,
+                    format!("credentials could not be read to compare with: {why}"),
+                );
+            }
+            self.compared_with.push(source);
         }
     }
     pub fn gap(&mut self, path: &str, line: Option<usize>, why: String) {
@@ -65,7 +109,7 @@ impl Report {
 pub fn scrub_metadata(value: &mut Value) {
     match value {
         Value::String(text) => {
-            let mut scrub = Redactions::default();
+            let mut scrub = scrub::Redactions::default();
             let whole = scrub.text(text);
             *text = whole
                 .split_inclusive(['/', '\\'])
@@ -82,6 +126,7 @@ pub fn scan_file(
     path: &Path,
     session: &Session,
     since: Option<DateTime<FixedOffset>>,
+    held: &Held,
     report: &mut Report,
 ) {
     let source = path.display().to_string();
@@ -93,73 +138,253 @@ pub fn scan_file(
         }
     };
     report.transcripts += 1;
+    let mut scan = Scan::new(source, session, since, held);
     for (index, line) in BufReader::new(file).split(b'\n').enumerate() {
         let number = index + 1;
         let bytes = match line {
             Ok(bytes) => bytes,
             Err(error) => {
-                report.gap(&source, Some(number), error.to_string());
+                report.gap(&scan.source, Some(number), error.to_string());
                 break;
             }
         };
         if bytes.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        let record: Value = match serde_json::from_slice(&bytes) {
-            Ok(record) => record,
-            Err(error) => {
-                report.gap(
-                    &source,
-                    Some(number),
-                    format!("malformed JSON/UTF-8: {error}"),
-                );
-                // Retain a detectable occurrence even in a damaged record; its
-                // role and time are unknown, never silently assigned to a window.
-                let text = String::from_utf8_lossy(&bytes);
-                let mut marks = BTreeMap::new();
-                count(&text, "other", &mut marks);
-                append(report, session, &source, number, None, marks);
-                continue;
-            }
-        };
-        let at = record["timestamp"].as_str().map(str::to_owned).or_else(|| {
-            record["timestamp"]
-                .as_i64()
-                .and_then(DateTime::from_timestamp_millis)
-                .map(|t| t.to_rfc3339())
-        });
-        let parsed = at
-            .as_deref()
-            .and_then(|t| DateTime::parse_from_rfc3339(t).ok());
-        if since.zip(parsed).is_some_and(|(from, at)| at <= from) {
-            continue;
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(record) => scan.record(number, &record, report),
+            Err(error) => scan.damaged(
+                number,
+                &String::from_utf8_lossy(&bytes),
+                format!("malformed JSON/UTF-8: {error}"),
+                report,
+            ),
         }
-        let at = parsed.and(at);
-        let mut marks = BTreeMap::new();
-        for (place, value) in pieces(&session.agent, &record) {
-            let mut text = String::new();
-            flatten(value, &mut text);
-            count(&text, place, &mut marks);
-        }
-        if !marks.is_empty() && since.is_some() && at.is_none() {
-            report.gap(
-                &source,
-                Some(number),
-                "finding has no valid time; it is included but cannot be placed after --since"
-                    .into(),
-            );
-        }
-        append(report, session, &source, number, at, marks);
     }
 }
 
-type Marks = BTreeMap<(&'static str, &'static str), usize>;
-fn count(text: &str, place: &'static str, marks: &mut Marks) {
-    let mut found = Redactions::default();
-    let _ = found.text(text);
-    for (&rule, &n) in found.by_rule() {
-        *marks.entry((place, rule)).or_default() += n;
+/// One opencode session's messages, as [`crate::opencode::records`] reads
+/// them from `store`: each scanned as a transcript's record is, its `seq`
+/// for a line. A message whose data is no JSON is scanned as text.
+pub fn scan_records(
+    store: &Path,
+    session: &Session,
+    records: Vec<(usize, Value)>,
+    since: Option<DateTime<FixedOffset>>,
+    held: &Held,
+    report: &mut Report,
+) {
+    report.transcripts += 1;
+    let mut scan = Scan::new(store.display().to_string(), session, since, held);
+    // A store holds many sessions, each counting its messages from 0.
+    scan.about = format!("opencode session {}: ", session.id);
+    for (seq, record) in records {
+        match (record["malformed"].as_str(), record["data"].as_str()) {
+            (Some(why), Some(text)) => {
+                scan.damaged(seq, text, format!("malformed JSON: {why}"), report)
+            }
+            _ => scan.record(seq, &record, report),
+        }
     }
+}
+
+/// One transcript's scan, record by record, in the order it was written.
+struct Scan<'a> {
+    source: String,
+    session: &'a Session,
+    since: Option<DateTime<FixedOffset>>,
+    held: &'a Held,
+    /// The time of the last record that had one: a transcript is appended
+    /// to, so a record without a time was written at or after it.
+    previous: Option<(String, DateTime<FixedOffset>)>,
+    /// What a gap says first, where `source` and the line alone do not
+    /// place it.
+    about: String,
+}
+
+impl<'a> Scan<'a> {
+    fn new(
+        source: String,
+        session: &'a Session,
+        since: Option<DateTime<FixedOffset>>,
+        held: &'a Held,
+    ) -> Self {
+        Scan {
+            source,
+            session,
+            since,
+            held,
+            previous: None,
+            about: String::new(),
+        }
+    }
+
+    /// A record that could not be read: a gap. A detectable occurrence in it
+    /// is still kept; its role and time are unknown, never silently assigned
+    /// to a window.
+    fn damaged(&mut self, number: usize, text: &str, why: String, report: &mut Report) {
+        report.gap(&self.source, Some(number), format!("{}{why}", self.about));
+        let mut marks = BTreeMap::new();
+        count(text, "other", None, self.held, &mut marks, report);
+        append(
+            report,
+            self.session,
+            &self.source,
+            number,
+            (None, false),
+            marks,
+        );
+    }
+
+    fn record(&mut self, number: usize, record: &Value, report: &mut Report) {
+        let session = self.session;
+        let stamp = record.get("timestamp").or_else(|| {
+            (session.agent == "claude" && record["type"] == "file-history-snapshot")
+                .then(|| record["snapshot"].get("timestamp"))
+                .flatten()
+        });
+        let at = stamp
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                stamp
+                    .and_then(Value::as_i64)
+                    .and_then(DateTime::from_timestamp_millis)
+                    .map(|t| t.to_rfc3339())
+            });
+        let parsed = at
+            .as_deref()
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok());
+        let before = self.previous.take();
+        self.previous = at.clone().zip(parsed).or(before.clone());
+        let since = self.since;
+        if since.zip(parsed).is_some_and(|(from, at)| at <= from) {
+            return;
+        }
+        // No time of its own: the record before's, when that places it.
+        // After `since` it places this one there too; before, it cannot.
+        let at = match (parsed.and(at), before) {
+            (Some(at), _) => (Some(at), false),
+            (None, Some((at, t))) if since.is_none_or(|from| t > from) => (Some(at), true),
+            (None, _) => (None, false),
+        };
+        let mut marks = BTreeMap::new();
+        for (place, value, opaque_field) in pieces(&session.agent, record) {
+            count_piece(value, place, opaque_field, self.held, &mut marks, report);
+        }
+        if !marks.is_empty() && since.is_some() && at.0.is_none() {
+            report.gap(
+                &self.source,
+                Some(number),
+                format!(
+                    "{}finding has no valid time; it is included but cannot be placed after --since",
+                    self.about
+                ),
+            );
+            report.undated_records += 1;
+        }
+        append(report, session, &self.source, number, at, marks);
+    }
+}
+
+struct Counts {
+    total: usize,
+    opaque: Option<usize>,
+}
+impl Default for Counts {
+    fn default() -> Self {
+        Self {
+            total: 0,
+            opaque: Some(0),
+        }
+    }
+}
+/// The held credentials found in one record, by where, rule and source.
+type Marks = BTreeMap<(&'static str, &'static str, String), Counts>;
+
+fn count_piece(
+    value: &Value,
+    place: &'static str,
+    field: Option<&'static str>,
+    held: &Held,
+    marks: &mut Marks,
+    report: &mut Report,
+) {
+    if let Some((field, text)) =
+        field.and_then(|field| value[field].as_str().map(|text| (field, text)))
+    {
+        // Keep scanning both portions. Context is not an exemption: even a
+        // provider-shaped key in a metadata field remains a finding.
+        count(text, place, Some(true), held, marks, report);
+        let mut rest = value.clone();
+        rest.as_object_mut()
+            .expect("a field belongs to an object")
+            .remove(field);
+        let mut text = String::new();
+        flatten(&rest, &mut text);
+        count(&text, place, Some(false), held, marks, report);
+    } else {
+        let mut text = String::new();
+        flatten(value, &mut text);
+        count(&text, place, Some(false), held, marks, report);
+    }
+}
+
+/// `text`, as a terminal shows it: each credential this machine holds that
+/// stands in it is marked for a finding, under the rule the detector gives
+/// it there (`no_known_shape` where it gives none, as for a value only a
+/// label makes look secret); every other secret-shaped string is counted
+/// by its rule, and as a placeholder when it plainly is one.
+fn count(
+    text: &str,
+    place: &'static str,
+    opaque: Option<bool>,
+    held: &Held,
+    marks: &mut Marks,
+    report: &mut Report,
+) {
+    let shown = scrub::shown(text);
+    let found = scrub::found(&shown);
+    for (rule, value) in &found {
+        if held.which(value).is_none() {
+            *report.candidates.entry(rule).or_default() += 1;
+            report.placeholders += usize::from(placeholder(value));
+        }
+    }
+    for (value, source) in held.each() {
+        let n = held::occurrences(&shown, value);
+        if n == 0 {
+            continue;
+        }
+        let rule = found
+            .iter()
+            .find(|(_, v)| v == value)
+            .map_or("no_known_shape", |(rule, _)| rule);
+        let counts = marks.entry((place, rule, source.to_owned())).or_default();
+        counts.total += n;
+        match (counts.opaque.as_mut(), opaque) {
+            (Some(count), Some(true)) => *count += n,
+            (_, None) => counts.opaque = None,
+            _ => {}
+        }
+    }
+}
+
+/// A secret-shaped string that is plainly no secret: made of a few
+/// characters repeated (`sk-a1a1a1…`), holding a straight run of the
+/// alphabet or of digits (`ABCDEF…`), or ending as AWS's documentation
+/// examples do (`…EXAMPLE`, `…EXAMPLEKEY`). A real key is random, and is
+/// none of these.
+fn placeholder(value: &str) -> bool {
+    let alnum: Vec<u8> = value.bytes().filter(u8::is_ascii_alphanumeric).collect();
+    let distinct = alnum
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let run = alnum
+        .windows(6)
+        .any(|w| w.windows(2).all(|pair| pair[1] == pair[0] + 1));
+    distinct < 10 || run || value.ends_with("EXAMPLE") || value.ends_with("EXAMPLEKEY")
 }
 
 fn append(
@@ -167,10 +392,10 @@ fn append(
     session: &Session,
     source: &str,
     line: usize,
-    at: Option<String>,
+    (at, at_inferred): (Option<String>, bool),
     marks: Marks,
 ) {
-    for ((place, rule), count) in marks {
+    for ((place, rule, held), counts) in marks {
         report.findings.push(Finding {
             agent: session.agent.clone(),
             session: session.id.clone(),
@@ -178,9 +403,13 @@ fn append(
             source: source.into(),
             line,
             at: at.clone(),
+            at_inferred: at.is_some() && at_inferred,
             place,
             rule,
-            count,
+            count: counts.total,
+            held,
+            opaque_count: counts.opaque,
+            opaque_native: counts.opaque.map(|_| true),
         });
     }
 }
@@ -217,7 +446,14 @@ fn role(role: Option<&str>) -> &'static str {
     }
 }
 
-fn blocks<'a>(content: &'a Value, place: &'static str, out: &mut Vec<(&'static str, &'a Value)>) {
+type Piece<'a> = (&'static str, &'a Value, Option<&'static str>);
+
+fn blocks<'a>(
+    content: &'a Value,
+    place: &'static str,
+    native_thinking: bool,
+    out: &mut Vec<Piece<'a>>,
+) {
     if let Some(items) = content.as_array() {
         for block in items {
             let before = out.len();
@@ -225,45 +461,94 @@ fn blocks<'a>(content: &'a Value, place: &'static str, out: &mut Vec<(&'static s
                 Some("tool_use" | "toolCall") => {
                     for field in ["input", "arguments"] {
                         if !block[field].is_null() {
-                            out.push(("tool_input", &block[field]));
+                            out.push(("tool_input", &block[field], None));
                         }
                     }
                 }
                 Some("tool_result" | "toolResult") => {
                     for field in ["content", "output"] {
                         if !block[field].is_null() {
-                            out.push(("tool_output", &block[field]));
+                            out.push(("tool_output", &block[field], None));
                         }
                     }
                 }
-                _ => out.push((place, block)),
+                Some("thinking") if native_thinking => out.push((place, block, Some("signature"))),
+                _ => out.push((place, block, None)),
             }
             if out.len() == before {
-                out.push(("other", block));
+                out.push(("other", block, None));
             }
         }
     } else {
-        out.push((place, content));
+        out.push((place, content, None));
     }
 }
 
-fn pieces<'a>(agent: &str, record: &'a Value) -> Vec<(&'static str, &'a Value)> {
+/// An opencode message's pieces. A person writes `user` messages; an
+/// assistant message's text and reasoning blocks are the agent's, and a tool
+/// block's `state` holds the call's `input` and, in every other field, what
+/// came back. Everything else, harness messages included, is `other`.
+fn opencode_pieces<'a>(record: &'a Value, out: &mut Vec<Piece<'a>>) {
+    let d = &record["data"];
+    let fields = |value: &'a Value| value.as_object().into_iter().flatten();
+    match record["type"].as_str() {
+        Some("user") => out.push(("person", d, None)),
+        Some("assistant") if d.is_object() => {
+            for (key, value) in fields(d) {
+                if key != "content" {
+                    out.push(("other", value, None));
+                    continue;
+                }
+                for block in value.as_array().into_iter().flatten() {
+                    match block["type"].as_str() {
+                        Some("text" | "reasoning") => out.push(("agent", block, None)),
+                        Some("tool") => {
+                            for (key, value) in fields(block) {
+                                if key != "state" {
+                                    out.push(("other", value, None));
+                                } else if value.is_object() {
+                                    for (key, value) in fields(value) {
+                                        let place = if key == "input" {
+                                            "tool_input"
+                                        } else {
+                                            "tool_output"
+                                        };
+                                        out.push((place, value, None));
+                                    }
+                                } else {
+                                    out.push(("tool_output", value, None));
+                                }
+                            }
+                        }
+                        _ => out.push(("other", block, None)),
+                    }
+                }
+            }
+        }
+        _ => out.push(("other", d, None)),
+    }
+}
+
+fn pieces<'a>(agent: &str, record: &'a Value) -> Vec<Piece<'a>> {
     let mut out = Vec::new();
-    if agent == "codex" && record["type"] == "response_item" {
+    if agent == "opencode" {
+        opencode_pieces(record, &mut out);
+    } else if agent == "codex" && record["type"] == "response_item" {
         let p = &record["payload"];
         match p["type"].as_str() {
-            Some("message") => blocks(&p["content"], role(p["role"].as_str()), &mut out),
+            Some("message") => blocks(&p["content"], role(p["role"].as_str()), false, &mut out),
+            Some("reasoning") => out.push(("other", p, Some("encrypted_content"))),
             Some("function_call" | "custom_tool_call") => {
                 for field in ["arguments", "input"] {
                     if !p[field].is_null() {
-                        out.push(("tool_input", &p[field]));
+                        out.push(("tool_input", &p[field], None));
                     }
                 }
             }
             Some("function_call_output" | "custom_tool_call_output") => {
-                out.push(("tool_output", &p["output"]))
+                out.push(("tool_output", &p["output"], None))
             }
-            _ => out.push(("other", p)),
+            _ => out.push(("other", p, None)),
         }
     } else if record["message"].is_object() {
         let m = &record["message"];
@@ -272,7 +557,9 @@ fn pieces<'a>(agent: &str, record: &'a Value) -> Vec<(&'static str, &'a Value)> 
         } else {
             role(m["role"].as_str())
         };
-        blocks(&m["content"], place, &mut out);
+        let native_thinking =
+            agent == "claude" && record["type"] == "assistant" && place == "agent";
+        blocks(&m["content"], place, native_thinking, &mut out);
     } else if agent == "codex" && record["type"] == "event_msg" {
         let p = &record["payload"];
         let place = match p["type"].as_str() {
@@ -280,13 +567,13 @@ fn pieces<'a>(agent: &str, record: &'a Value) -> Vec<(&'static str, &'a Value)> 
             Some("agent_message" | "agent_reasoning") => "agent",
             _ => "other",
         };
-        out.push((place, p));
+        out.push((place, p, None));
     } else {
-        out.push(("other", record));
+        out.push(("other", record, None));
     }
-    out.retain(|(_, value)| !value.is_null());
+    out.retain(|(_, value, _)| !value.is_null());
     if out.is_empty() {
-        out.push(("other", record));
+        out.push(("other", record, None));
     }
     out
 }

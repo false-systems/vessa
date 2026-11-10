@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" fill="none" role="img" aria-labelledby="t d">
+<title id="t">vessa</title>
+<desc id="d">A ledger of six ruled lines with readings of different lengths. One reading is highlighted and the last one is dashed, meaning it could not be read in full.</desc>
+<rect width="1200" height="360" fill="#f1ebdc"/>
+<g stroke="#171715" stroke-width="2">
+<path d="M40 40H56M48 32V48M1144 320H1160M1152 312V328"/>
+<path d="M64 286H560" stroke="#b9b3a5"/>
+<path d="M700 70H1120M700 110H1120M700 150H1120M700 190H1120M700 230H1120M700 270H1120" stroke="#b9b3a5"/>
+<path d="M700 70H1010" stroke-width="10"/>
+<path d="M700 110H880" stroke-width="10"/>
+<path d="M700 150H1090" stroke-width="10" stroke="#c75b36"/>
+<path d="M700 190H790" stroke-width="10"/>
+<path d="M700 230H940" stroke-width="10" stroke="#66766d"/>
+<path d="M700 270H760" stroke-width="10" stroke-dasharray="6 8"/>
+</g>
+<text x="64" y="188" font-family="Geist, 'Helvetica Neue', Arial, sans-serif" font-size="132" font-weight="600" letter-spacing="-7" fill="#171715">vessa</text>
+<text x="66" y="254" font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="24" fill="#57594f">TOKENS COUNTED, NOT GUESSED.</text>
+
+</svg>

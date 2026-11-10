@@ -8,12 +8,9 @@
 //! by rule, is said. `vessa messages --raw` alone prints the words as
 //! written.
 //!
-//! The rules are ohjaa intake's, which scrubs the prompt it sends to its
-//! drafter (false-systems/ohjaa, `src/intake.rs`, the `// ---- secrets ----`
-//! section, main at 9cad209, 2026-10-28). They are copied, not shared,
-//! since repositories stand alone: known key prefixes, JWTs, PEM private
-//! key blocks, an id and a secret joined by a dot, a long token mixing
-//! capitals, lower case and digits, and a long mixed token right after a
+//! The rules: known key prefixes, JWTs, PEM private key blocks, an id and
+//! a secret joined by a dot, a long token mixing capitals, lower case and
+//! digits, and a long mixed token right after a
 //! word that names a secret. Vessa names each rule, judges a text as a
 //! terminal shows it, and adds two exceptions that are no secret: AWS's
 //! documented example keys, and signed evidence exports that hold none,
@@ -168,9 +165,9 @@ pub fn tail(text: &str, chars: usize) -> Tail {
     }
 }
 
-/// What a usage command prints of transcripts' and a wrapper's words,
+/// What a usage command prints of transcripts' and linked records' words,
 /// scrubbed in place: the report's warnings, each session's limitations,
-/// the wrapper session records linked to it, which hold what a session was
+/// the session records linked to it, which hold what a session was
 /// asked and handed over, and the names its usage records give: the
 /// provider and model a transcript names.
 pub fn report(report: &mut Report) -> Redactions {
@@ -187,6 +184,34 @@ pub fn report(report: &mut Report) -> Redactions {
         }
     }
     found
+}
+
+/// `text` as a terminal shows it: without the control and bidirectional
+/// formatting characters [`crate::render::for_terminal`] drops, line breaks
+/// aside. What the rules judge, and what the secrets scan searches.
+pub fn shown(text: &str) -> std::borrow::Cow<'_, str> {
+    let hidden = |c: char| c != '\n' && !crate::render::shown(c);
+    if text.chars().any(hidden) {
+        text.chars()
+            .filter(|c| !hidden(*c))
+            .collect::<String>()
+            .into()
+    } else {
+        text.into()
+    }
+}
+
+/// Each secret-looking token in `text`, as a terminal shows it, with its
+/// rule: what the secrets scan counts, and how a credential this machine
+/// holds is recognized. The values live only as long as the caller keeps
+/// them, which is never past the record or credential file being read;
+/// nothing prints them.
+pub fn found(text: &str) -> Vec<(&'static str, String)> {
+    let shown = shown(text);
+    spans(&shown)
+        .into_iter()
+        .map(|(start, end, rule)| (rule, shown[start..end].to_owned()))
+        .collect()
 }
 
 /// `text` with each secret-looking token replaced by `[redacted]`, and
@@ -328,7 +353,7 @@ fn tokens(text: &str) -> Vec<(usize, usize, &'static str)> {
 
 /// The bytes a token is made of (all ASCII, so a run of them always starts
 /// and ends on a character boundary).
-fn token_byte(byte: u8) -> bool {
+pub fn token_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'+' | b'/' | b'~')
 }
 
@@ -362,19 +387,22 @@ fn secret(run: &str, after: Option<(&str, &str)>) -> Option<(usize, &'static str
     if dotted_key(run) {
         return Some((run.len(), "id_and_secret"));
     }
-    if mixes_cases_and_digits(run) {
-        return Some((run.len(), "mixed_token"));
+    // Preserve the more specific evidence when both rules match. This changes
+    // attribution, not which bytes are redacted or how many occurrences exist.
+    if let Some((word, between)) = after {
+        let separated = (1..=4).contains(&between.len())
+            && between
+                .bytes()
+                .all(|b| matches!(b, b' ' | b'\t' | b':' | b'=' | b'"' | b'\''));
+        let mixed =
+            run.bytes().any(|b| b.is_ascii_digit()) && run.bytes().any(|b| b.is_ascii_alphabetic());
+        let distinct = run.bytes().collect::<BTreeSet<u8>>().len();
+        let long_and_mixed = run.len() >= 16 && mixed && distinct >= 8 && !path(run);
+        if separated && names_a_secret(word) && long_and_mixed {
+            return Some((run.len(), "named_secret"));
+        }
     }
-    let (word, between) = after?;
-    let separated = (1..=4).contains(&between.len())
-        && between
-            .bytes()
-            .all(|b| matches!(b, b' ' | b'\t' | b':' | b'=' | b'"' | b'\''));
-    let mixed =
-        run.bytes().any(|b| b.is_ascii_digit()) && run.bytes().any(|b| b.is_ascii_alphabetic());
-    let distinct = run.bytes().collect::<BTreeSet<u8>>().len();
-    let long_and_mixed = run.len() >= 16 && mixed && distinct >= 8 && !path(run);
-    (separated && names_a_secret(word) && long_and_mixed).then_some((run.len(), "named_secret"))
+    mixes_cases_and_digits(run).then_some((run.len(), "mixed_token"))
 }
 
 /// The rule of a key that `head` (a run's leading letters, digits, `_` and
@@ -445,15 +473,13 @@ fn dotted_key(run: &str) -> bool {
     })
 }
 
-/// A signed evidence export, as habitat signs its runtime evidence
-/// (`<payload hex>.<signature hex>`, its `sign_evidence`): a 64-byte Ed25519
-/// signature in hex, over JSON in hex that declares itself an export, with
-/// the `version` 1, `evidence`, `exported_at` and `operation_id` vartio's
-/// verifier reads, and holds nothing a rule redacts. It is shaped like an
-/// id and a secret, but it is evidence, and redacting it would destroy it.
-/// Anything else on that wire is judged by the rules, and redacted: habitat
-/// signs its grant proofs on it too, which authorize whoever holds one for
-/// up to 30 s.
+/// A signed evidence export (`<payload hex>.<signature hex>`): a 64-byte
+/// Ed25519 signature in hex, over JSON in hex that declares itself an
+/// export, with `version` 1, `evidence`, `exported_at` and `operation_id`,
+/// and holds nothing a rule redacts. It is shaped like an id and a secret,
+/// but it is evidence, and redacting it would destroy it. Anything else in
+/// that shape is judged by the rules, and redacted: a signed grant proof
+/// has it too, and authorizes whoever holds one.
 fn signed_evidence(run: &str) -> bool {
     let Some((payload, signature)) = run.split_once('.') else {
         return false;
@@ -618,12 +644,11 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// The JSON of an evidence export, as habitat writes one (its
-    /// `export_evidence`, keys in order), with `extra` among the claims of
-    /// its one envelope.
+    /// The JSON of an evidence export, keys in order, with `extra` among
+    /// the claims of its one envelope.
     fn export(extra: &str) -> String {
         format!(
-            r#"{{"anomalies":[],"effects":[],"evidence":[{{"claim_type":"effect_attempted","lease_generation":1,"observation_grade":"executor_observed","operation_id":"op-demo","payload":{{"effect_id":"eff-demo"{extra}}},"source":"habitat","source_identity":"executor-demo","timestamp":1793000000000,"version":1}}],"exported_at":1793000000500,"lease_generation":1,"operation_id":"op-demo","results":[],"status":"active","version":1}}"#
+            r#"{{"anomalies":[],"effects":[],"evidence":[{{"claim_type":"effect_attempted","lease_generation":1,"observation_grade":"executor_observed","operation_id":"op-demo","payload":{{"effect_id":"eff-demo"{extra}}},"source":"executor","source_identity":"executor-demo","timestamp":1793000000000,"version":1}}],"exported_at":1793000000500,"lease_generation":1,"operation_id":"op-demo","results":[],"status":"active","version":1}}"#
         )
     }
 
@@ -632,8 +657,7 @@ mod tests {
         "5e0f".repeat(32)
     }
 
-    /// A signed evidence token in the shape habitat writes one: the export's
-    /// JSON in hex (`7b22` is `{"`), a dot, and its signature in hex.
+    /// A signed evidence token: the export's JSON in hex (`7b22` is `{"`), a dot, and its signature in hex.
     fn evidence() -> String {
         format!("{}.{}", hex(export("").as_bytes()), signature())
     }
@@ -736,6 +760,24 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_secret_label_takes_precedence_over_generic_shape() {
+        let value = fake(&["Ab3dE5gH7jK9mN1pQ3sT", "5vW7yZ9bC1dF3hJ5kL7mN9p"]);
+        assert_eq!(scrub(&value).1.by_rule(), &one("mixed_token"));
+        for label in [
+            "password",
+            "api_key",
+            "access_token",
+            "client_secret",
+            "Bearer",
+        ] {
+            let (hidden, found) = scrub(&format!("{label}: {value}"));
+            assert_eq!(found.by_rule(), &one("named_secret"), "{label}");
+            assert_eq!(found.total(), 1);
+            assert!(!hidden.contains(&value));
+        }
+    }
+
+    #[test]
     fn a_long_mixed_token_after_a_word_that_names_a_secret_is_redacted() {
         let value = &BODY[..24];
         for text in [
@@ -794,7 +836,7 @@ mod tests {
             "the key thing is to keep the token budget small",
             "password: hunter2",
             "the token count was 1234",
-            "key /Users/demo/.ssh/id_ed25519_github_2026",
+            "key /home/dev/.ssh/id_ed25519_github_2026",
             // Prefixes inside ordinary words, or too short to be keys.
             "use sk-learn, or task-1234567890abcdefghij",
             "the AKIA prefix names an AWS key",
@@ -807,12 +849,12 @@ mod tests {
             "image sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
             "a 9f86d081884c7d659a2f.feaa0c55ad01 short id",
             "test_the_cursor_moves_only_past_what_was_handled_and_never_back_2",
-            "/Users/demo/projects/_worktrees/vessa-scrub/src/ScrubTokens2/main.rs",
+            "/home/dev/projects/_worktrees/vessa-scrub/src/ScrubTokens2/main.rs",
             "~/.codex/sessions/2026/10/26/rollout-2026-10-26T10-00-00-8c1f2e3a.jsonl",
             "ProjectManagementDashboardSettingsController is long but has no digit",
             // A path is judged by the pieces of its names: versioned and dated
             // file names are made of short words.
-            "/Users/demo/Downloads/Vessa-1.2.3-macOS-arm64-applesilicon.zip",
+            "/home/dev/Downloads/Vessa-1.2.3-macOS-arm64-applesilicon.zip",
             "~/Desktop/2026-10-26T10-20-33Z_Screen-Recording-8c1f2e3a-Final.mov",
             // What a scrub leaves is no secret either.
             "[redacted] and [redacted].",
@@ -873,9 +915,8 @@ mod tests {
     fn only_an_evidence_export_that_holds_no_secret_is_kept() {
         let github = fake(&["gh", "p_", &BODY[..36]]);
         // A grant proof is an authorization: whoever holds it may use one
-        // right until it expires (habitat-proof's `ProofClaims`, signed on
-        // the same wire).
-        let grant = r#"{"version":2,"habitat_id":"hab-demo","key_id":"5e0f5e0f5e0f5e0f","grant_id":"grant-demo","operation_id":"op-demo","resource_id":"res-demo","right":"execute","issued_at_ms":1793000000000,"expires_at_ms":1793000030000,"nonce":"0a1b2c3d4e5f60718293a4b5c6d7e8f9"}"#;
+        // right until it expires, and is signed in the same shape.
+        let grant = r#"{"version":2,"runtime_id":"rt-demo","key_id":"5e0f5e0f5e0f5e0f","grant_id":"grant-demo","operation_id":"op-demo","resource_id":"res-demo","right":"execute","issued_at_ms":1793000000000,"expires_at_ms":1793000030000,"nonce":"0a1b2c3d4e5f60718293a4b5c6d7e8f9"}"#;
         for (what, token) in [
             (
                 "hex that is no JSON",
@@ -936,7 +977,7 @@ mod tests {
         for text in [
             "key ~/.ssh/id_ed25519_github_2026",
             "private_key: /etc/vessa/Keys2/deploy2.pem",
-            "token: /Users/demo/Library/ScrubTokens2/main2",
+            "token: /home/dev/Library/ScrubTokens2/main2",
         ] {
             assert_eq!(
                 scrub(text),
