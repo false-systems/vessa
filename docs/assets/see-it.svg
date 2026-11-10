@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 408" fill="none" role="img" aria-labelledby="t d">
+<title id="t">vessa usage --by-agent on the sample sessions</title>
+<desc id="d">One command and its output. vessa usage --by-agent --input examples prints, for each of three agents and each model it used, the input, output, cache-read and cache-write tokens the agent recorded.</desc>
+<rect width="1200" height="408" fill="#f1ebdc"/>
+<g stroke="#171715" stroke-width="2"><path d="M40 40H56M48 32V48M1144 368H1160M1152 360V376"/></g>
+<g stroke="#b9b3a5" stroke-width="1"><path d="M64 96H1136M64 132H1136M64 168H1136M64 204H1136M64 240H1136M64 276H1136M64 312H1136M64 348H1136M64 384H1136"/></g>
+<rect x="64" y="170" width="6" height="32" fill="#d4aa4e"/>
+<g font-family="'Geist Mono', ui-monospace, Menlo, Consolas, monospace" font-size="20">
+<text x="84" y="86" fill="#171715" font-weight="600"><tspan fill="#c75b36">$</tspan> vessa usage --by-agent --input examples</text>
+<text x="84" y="122" fill="#57594f">Deduplicated agent totals</text>
+<text x="84" y="158" fill="#57594f">claude</text>
+<text x="108" y="194" fill="#171715">anthropic/demo-model in=1206 out=1675 cache-read=3300 cache-write=180</text>
+<text x="84" y="230" fill="#57594f">codex</text>
+<text x="108" y="266" fill="#57594f">openai/demo-codex in=800 out=200 cache-read=700 cache-write=0</text>
+<text x="84" y="302" fill="#57594f">pi</text>
+<text x="108" y="338" fill="#57594f">test/demo in=700 out=250 cache-read=800 cache-write=0</text>
+<text x="108" y="374" fill="#57594f">zai/demo-glm in=220 out=110 cache-read=400 cache-write=0</text>
+</g>
+</svg>
