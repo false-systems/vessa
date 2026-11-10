@@ -99,9 +99,12 @@ jobs:
         with:
           toolchain: "1.98"
 
-      - name: Is sqlite3 here?
-        continue-on-error: true
-        run: sqlite3 --version
+      # The opencode tests make and read SQLite stores with the sqlite3
+      # command, as vessa reads opencode's store.
+      - name: Install sqlite3
+        run: |
+          choco install sqlite --no-progress -y
+          sqlite3 --version
 
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --no-fail-fast
