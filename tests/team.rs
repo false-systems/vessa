@@ -887,7 +887,7 @@ fn a_subagent_is_shared_once_with_or_without_its_session() {
     .unwrap();
     let second = shared(&world);
     assert_eq!(ids(&second), ["main-1"].map(String::from).into());
-    assert_eq!(second["sessions"][0]["subagents"], 1);
+    assert_eq!(second["sessions"][0]["subagents"], json!(["main-1/helper"]));
     assert_eq!(second["sessions"][0]["entries"][0]["input_tokens"], 170);
 
     // The session's transcript goes, the subagent's stays: the session
@@ -895,6 +895,46 @@ fn a_subagent_is_shared_once_with_or_without_its_session() {
     std::fs::remove_file(folder.join("main-1.jsonl")).unwrap();
     let third = shared(&world);
     assert_eq!(third["sessions"], second["sessions"]);
+
+    // A subagent the session's record does not hold is shared alone, even
+    // though that session was shared.
+    let late = folder
+        .join("main-1")
+        .join("subagents")
+        .join("agent-late.jsonl");
+    std::fs::write(&late, subagent("main-1", "late", &alice, 30)).unwrap();
+    let fourth = shared(&world);
+    assert_eq!(
+        ids(&fourth),
+        ["main-1", "main-1/late"].map(String::from).into()
+    );
+}
+
+#[test]
+fn a_share_stays_partial_while_it_keeps_sessions_of_one_that_was() {
+    let world = World::new("coverage");
+    let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");
+    // A file that is no session vessa can read: a source warning.
+    let folder = world.sessions(
+        "sessions",
+        &[
+            ("a.jsonl", claude("a", &alice, None, 1)),
+            ("unreadable.jsonl", "{\"no\":\"header\"}\n".into()),
+        ],
+    );
+    let out = world.share(&alice, &folder, &["--json"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    assert_eq!(record(&out)["source_warnings"], 1);
+
+    // Read again without it, the share keeps the sessions of the one that
+    // may have missed some, so it is still partial.
+    std::fs::remove_file(folder.join("unreadable.jsonl")).unwrap();
+    let out = world.share(&alice, &folder, &["--json"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    assert_eq!(record(&out)["source_warnings"], 1);
+    let out = world.vessa(&alice, &["team", "--json"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    assert_eq!(record(&out)["people"][0]["source_warnings"], 1);
 }
 
 #[test]

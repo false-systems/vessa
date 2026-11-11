@@ -74,8 +74,8 @@ struct Shared {
     /// The time of its latest usage record, its subagents' included.
     ended_at: Option<String>,
     branch: Option<String>,
-    /// How many subagents its entries include.
-    subagents: usize,
+    /// The native ids of the subagents its entries include.
+    subagents: Vec<String>,
     partial: bool,
     /// vessa's limitations of this session, by kind (see [`kind`]).
     limitations: BTreeMap<String, usize>,
@@ -129,7 +129,11 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
         // A session is known by its id. One that reads as a secret or a
         // path cannot be written as it is, and any stand-in made from it
         // would be its fingerprint: it is left out, and said.
-        if name(&family.main.id, &mut Redactions::default()) != family.main.id {
+        let known_by = std::iter::once(family.main).chain(family.subagents.iter().copied());
+        if known_by
+            .map(|s| &s.id)
+            .any(|id| name(id, &mut Redactions::default()) != *id)
+        {
             withheld += 1;
             continue;
         }
@@ -161,6 +165,17 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
             anyhow!("the share at {commit} is not a {RECORD} record ({why}); nothing was written")
         })?);
     }
+    // A share made with sources vessa could not read may have missed
+    // sessions that are gone since; this one keeps its sessions, so it is
+    // no more complete than that one was.
+    let carried = earlier.iter().map(|r| r.source_warnings).max().unwrap_or(0);
+    if carried > source_warnings {
+        eprintln!(
+            "vessa: an earlier share this one follows was made with {} vessa could not read, so sessions of this repository may be missing from it",
+            many(carried, "warning"),
+        );
+        source_warnings = carried;
+    }
     // A session shared before keeps its record, unless it is read now:
     // agents delete old transcripts, and worktrees are removed.
     earlier.sort_by(|a, b| a.shared_at.cmp(&b.shared_at));
@@ -177,7 +192,12 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
     for (s, of) in current {
         // A subagent whose session's transcript is gone, and whose session
         // was shared with it: its usage is in that record already.
-        if of.is_some_and(|session| sessions.contains_key(&(s.agent.clone(), session))) {
+        let counted = |session: String| {
+            sessions
+                .get(&(s.agent.clone(), session))
+                .is_some_and(|r: &Shared| r.subagents.contains(&s.id))
+        };
+        if of.is_some_and(counted) {
             continue;
         }
         let key = (s.agent.clone(), s.id.clone());
@@ -297,7 +317,11 @@ fn shared(family: &model::Family, found: &mut Redactions) -> Result<Shared> {
             .max()
             .map(show),
         branch: main.branch.as_deref().map(|b| name(b, found)),
-        subagents: family.subagents.len(),
+        subagents: {
+            let mut ids: Vec<String> = family.subagents.iter().map(|s| s.id.clone()).collect();
+            ids.sort();
+            ids
+        },
         partial: !limitations.is_empty(),
         limitations,
         entries,

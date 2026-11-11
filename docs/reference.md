@@ -913,7 +913,7 @@ A share is one `vessa-team-usage.v1` record for the person:
       "started_at": "2026-11-09T09:00:00Z",
       "ended_at": "2026-11-09T09:20:00Z",
       "branch": "main",
-      "subagents": 0,
+      "subagents": [],
       "partial": false,
       "limitations": {},
       "entries": [
@@ -931,7 +931,10 @@ A share is one `vessa-team-usage.v1` record for the person:
 - `source_warnings`: how many warnings leave the share incomplete: each
   source vessa could not read, since sessions of this repository may be
   among them, and one more when sessions of this repository were left out
-  because their id reads as a secret or a path. A share with any is partial.
+  because their id reads as a secret or a path. A share keeps the sessions
+  of the shares before it, so it carries the most any of them had: a
+  session that a source held then may be gone since, and missing. A share
+  with any is partial, and stays so.
 - `sessions`, in agent and id order. Each has:
   - `agent`, and `id`: the agent's own session id;
   - `started_at`, and `ended_at`: the time of its latest usage record, its
@@ -939,7 +942,8 @@ A share is one `vessa-team-usage.v1` record for the person:
   - `branch`: the first git branch its transcript records (Claude Code's
     `gitBranch`, Codex's `git.branch`). Null when it records none, as pi and
     opencode do not;
-  - `subagents`: how many subagents its entries include;
+  - `subagents`: the ids of the subagents its entries include, as `vessa
+    status` names them;
   - `entries`: its tokens by provider and model, as `vessa usage` counts
     them, its subagents' included. A category the agent did not record is
     null;
@@ -1001,9 +1005,10 @@ session of the repository is found, nothing is written.
 
 A subagent is shared once. Read without its session's transcript, it is
 shared as a session of its own, under its own id. Once its session is read,
-it is counted there, and its own record goes. A subagent whose session was
-shared before, and whose session's transcript is gone, is not shared beside
-it: its usage is in that session's record.
+it is counted there, and its own record goes. A subagent whose session's
+transcript is gone is not shared beside that session's record when the
+record names it in `subagents`: its usage is there. One the record does not
+name is shared alone.
 
 ### A push the remote refuses
 
