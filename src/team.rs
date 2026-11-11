@@ -28,9 +28,9 @@ const TEAM: &str = "vessa-team.v1";
 const FILE: &str = "usage.json";
 /// Where each person's share is kept, by key.
 const SHARED: &str = "refs/vessa/usage/";
-/// The limitation of a session whose subagent recorded usage after the
-/// session was shared, while the session's transcript is gone.
-const AFTER_SHARE: &str = "subagent_usage_after_share";
+/// The limitation of a session whose subagent's numbers changed after the
+/// session was shared, read while the session's transcript is gone.
+const AFTER_SHARE: &str = "subagent_changed_after_share";
 
 /// What every fetch is given, so it fetches the refspec it names and
 /// nothing else, whatever this clone's settings say: no tags, no
@@ -77,11 +77,19 @@ struct Shared {
     /// The time of its latest usage record, its subagents' included.
     ended_at: Option<String>,
     branch: Option<String>,
-    /// The native ids of the subagents its entries include.
-    subagents: Vec<String>,
+    /// The subagents its entries include.
+    subagents: Vec<Subagent>,
     partial: bool,
     /// vessa's limitations of this session, by kind (see [`kind`]).
     limitations: BTreeMap<String, usize>,
+    entries: Vec<Entry>,
+}
+
+/// A subagent a session's entries include: its native id, and its own
+/// numbers, as `vessa status` shows them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct Subagent {
+    id: String,
     entries: Vec<Entry>,
 }
 
@@ -184,37 +192,34 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
     // A subagent is counted in the record of the session that names it. A
     // record of it alone, read now while its session's transcript is gone
     // or kept from a share this one follows, gives way to that session's.
-    let named: BTreeMap<(String, String), (String, String)> = sessions
+    // Each subagent a session names, with that session and the subagent's
+    // numbers as the session's record holds them.
+    type Key = (String, String);
+    let named: BTreeMap<Key, (Key, Vec<Entry>)> = sessions
         .values()
         .flat_map(|s| {
-            s.subagents.iter().map(|id| {
+            s.subagents.iter().map(|sub| {
                 (
-                    (s.agent.clone(), id.clone()),
-                    (s.agent.clone(), s.id.clone()),
+                    (s.agent.clone(), sub.id.clone()),
+                    ((s.agent.clone(), s.id.clone()), sub.entries.clone()),
                 )
             })
         })
         .collect();
-    // Usage a subagent read now recorded after its session, not read now,
-    // was shared cannot be added to that session's record without counting
-    // the rest twice: the session is partial. So it is when either time is
-    // unknown.
-    let mut grew = BTreeSet::new();
-    for (subagent, session) in &named {
+    // A subagent read now alone, whose session (not read now) holds other
+    // numbers for it than it has now, changed after that session was
+    // shared. The change cannot be put in that session's record without
+    // counting the rest twice: the session is partial.
+    let mut changed = BTreeSet::new();
+    for (subagent, (session, recorded)) in &named {
         if !now_read.contains(subagent) || now_read.contains(session) {
             continue;
         }
-        let latest = |key: &(String, String)| {
-            sessions
-                .get(key)
-                .and_then(|s: &Shared| s.ended_at.as_deref())
-                .and_then(time)
-        };
-        if !matches!((latest(subagent), latest(session)), (Some(a), Some(b)) if a <= b) {
-            grew.insert(session.clone());
+        if sessions.get(subagent).map(|s: &Shared| &s.entries) != Some(recorded) {
+            changed.insert(session.clone());
         }
     }
-    for key in grew {
+    for key in changed {
         if let Some(s) = sessions.get_mut(&key) {
             s.limitations.insert(AFTER_SHARE.to_owned(), 1);
             s.partial = true;
@@ -321,9 +326,41 @@ fn shared(family: &model::Family, found: &mut Redactions) -> Result<Shared> {
     for said in family.limitations() {
         *limitations.entry(kind(&said).to_owned()).or_insert(0) += 1;
     }
-    // Names withheld alike are one entry.
+    let entries = named_entries(family.totals()?, found)?;
+    // Sessions come in id order, so a session's subagents do too.
+    let subagents = family
+        .subagents
+        .iter()
+        .map(|s| {
+            Ok(Subagent {
+                id: s.id.clone(),
+                entries: named_entries(model::aggregate(s)?, found)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Shared {
+        agent: main.agent.clone(),
+        // Checked by `share`: the id is written as it is.
+        id: main.id.clone(),
+        started_at: main.started_at.as_deref().and_then(time).map(show),
+        ended_at: family
+            .usage()
+            .filter_map(|u| u.at.as_deref().and_then(time))
+            .max()
+            .map(show),
+        branch: main.branch.as_deref().map(|b| name(b, found)),
+        subagents,
+        partial: !limitations.is_empty(),
+        limitations,
+        entries,
+    })
+}
+
+/// `entries` with their names as the record keeps them; names withheld
+/// alike are one entry.
+fn named_entries(entries: Vec<Entry>, found: &mut Redactions) -> Result<Vec<Entry>> {
     let mut by_name: BTreeMap<(String, String), Entry> = BTreeMap::new();
-    for e in family.totals()? {
+    for e in entries {
         let provider = name(&e.provider, found);
         let model = model_name(&e.provider, &e.model, found);
         match by_name.entry((provider.clone(), model.clone())) {
@@ -344,27 +381,7 @@ fn shared(family: &model::Family, found: &mut Redactions) -> Result<Shared> {
             }
         }
     }
-    let entries = by_name.into_values().collect();
-    Ok(Shared {
-        agent: main.agent.clone(),
-        // Checked by `share`: the id is written as it is.
-        id: main.id.clone(),
-        started_at: main.started_at.as_deref().and_then(time).map(show),
-        ended_at: family
-            .usage()
-            .filter_map(|u| u.at.as_deref().and_then(time))
-            .max()
-            .map(show),
-        branch: main.branch.as_deref().map(|b| name(b, found)),
-        subagents: {
-            let mut ids: Vec<String> = family.subagents.iter().map(|s| s.id.clone()).collect();
-            ids.sort();
-            ids
-        },
-        partial: !limitations.is_empty(),
-        limitations,
-        entries,
-    })
+    Ok(by_name.into_values().collect())
 }
 
 /// A provider or branch name a transcript gives, as the record keeps it:

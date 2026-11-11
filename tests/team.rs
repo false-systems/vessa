@@ -950,7 +950,11 @@ fn a_subagent_is_shared_once_with_or_without_its_session() {
     .unwrap();
     let second = shared(&world);
     assert_eq!(ids(&second), ["main-1"].map(String::from).into());
-    assert_eq!(second["sessions"][0]["subagents"], json!(["main-1/helper"]));
+    // The record names the subagent, with its own numbers.
+    let named = &second["sessions"][0]["subagents"];
+    assert_eq!(named.as_array().unwrap().len(), 1);
+    assert_eq!(named[0]["id"], "main-1/helper");
+    assert_eq!(named[0]["entries"][0]["input_tokens"], 70);
     assert_eq!(second["sessions"][0]["entries"][0]["input_tokens"], 170);
 
     // The session's transcript goes, the subagent's stays: the session
@@ -1031,11 +1035,12 @@ fn a_subagent_that_recorded_more_after_its_session_was_shared_makes_it_partial()
     let out = world.share(&alice, &folder, &["--no-push"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
 
-    // The session's transcript goes; its subagent records a request more,
-    // after the share.
+    // The session's transcript goes; its subagent holds a request more than
+    // when the session was shared, dated before the session's last one, so
+    // no time can tell it is new.
     std::fs::remove_file(folder.join("main-1.jsonl")).unwrap();
     let later = json!({"type":"assistant","uuid":"helper-a2","requestId":"req_helper2","sessionId":"main-1",
-        "agentId":"helper","isSidechain":true,"cwd":text(&alice),"timestamp":"2026-09-30T10:00:00Z",
+        "agentId":"helper","isSidechain":true,"cwd":text(&alice),"timestamp":"2026-09-30T09:04:00Z",
         "message":{"id":"msg_01helper2","role":"assistant","model":"demo-model","content":[],
             "usage":{"input_tokens":30,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}});
     std::fs::write(
@@ -1052,7 +1057,7 @@ fn a_subagent_that_recorded_more_after_its_session_was_shared_makes_it_partial()
     let s = &v["sessions"][0];
     assert_eq!(s["entries"][0]["input_tokens"], 170);
     assert_eq!(s["partial"], true);
-    assert_eq!(s["limitations"], json!({"subagent_usage_after_share": 1}));
+    assert_eq!(s["limitations"], json!({"subagent_changed_after_share": 1}));
     // Shared again, the same.
     let again = world.share(&alice, &folder, &["--json", "--no-push"]);
     assert_eq!(record(&again)["sessions"], v["sessions"]);

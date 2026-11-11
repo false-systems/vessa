@@ -943,8 +943,8 @@ A share is one `vessa-team-usage.v1` record for the person:
     `gitBranch`, Codex's `git.branch`), or `[path]` for a name with a
     separator, such as `feat/team` (see below). Null when it records none,
     as pi and opencode do not;
-  - `subagents`: the ids of the subagents its entries include, as `vessa
-    status` names them;
+  - `subagents`: each subagent its entries include, with its `id`, as `vessa
+    status` names it, and its own `entries`;
   - `entries`: its tokens by provider and model, as `vessa usage` counts
     them, its subagents' included. A category the agent did not record is
     null;
@@ -964,7 +964,7 @@ A share is one `vessa-team-usage.v1` record for the person:
 | `copied_launch_records` | and another hold copies of each other's launch records |
 | `codex_cache_writes` | is a Codex session that recorded cache writes |
 | `messages_unreadable` | is an opencode session whose messages could not be read |
-| `subagent_usage_after_share` | has a subagent that recorded usage after the session was shared, read while the session's transcript was gone; that usage is not counted |
+| `subagent_changed_after_share` | has a subagent whose numbers changed after the session was shared, read while the session's transcript was gone; the change is not counted |
 | `other` | has another limitation |
 
 **Never in the record:** what a person or an agent wrote (prompts, replies,
@@ -1018,22 +1018,22 @@ with: agents delete old transcripts, and worktrees are removed. Sharing
 again with nothing changed shares the same sessions, byte for byte. When no
 session of the repository is found, nothing is written.
 
-A subagent is shared once. Read without its session's transcript, it is
-shared as a session of its own, under its own id. Once its session is read,
-it is counted there, and its own record goes. Whenever a session in the
-share names a subagent in `subagents`, a record of that subagent alone
-gives way to it: one read now while the session's transcript is gone, and
-one kept from a share this one follows, of this clone or of another. A
-subagent no session in the share names is shared alone, also when its
-session is read but not shared (recorded outside the repository, or left
-out for its id).
+A subagent is shared once. A subagent read with its session belongs to
+that session: it is shared with it, and when the session is not shared
+(recorded outside the repository, or left out for its id), neither is the
+subagent. Read without its session's transcript, a subagent is placed by
+its own folder, and shared as a session of its own, under its own id.
+Whenever a session in the share names a subagent in `subagents`, a record
+of that subagent alone gives way to it: one read now while the session's
+transcript is gone, and one kept from a share this one follows, of this
+clone or of another. A record of a subagent alone that no session in the
+share names stays.
 
-A subagent read alone may have recorded usage after its session, whose
-transcript is gone, was shared. That usage cannot be added to the
-session's record without counting the rest twice, so it is left out and
-the session is partial, with the limitation `subagent_usage_after_share`.
-So it is when the subagent's latest usage, or the session's `ended_at`, has
-no time.
+A subagent read alone, while its session's transcript is gone, may hold
+other numbers than its session's record holds for it: it went on after
+that session was shared. The difference cannot be put in the session's
+record without counting the rest twice, so it is left out, and the session
+is partial, with the limitation `subagent_changed_after_share`.
 
 ### A push the remote refuses
 
