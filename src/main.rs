@@ -6,6 +6,7 @@ mod opencode;
 mod render;
 mod scrub;
 mod secrets;
+mod team;
 mod work;
 
 use anyhow::{ensure, Context, Result};
@@ -97,6 +98,37 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
+    /// Share your usage in this repository with its team: one record of
+    /// numbers for you (sessions recorded in this clone's worktrees, their
+    /// token counts and times), committed to refs/vessa/usage/ and pushed.
+    /// Never holds what anyone wrote, a path or the machine's name. With
+    /// --json or --dry-run: the vessa-team-usage.v1 record.
+    Share {
+        /// The remote to push to.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Keep the share in this clone; do not push it.
+        #[arg(long)]
+        no_push: bool,
+        /// Print the record that would be written, and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// What the team shared in this repository: each person's latest
+    /// share, with a team total. Reads only what was shared. With --json:
+    /// vessa-team.v1.
+    Team {
+        /// The remote to fetch shares from.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Read only the shares this clone already has; do not fetch.
+        #[arg(long)]
+        no_fetch: bool,
+        /// Group by agent, model, week (ISO, of a session's start, in UTC)
+        /// or branch, instead of by person.
+        #[arg(long, value_enum)]
+        by: Option<team::By>,
+    },
 }
 
 fn run(cli: Cli) -> Result<i32> {
@@ -144,6 +176,40 @@ fn run_once(cli: Cli) -> Result<i32> {
     }
     if let Cmd::Secrets { since } = &cli.command {
         return scan_secrets(&cli, since.as_deref());
+    }
+    if let Cmd::Share {
+        remote,
+        no_push,
+        dry_run,
+    } = &cli.command
+    {
+        ensure!(
+            cli.agent.is_none() && cli.session.is_none(),
+            "share shares every session of this repository; --agent and --session do not apply"
+        );
+        let (paths, not_installed) = inputs(&cli)?;
+        return team::share(
+            &paths,
+            not_installed,
+            team::Share {
+                remote,
+                push: !no_push,
+                dry_run: *dry_run,
+                json: cli.json,
+            },
+        );
+    }
+    if let Cmd::Team {
+        remote,
+        no_fetch,
+        by,
+    } = &cli.command
+    {
+        ensure!(
+            cli.input.is_empty() && cli.agent.is_none() && cli.session.is_none(),
+            "team reads only what was shared, never session files; --input, --agent and --session do not apply"
+        );
+        return team::team(remote, !no_fetch, *by, cli.json);
     }
     if matches!(cli.command, Cmd::Status) {
         ensure!(
@@ -208,7 +274,11 @@ fn run_once(cli: Cli) -> Result<i32> {
         eprintln!("vessa: {}", clean(warning));
     }
     match cli.command {
-        Cmd::ClaudeStatusline | Cmd::Messages { .. } | Cmd::Secrets { .. } => unreachable!(),
+        Cmd::ClaudeStatusline
+        | Cmd::Messages { .. }
+        | Cmd::Secrets { .. }
+        | Cmd::Share { .. }
+        | Cmd::Team { .. } => unreachable!(),
         Cmd::Status => {
             let families = model::families(&report.sessions);
             ensure!(

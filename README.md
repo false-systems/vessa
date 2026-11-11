@@ -15,7 +15,8 @@ format, and none of them gives you one view across all of them. vessa reads
 those files where they are and counts what they recorded, by session,
 provider and model. It keeps measured numbers apart from anything inferred.
 A count that is missing stays unknown; it never becomes zero. Nothing leaves
-your machine, and the files it reads are never changed.
+your machine unless you run `vessa share`, which shares numbers only, and the
+files it reads are never changed.
 
 ## See it
 
@@ -100,6 +101,19 @@ redacted. Add `--json` to most commands for machine-readable output, and
 
 Exit code 0 means the evidence is complete, 4 means it is partial, and 1
 means the command failed.
+
+## With a team
+
+A team sees what its agents used through the project's own git repository,
+with no server: whoever can push to it is the team. In a clone, `vessa share`
+commits one record of your numbers there (sessions, token counts, times) and
+pushes it; `vessa team` fetches everyone's and adds them up. What anyone
+wrote, paths and the machine's name are never shared.
+
+```sh
+vessa share   # your sessions in this repository, as numbers, pushed
+vessa team    # each person's latest share, and the team total
+```
 
 ## How it fits
 

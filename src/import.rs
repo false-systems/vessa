@@ -805,6 +805,9 @@ struct Scan {
     cwd: Option<String>,
     entrypoint: Option<String>,
     agent_id: Option<String>,
+    /// The first branch a record names: Claude Code's `gitBranch`, Codex's
+    /// `session_meta.payload.git.branch`. An empty one names none.
+    branch: Option<String>,
     /// Whether any record is a Claude sidechain, and whether any says.
     sidechain: bool,
     sidechain_said: bool,
@@ -874,6 +877,14 @@ impl Scan {
             if slot.is_none() {
                 *slot = v[key].as_str().map(str::to_owned);
             }
+        }
+        if self.branch.is_none() {
+            let named = if v["type"] == "session_meta" {
+                &v["payload"]["git"]["branch"]
+            } else {
+                &v["gitBranch"]
+            };
+            self.branch = named.as_str().filter(|b| !b.is_empty()).map(str::to_owned);
         }
         self.sidechain |= v["isSidechain"] == true;
         self.sidechain_said |= v["isSidechain"].is_boolean();
@@ -968,6 +979,9 @@ impl Scan {
                 .unwrap_or_default(),
             entrypoint: (agent == "claude").then_some(self.entrypoint).flatten(),
             originator: (agent == "codex").then_some(opening.originator).flatten(),
+            branch: matches!(agent, "claude" | "codex")
+                .then_some(self.branch)
+                .flatten(),
             source: path.display().to_string(),
             usage: Vec::new(),
             limitations,

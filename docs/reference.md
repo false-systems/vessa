@@ -2,8 +2,8 @@
 
 vessa is one Rust binary. It reads the session files coding agents leave on
 disk and reports the token usage they recorded. It has no database, no
-daemon and no JavaScript, and it makes no network calls. It never changes
-the files it reads.
+daemon and no JavaScript. Only `share` and `team` use the network, through
+git (see [With a team](#with-a-team)). It never changes the files it reads.
 
 Contents:
 
@@ -26,6 +26,7 @@ Contents:
 - [Redaction](#redaction)
 - [What counts as a person's message](#what-counts-as-a-persons-message)
 - [Secrets scan](#secrets-scan)
+- [With a team](#with-a-team)
 - [Privacy](#privacy)
 - [Limits](#limits)
 - [Development](#development)
@@ -43,6 +44,8 @@ Contents:
 | `vessa messages` | Lists the messages people typed, each with the agent reply it follows. `--since`, `--raw`. |
 | `vessa secrets` | Scans for credentials this machine holds. Prints location, rule and count, never a value. `--since`. |
 | `vessa claude-statusline` | Renders Claude Code's status-line JSON from stdin. |
+| `vessa share` | Shares your usage in this repository with its team: one record of numbers, committed under `refs/vessa/usage/` and pushed. `--dry-run`, `--no-push`, `--remote`. |
+| `vessa team` | What the team shared: each person's latest share, and a team total. `--by agent\|model\|week\|branch`, `--no-fetch`, `--remote`. |
 
 Every command accepts these options:
 
@@ -861,10 +864,205 @@ A complete scan means the selected sources were read. It does not mean the
 detector can recognize every possible secret. The plain output gives the
 same metadata and coverage status as the JSON.
 
+## With a team
+
+A repository's team is whoever can push to it. `vessa share` keeps each
+person's usage in that repository, under git refs of its own, and
+`vessa team` reads what everyone shared. There is no server. Only numbers
+are shared: nothing anyone wrote, no path and no machine name.
+
+```sh
+vessa share --dry-run   # the record that would be shared, and nothing else
+vessa share             # share your sessions in this repository, and push
+vessa team              # each person's latest share, with a team total
+vessa team --by branch  # the same sessions, by branch
+```
+
+### Which sessions are shared
+
+`vessa share` runs inside a clone, in any of its worktrees. A session
+belongs to the repository when the folder its agent recorded (its `cwd`) is
+inside the top folder of the clone's main worktree or of one of its linked
+worktrees, as `git worktree list` names them. The two are compared as
+paths, part by part, after each is resolved as the file system resolves it
+(symbolic links, and Windows' short names and drive spellings). A folder
+since deleted is placed by the part of it that still exists. A session that
+recorded no folder, or a relative one, belongs to no repository. Time never
+decides.
+
+vessa reads every session, as `vessa usage` does, so each is counted as
+`usage` counts it, and then shares those of this repository. A session's
+subagents are counted with it. `--input` reads other places than the
+agents' own folders, as elsewhere; `--agent` and `--session` do not apply.
+
+### The record
+
+A share is one `vessa-team-usage.v1` record for the person:
+
+```json
+{
+  "schema": "vessa-team-usage.v1",
+  "person": {"name": "Ada Lovelace", "email": "ada@example.org"},
+  "shared_at": "2026-11-11T09:36:15Z",
+  "entries_include_subagents": true,
+  "source_warnings": 0,
+  "sessions": [
+    {
+      "agent": "claude",
+      "id": "ada-1",
+      "started_at": "2026-11-09T09:00:00Z",
+      "ended_at": "2026-11-09T09:20:00Z",
+      "branch": "main",
+      "subagents": 0,
+      "partial": false,
+      "limitations": {},
+      "entries": [
+        {"provider": "anthropic", "model": "demo-model", "input_tokens": 1200,
+         "output_tokens": 420, "cache_read_tokens": 9100, "cache_write_tokens": 640}
+      ]
+    }
+  ]
+}
+```
+
+- `person`: `git config user.name` and `user.email` in the clone.
+- `shared_at`: when it was shared, in UTC.
+- `entries_include_subagents`: always true.
+- `source_warnings`: how many sources vessa could not read when it was
+  shared. Sessions of this repository may be among them, so a share with any
+  is partial.
+- `sessions`, in agent and id order. Each has:
+  - `agent`, and `id`: the agent's own session id;
+  - `started_at`, and `ended_at`: the time of its latest usage record, its
+    subagents' included. RFC 3339 in UTC; null when unknown;
+  - `branch`: the first git branch its transcript records (Claude Code's
+    `gitBranch`, Codex's `git.branch`). Null when it records none, as pi and
+    opencode do not;
+  - `subagents`: how many subagents its entries include;
+  - `entries`: its tokens by provider and model, as `vessa usage` counts
+    them, its subagents' included. A category the agent did not record is
+    null;
+  - `partial`, and `limitations`: vessa's limitations of the session, counted
+    by kind. A partial session's numbers are incomplete; on the machine that
+    shared it, `vessa status --session ID` says why.
+
+| Kind | The session |
+| --- | --- |
+| `malformed_record` | holds a record that is not JSON |
+| `unreadable_record` | holds a record vessa could not read for usage |
+| `subagent_not_read` | launched a subagent whose transcript was not read |
+| `conflicting_usage` | holds two snapshots of one request that disagree |
+| `no_usage_recorded` | recorded no usage |
+| `counted_with_another_session` | holds requests counted with another session |
+| `lineage_loop` | is a subagent whose lineage loops |
+| `copied_launch_records` | and another hold copies of each other's launch records |
+| `codex_cache_writes` | is a Codex session that recorded cache writes |
+| `messages_unreadable` | is an opencode session whose messages could not be read |
+| `other` | has another limitation |
+
+**Never in the record:** what a person or an agent wrote (prompts, replies,
+thinking, tool input and output, commit messages, summaries), any file path,
+absolute or relative, the machine's name, and prices or costs. A
+limitation's own words are not kept, since they quote record ids, other
+sessions' ids and names: only its kind is. Every name a transcript gives (a
+session id, branch, provider or model) is scrubbed by the rules under
+[Redaction](#redaction), and one that reads as a path (from the root, from
+home, from a dot, a Windows drive or share, a file URL, or with a
+backslash) is written `[path]`.
+
+`--dry-run` prints the record that would be written, and changes nothing.
+`--json` prints the record that was written, byte for byte.
+
+### Where it is kept
+
+The record is the one file, `usage.json`, of a commit on
+`refs/vessa/usage/<key>`. `<key>` is the first 16 hex digits of the git
+hash of the lower-cased email, so the ref name does not spell the address:
+
+```sh
+printf %s ada@example.org | git hash-object --stdin | cut -c1-16
+```
+
+Each share is a new commit on the one before, with the person as its author
+and `shared_at` as its time, so the ref's history shows each share. The
+record's bytes are written as they are, with git's plumbing (`hash-object`,
+`mktree`, `commit-tree`, `update-ref`).
+
+A share holds the person's whole set for the repository, each session by
+agent and id. A session read now is shared with its current numbers. A
+session shared before and not found now keeps the record it was shared
+with: agents delete old transcripts, and worktrees are removed. Sharing
+again with nothing changed shares the same sessions, byte for byte. When no
+session of the repository is found, nothing is written.
+
+### A push the remote refuses
+
+`share` then pushes that one ref to `origin`, or to the remote `--remote
+NAME` names. `--no-push` keeps it in the clone. The push is never forced.
+
+When the remote refuses it because the ref moved, someone shared under the
+same key: from another clone, another machine, or another person with the
+same email. vessa fetches that share into
+`refs/vessa/remotes/<remote>/usage/<key>`, pushes nothing, and says whose
+share it is (exit 1). Nothing on the remote is overwritten, and the new
+share stays in the clone. `vessa share` run again follows both shares,
+keeps the sessions of both, and pushes.
+
+### `vessa team`
+
+`vessa team` fetches `refs/vessa/usage/*` from `origin`, or the remote
+`--remote NAME` names, into `refs/vessa/remotes/<remote>/usage/*`, and drops
+those the remote no longer has. It never fetches into `refs/vessa/usage/`,
+so a share kept in the clone is never replaced. `--no-fetch` reads only what
+the clone already has.
+
+Of each person it reads the latest share: the clone's own when it holds the
+remote's, else the remote's. It reads nothing else, never anyone's session
+files: `--input`, `--agent` and `--session` do not apply.
+
+It prints one block per person, with when they last shared, their sessions,
+and their tokens by agent, provider and model, then the team total. `--by
+agent|model|week|branch` groups the sessions by that instead. A week is the
+ISO week of a session's start, in UTC, named as `stats` names it. It says
+how many people have shared. A person who has not shared does not appear,
+and is never counted as zero. A sum with an unknown category is unknown.
+Partial sessions are counted, and listed with their limitations' kinds.
+
+With `--json` it emits `vessa-team.v1`:
+
+- `remote`; `fetched`, false with `--no-fetch` or when the fetch failed;
+  `by`, `person` unless `--by` names another;
+- `people`: each person's `key`, `name`, `email`, `shared_at`, `pushed`
+  (false when the clone's own share is ahead of the remote's),
+  `source_warnings`, and `sessions` as shared;
+- `groups`: by person, with the person's key as `key`, or by what `--by`
+  names. Each has its `key` (null when unknown: no branch recorded, no
+  start, no usage recorded), how many `people`, `sessions` and
+  `partial_sessions` it holds, and `entries` by agent, provider and model,
+  each with how many `sessions` it sums;
+- `total`: the same, for everyone, without a key;
+- `warnings`.
+
+### Network
+
+`share` and `team` are the only commands that use the network: only through
+git, only while they run, and only to push or fetch `refs/vessa/usage/*`.
+git uses the remote's own settings and credentials. Every other command
+works offline.
+
+### Exit codes of `share` and `team`
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Every session shared or shown is complete, and every source was read. |
+| 4 | Partial: a session with limitations, a share made with unreadable sources, or a warning (a fetch that failed, a share that cannot be read, a clone's share that differs from the remote's). |
+| 1 | It failed: not in a clone, no git name or email, a remote name git would take for an option, a push the remote refused, or a git command that failed. |
+
 ## Privacy
 
-- vessa reads local files and writes only where you tell it to: stdout, or
-  the `--output` file of `report`.
+- vessa reads local files and writes only where you tell it to: stdout, the
+  `--output` file of `report`, and, for `share`, its record under this
+  repository's `refs/vessa/usage/`.
 - Only `messages` prints conversation text, and it redacts secret-looking
   tokens unless `--raw` is given.
 - Text from transcripts that a command prints for a terminal (the status
@@ -903,4 +1101,5 @@ generated reports do not belong in this repository.
 
 The exports use these schemas: `vessa-usage.v2`, `vessa-status.v2`,
 `vessa-statistics.v2`, `vessa-session-headers.v1`, `vessa-messages.v1`,
-`vessa-secrets.v1` and `agent-usage.v1`. Consumers must check the schema.
+`vessa-secrets.v1`, `vessa-team-usage.v1`, `vessa-team.v1` and
+`agent-usage.v1`. Consumers must check the schema.

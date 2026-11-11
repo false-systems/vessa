@@ -1,11 +1,12 @@
 repo:
   name: vessa
-  role: Local agent-session token usage accounting, and the one reader of agent conversations; imports native usage records, lists the messages people typed, and renders CLI, JSON exports and standalone HTML reports.
+  role: Local agent-session token usage accounting, and the one reader of agent conversations; imports native usage records, lists the messages people typed, renders CLI, JSON exports and standalone HTML reports, and shares numbers-only usage with a repository's team through its own git refs.
   not:
     - agent harness
     - pricing or billing
     - knowledge authority
     - daemon
+    - server
 context:
   important_docs:
     - README.md
@@ -22,3 +23,11 @@ validation:
     - cargo fmt --check
     - cargo clippy --all-targets -- -D warnings
     - cargo test
+boundaries:
+  - Rust only.
+  - 'No spending features: do not import or calculate prices, currency estimates, credits or billing.'
+  - No runtime dependency on any other repository.
+  - No database or daemon.
+  - 'Every command works offline, except `share` and `team`: they use the network only through git, only while they run, and only to push or fetch `refs/vessa/usage/*`.'
+  - '`share` writes numbers only: never what anyone wrote, a path or the machine''s name.'
+  - '`team` reads only what was shared, never anyone''s session files.'

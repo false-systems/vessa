@@ -201,6 +201,8 @@ pub fn sessions(store: &Path) -> Result<(Vec<Stored>, Vec<String>)> {
                 work: Vec::new(),
                 entrypoint: None,
                 originator: None,
+                // opencode's store records no branch.
+                branch: None,
                 launched: Vec::new(),
                 counted_elsewhere: 0,
                 synthetic: Default::default(),
