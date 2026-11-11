@@ -1266,6 +1266,62 @@ fn a_person_is_partial_by_their_latest_share() {
     let v = record(&out);
     assert_eq!(v["people"][0]["partial"], false);
     assert_eq!(v["people"][0]["source_warnings"], 0);
+
+    // A source goes unreadable while no session changes: the warnings are
+    // new, so they are shared, with no session.
+    std::fs::write(folder.join("unreadable.jsonl"), "{\"no\":\"header\"}\n").unwrap();
+    let out = world.share(&alice, &folder, &["--json", "--no-push"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    let v = record(&out);
+    assert_eq!(v["source_warnings"], 1);
+    assert_eq!(v["sessions"], json!([]));
+    let out = world.vessa(&alice, &["team", "--json", "--no-fetch"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    assert_eq!(record(&out)["people"][0]["partial"], true);
+}
+
+#[test]
+fn a_subagent_newer_than_its_session_s_record_makes_the_person_partial() {
+    let world = World::new("newer");
+    let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");
+    let folder = world.root.join("sessions");
+    let subagents = folder.join("main-1").join("subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    std::fs::write(
+        folder.join("main-1.jsonl"),
+        claude("main-1", &alice, None, 100),
+    )
+    .unwrap();
+    let helper = subagents.join("agent-helper.jsonl");
+    std::fs::write(&helper, subagent("main-1", "helper", &alice, 70)).unwrap();
+    let out = world.share(&alice, &folder, &["--no-push"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    // The session's transcript goes; its subagent records one request more,
+    // and is shared alone.
+    std::fs::remove_file(folder.join("main-1.jsonl")).unwrap();
+    let later = json!({"type":"assistant","uuid":"helper-a2","requestId":"req_helper2","sessionId":"main-1",
+        "agentId":"helper","isSidechain":true,"cwd":text(&alice),"timestamp":"2026-09-30T09:04:00Z",
+        "message":{"id":"msg_01helper2","role":"assistant","model":"demo-model","content":[],
+            "usage":{"input_tokens":30,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}});
+    std::fs::write(
+        &helper,
+        subagent("main-1", "helper", &alice, 70) + &format!("{later}\n"),
+    )
+    .unwrap();
+    let out = world.share(&alice, &folder, &["--json", "--no-push"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        ids(&record(&out)),
+        ["main-1/helper"].map(String::from).into()
+    );
+    // Reading, the session counts its subagent as it was; the newer usage
+    // is not counted, and the person is partial.
+    let out = world.vessa(&alice, &["team", "--json", "--no-fetch"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    let ada = &record(&out)["people"][0];
+    assert_eq!(ids(ada), ["main-1"].map(String::from).into());
+    assert_eq!(ada["subagents_newer_than_their_session"], 1);
+    assert_eq!(ada["partial"], true);
 }
 
 #[test]

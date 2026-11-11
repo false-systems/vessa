@@ -177,10 +177,13 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
     // Each session's latest record in their history; a session whose record
     // is the same is not written again.
     let mut latest = BTreeMap::new();
+    // The warnings of the most recent share, which `team` shows.
+    let mut last_warnings = None;
     for (commit, read) in history(&parents)? {
         let record = read.map_err(|why| {
             anyhow!("the share at {commit} is not a {RECORD} record ({why}); nothing was written")
         })?;
+        last_warnings.get_or_insert(record.source_warnings);
         for s in record.sessions {
             latest.entry((s.agent.clone(), s.id.clone())).or_insert(s);
         }
@@ -233,8 +236,11 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
         4
     };
     // Two copies of the ref that went apart are joined by a commit on both,
-    // whether or not it adds a session.
-    let nothing = record.sessions.is_empty() && parents.len() < 2;
+    // whether or not it adds a session; and warnings other than the most
+    // recent share's are new too, since `team` shows those.
+    let nothing = record.sessions.is_empty()
+        && parents.len() < 2
+        && last_warnings.is_none_or(|last| last == source_warnings);
     if asked.dry_run {
         if nothing {
             eprintln!("vessa: dry run: nothing new to share");
@@ -1124,15 +1130,19 @@ struct Shares {
     /// Records of a subagent alone that a session of theirs names: counted
     /// with that session, not apart.
     folded: usize,
+    /// Of those, records shared after their session's, with other numbers
+    /// than it holds for them: what they add is not counted.
+    newer: usize,
     /// This clone's share of theirs is on the remote, as last fetched.
     pushed: bool,
 }
 
 impl Shares {
-    /// Their most recent share had warnings, or a session's latest record
-    /// is partial.
+    /// Their most recent share had warnings, a session's latest record is
+    /// partial, or a subagent's own record is newer than what its session
+    /// holds of it.
     fn partial(&self) -> bool {
-        self.source_warnings > 0 || self.sessions.iter().any(|s| s.partial)
+        self.source_warnings > 0 || self.newer > 0 || self.sessions.iter().any(|s| s.partial)
     }
 }
 
@@ -1324,7 +1334,9 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
                 );
             }
         }
-        let mut latest: BTreeMap<(String, String), Shared> = BTreeMap::new();
+        // Each session's latest record, with how recent its share is (0 the
+        // most recent).
+        let mut latest: BTreeMap<(String, String), (usize, Shared)> = BTreeMap::new();
         let mut newest: Option<(Person, String, usize)> = None;
         let mut count = 0;
         for commit in commits
@@ -1334,11 +1346,13 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
         {
             match records.remove(commit) {
                 Some(Ok(record)) => {
-                    count += 1;
                     newest.get_or_insert((record.person, record.shared_at, record.source_warnings));
                     for s in record.sessions {
-                        latest.entry((s.agent.clone(), s.id.clone())).or_insert(s);
+                        latest
+                            .entry((s.agent.clone(), s.id.clone()))
+                            .or_insert((count, s));
                     }
+                    count += 1;
                 }
                 Some(Err(why)) => warnings.push(format!(
                     "the share {commit} under {key} cannot be read, so it is left out: {why}"
@@ -1350,17 +1364,31 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
             continue;
         };
         // A subagent is counted with the session that names it: a record of
-        // it alone gives way, and is counted here.
-        let named: BTreeSet<(String, String)> = latest
-            .values()
-            .flat_map(|s| {
-                s.subagents
-                    .iter()
-                    .map(|sub| (s.agent.clone(), sub.id.clone()))
+        // it alone gives way, and is counted here. One shared after that
+        // session's record, with other numbers than that record holds for
+        // it, went on after: what it added is not counted, so the person is
+        // partial.
+        let mut named: BTreeMap<(String, String), (usize, Vec<Entry>)> = BTreeMap::new();
+        for (at, s) in latest.values() {
+            for sub in &s.subagents {
+                named.insert(
+                    (s.agent.clone(), sub.id.clone()),
+                    (*at, sub.entries.clone()),
+                );
+            }
+        }
+        let newer = latest
+            .iter()
+            .filter(|(key, (at, s))| {
+                named
+                    .get(*key)
+                    .is_some_and(|(session_at, held)| at < session_at && &s.entries != held)
             })
-            .collect();
+            .count();
         let before = latest.len();
-        latest.retain(|key, _| !named.contains(key));
+        latest.retain(|key, _| !named.contains_key(key));
+        let latest: BTreeMap<(String, String), Shared> =
+            latest.into_iter().map(|(k, (_, s))| (k, s)).collect();
         let pushed = match (local, theirs) {
             (None, _) => true,
             (Some(_), None) => false,
@@ -1373,6 +1401,7 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
             source_warnings,
             shares: count,
             folded: before - latest.len(),
+            newer,
             sessions: latest.into_values().collect(),
             pushed,
         });
@@ -1446,7 +1475,8 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
                     "key": s.key, "name": s.person.name, "email": s.person.email,
                     "shared_at": s.shared_at, "shares": s.shares, "pushed": s.pushed,
                     "partial": s.partial(), "source_warnings": s.source_warnings,
-                    "subagents_counted_with_their_session": s.folded, "sessions": s.sessions,
+                    "subagents_counted_with_their_session": s.folded,
+                    "subagents_newer_than_their_session": s.newer, "sessions": s.sessions,
                 })
             })
             .collect();
@@ -1531,6 +1561,17 @@ fn print_team(
                     "its session"
                 } else {
                     "their sessions"
+                }
+            );
+        }
+        if s.newer > 0 {
+            said += &format!(
+                " · partial: {} went on after {} shared, not counted",
+                many(s.newer, "subagent"),
+                if s.newer == 1 {
+                    "its session was"
+                } else {
+                    "their sessions were"
                 }
             );
         }

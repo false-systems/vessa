@@ -1050,9 +1050,11 @@ printf %s ada@example.org | git hash-object --stdin | cut -c1-16
 A share adds; it never edits. Each share is a new commit on the one before,
 with the person as its author and `shared_at` as its time, and holds only
 the sessions that are new, or whose record differs from their latest one
-anywhere in the ref's history. Nothing written is ever rewritten. A share
-with nothing new makes no commit, and says so; a share this clone made
-earlier and has not pushed yet is pushed then. The record's bytes are
+anywhere in the ref's history. Nothing written is ever rewritten. Warnings
+other than the most recent share's are new too, since `team` shows those:
+such a share holds them and no session. A share with nothing new makes no
+commit, and says so; a share this clone made earlier and has not pushed yet
+is pushed then. The record's bytes are
 written as they are, with git's plumbing (`hash-object`, `mktree`,
 `commit-tree`, `update-ref`).
 
@@ -1096,10 +1098,14 @@ One rule is applied on reading, within one person: a session's latest
 record that is a subagent alone, which another session's latest record
 names in `subagents`, gives way to that session, which counts it. How many
 did is shown (`subagents_counted_with_their_session`, and in the plain form
-beside the person).
+beside the person). When such a record was shared after the session's, with
+other numbers than the session holds for it, the subagent went on after its
+session was shared (its session's transcript gone by then): what it added is
+not counted, and is counted in `subagents_newer_than_their_session`.
 
-A person is partial when their most recent share had source warnings, or
-when one of their sessions' latest records is partial.
+A person is partial when their most recent share had source warnings, when
+one of their sessions' latest records is partial, or when a subagent went on
+after its session was shared.
 
 It prints one block per person, with when they last shared, their sessions,
 and their tokens by agent, provider and model, then the team total. `--by
@@ -1118,7 +1124,8 @@ With `--json` it emits `vessa-team.v1`:
   recent share), `shares` (how many their history holds), `pushed` (false
   when this clone's copy is ahead of the remote's), `partial`,
   `source_warnings` (of their most recent share),
-  `subagents_counted_with_their_session`, and `sessions`, each the latest
+  `subagents_counted_with_their_session`,
+  `subagents_newer_than_their_session`, and `sessions`, each the latest
   record;
 - `groups`: by person, with the person's key as `key`, or by what `--by`
   names. Each has its `key` (null when unknown: no branch recorded, no
@@ -1142,7 +1149,7 @@ credentials. Every other command works offline.
 | Code | Meaning |
 | --- | --- |
 | 0 | Every session found or shown is complete, and every source was read. |
-| 4 | Partial. `share`: a session of this repository with limitations, or a source warning. `team`: a partial person (their most recent share had warnings, or a session's latest record is partial), or a warning (a fetch that failed, a share that cannot be read). |
+| 4 | Partial. `share`: a session of this repository with limitations, or a source warning. `team`: a partial person (their most recent share had warnings, a session's latest record is partial, or a subagent went on after its session was shared), or a warning (a fetch that failed, a share that cannot be read). |
 | 1 | It failed: not in a clone, no git name or email, a remote name git would take for an option, a push the remote refused, or a git command that failed. |
 
 ## Privacy
