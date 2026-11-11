@@ -251,11 +251,14 @@ pub type BySession = BTreeMap<String, Vec<(usize, Value)>>;
 /// `model` of their data, and the `paths` its tool parts name in their
 /// input (`state.input.path` or `filePath`): what usage and `share` read,
 /// in one query for the whole store. No other words of a message are read.
+/// Each part is read through the message's own data by its path
+/// (`fullkey`), never parsed on its own: a part that is a bare string is
+/// passed over, where parsing it would fail the whole query.
 /// A response whose data is not JSON comes with `malformed`.
 pub fn responses(store: &Path) -> Result<BySession> {
     let rows = query(
         store,
-        "select session_id, id, type, seq, time_created, json_valid(data) as valid, case when json_valid(data) then json_extract(data, '$.tokens') end as tokens, case when json_valid(data) then json_extract(data, '$.model') end as model, case when json_valid(data) and json_type(data, '$.content') = 'array' then (select json_group_array(p) from (select coalesce(json_extract(c.value, '$.state.input.path'), json_extract(c.value, '$.state.input.filePath')) as p from json_each(data, '$.content') as c where json_type(c.value) = 'object' and json_extract(c.value, '$.type') = 'tool') where typeof(p) = 'text') end as paths from session_message where type in ('assistant', 'compaction') order by session_id, seq, id",
+        "select session_id, id, type, seq, time_created, json_valid(data) as valid, case when json_valid(data) then json_extract(data, '$.tokens') end as tokens, case when json_valid(data) then json_extract(data, '$.model') end as model, case when json_valid(data) and json_type(data, '$.content') = 'array' then (select json_group_array(p) from (select coalesce(json_extract(data, c.fullkey || '.state.input.path'), json_extract(data, c.fullkey || '.state.input.filePath')) as p from json_each(data, '$.content') as c where c.type = 'object' and json_extract(data, c.fullkey || '.type') = 'tool') where typeof(p) = 'text') end as paths from session_message where type in ('assistant', 'compaction') order by session_id, seq, id",
     )?;
     let mut by_session = BySession::new();
     for row in rows {

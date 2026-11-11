@@ -1054,7 +1054,8 @@ fn a_session_is_found_by_the_files_it_touched_never_by_its_commands() {
             support::at(1),
             json!({"model":{"providerID":"demo","id":"demo-oc"},
                 "tokens":{"input":9,"output":1,"reasoning":0,"cache":{"read":0,"write":0}},
-                "content":[{"type":"tool","tool":"edit","state":{"status":"completed",
+                // Content elements that are no object are passed over.
+                "content":["a bare string", 3, null, {"type":"tool","tool":"edit","state":{"status":"completed",
                     "input":{"path":"alice/src/lib.rs","oldString":"a","newString":"b"}}}]})
             .to_string(),
         )],
@@ -1080,6 +1081,10 @@ fn a_session_is_found_by_the_files_it_touched_never_by_its_commands() {
         said.contains("7 sessions of this repository: 0 by the folder they recorded, 7 by the files they touched"),
         "{said}"
     );
+    // The store reads whole for every other command too.
+    let store = folder.join("opencode.db");
+    let out = world.vessa(&alice, &["usage", "--input", text(&store)]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
 }
 
 #[test]
