@@ -928,9 +928,10 @@ A share is one `vessa-team-usage.v1` record for the person:
 - `person`: `git config user.name` and `user.email` in the clone.
 - `shared_at`: when it was shared, in UTC.
 - `entries_include_subagents`: always true.
-- `source_warnings`: how many sources vessa could not read when it was
-  shared. Sessions of this repository may be among them, so a share with any
-  is partial.
+- `source_warnings`: how many warnings leave the share incomplete: each
+  source vessa could not read, since sessions of this repository may be
+  among them, and one more when sessions of this repository were left out
+  because their id reads as a secret or a path. A share with any is partial.
 - `sessions`, in agent and id order. Each has:
   - `agent`, and `id`: the agent's own session id;
   - `started_at`, and `ended_at`: the time of its latest usage record, its
@@ -964,11 +965,14 @@ A share is one `vessa-team-usage.v1` record for the person:
 thinking, tool input and output, commit messages, summaries), any file path,
 absolute or relative, the machine's name, and prices or costs. A
 limitation's own words are not kept, since they quote record ids, other
-sessions' ids and names: only its kind is. Every name a transcript gives (a
-session id, branch, provider or model) is scrubbed by the rules under
-[Redaction](#redaction), and one that reads as a path (from the root, from
-home, from a dot, a Windows drive or share, a file URL, or with a
-backslash) is written `[path]`.
+sessions' ids and names: only its kind is. A branch, provider or model name
+is scrubbed by the rules under [Redaction](#redaction), and one that reads
+as a path (from the root, from home, from a dot, a Windows drive or share, a
+file URL, or with a backslash) is written `[path]`. A session is known by
+its id, so a session whose id the scrub would change, or that reads as a
+path, is not shared at all: any stand-in made from it would be its
+fingerprint. `share` says how many were left out, and counts it in
+`source_warnings`.
 
 `--dry-run` prints the record that would be written, and changes nothing.
 `--json` prints the record that was written, byte for byte.
@@ -1047,8 +1051,9 @@ With `--json` it emits `vessa-team.v1`:
 
 `share` and `team` are the only commands that use the network: only through
 git, only while they run, and only to push or fetch `refs/vessa/usage/*`.
-git uses the remote's own settings and credentials. Every other command
-works offline.
+Each push and fetch names its refspec, and takes no tags and no submodules,
+whatever the clone's settings say. git uses the remote's own address and
+credentials. Every other command works offline.
 
 ### Exit codes of `share` and `team`
 

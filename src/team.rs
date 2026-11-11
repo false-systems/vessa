@@ -29,6 +29,16 @@ const FILE: &str = "usage.json";
 /// Where each person's share is kept, by key.
 const SHARED: &str = "refs/vessa/usage/";
 
+/// What every fetch is given, so it fetches the refspec it names and
+/// nothing else, whatever this clone's settings say: no tags, no
+/// submodules, and no FETCH_HEAD written.
+const ONLY_THE_REFSPEC: [&str; 4] = [
+    "--quiet",
+    "--no-tags",
+    "--no-recurse-submodules",
+    "--no-write-fetch-head",
+];
+
 /// Where `remote`'s shares are fetched to: apart from [`SHARED`], so a
 /// forced fetch never replaces this clone's own share.
 fn fetched(remote: &str) -> String {
@@ -99,12 +109,31 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
     for warning in &report.warnings {
         eprintln!("vessa: {}", clean(warning));
     }
-    let source_warnings = report.warnings.len();
-    let current = model::families(&report.sessions)
-        .iter()
-        .filter(|family| inside(&family.main.cwd, &roots))
-        .map(|family| shared(family, &mut found))
-        .collect::<Result<Vec<_>>>()?;
+    let mut source_warnings = report.warnings.len();
+    let mut current = Vec::new();
+    let mut withheld = 0;
+    for family in model::families(&report.sessions) {
+        if !inside(&family.main.cwd, &roots) {
+            continue;
+        }
+        // A session is known by its id. One that reads as a secret or a
+        // path cannot be written as it is, and any stand-in made from it
+        // would be its fingerprint: it is left out, and said.
+        if name(&family.main.id, &mut Redactions::default()) != family.main.id {
+            withheld += 1;
+            continue;
+        }
+        current.push(shared(&family, &mut found)?);
+    }
+    if withheld > 0 {
+        eprintln!(
+            "vessa: {} of this repository {} an id that reads as a secret or a path, so {} not shared",
+            many(withheld, "session"),
+            if withheld == 1 { "has" } else { "have" },
+            if withheld == 1 { "it is" } else { "they are" },
+        );
+        source_warnings += 1;
+    }
 
     // The share this one follows: this clone's, and the remote's last
     // fetched, unless one already holds the other.
@@ -129,10 +158,14 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
         }
     }
     let read_now = current.len();
+    let now_read: BTreeSet<_> = current
+        .iter()
+        .map(|s| (s.agent.clone(), s.id.clone()))
+        .collect();
+    let kept = sessions.keys().filter(|k| !now_read.contains(*k)).count();
     for s in current {
         sessions.insert((s.agent.clone(), s.id.clone()), s);
     }
-    let kept = sessions.len() - read_now;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
@@ -235,7 +268,8 @@ fn shared(family: &model::Family, found: &mut Redactions) -> Result<Shared> {
     }
     Ok(Shared {
         agent: main.agent.clone(),
-        id: name(&main.id, found),
+        // Checked by `share`: the id is written as it is.
+        id: main.id.clone(),
         started_at: main.started_at.as_deref().and_then(time).map(show),
         ended_at: family
             .usage()
@@ -651,7 +685,16 @@ fn commit(record: &Record, bytes: &[u8], parents: &[String], now: u64) -> Result
 /// that this clone has not seen, it is fetched and nothing is pushed.
 fn push(remote: &str, mine: &str, tracked: &str, commit: &str) -> Result<()> {
     let spec = format!("{mine}:{mine}");
-    let args = ["push", "--porcelain", remote, &spec];
+    // That ref alone, whatever this clone's settings say of tags and
+    // submodules.
+    let args = [
+        "push",
+        "--porcelain",
+        "--no-follow-tags",
+        "--recurse-submodules=no",
+        remote,
+        &spec,
+    ];
     let out = output(&args, None, &[])?;
     if out.status.success() {
         run(&["update-ref", tracked, commit])?;
@@ -669,8 +712,10 @@ fn push(remote: &str, mine: &str, tracked: &str, commit: &str) -> Result<()> {
     }
     let fetch = [
         "fetch",
-        "--quiet",
-        "--no-write-fetch-head",
+        ONLY_THE_REFSPEC[0],
+        ONLY_THE_REFSPEC[1],
+        ONLY_THE_REFSPEC[2],
+        ONLY_THE_REFSPEC[3],
         remote,
         &format!("+{mine}:{tracked}"),
     ];
@@ -857,9 +902,11 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
         let refspec = format!("+{SHARED}*:{tracked}*");
         let args = [
             "fetch",
-            "--quiet",
+            ONLY_THE_REFSPEC[0],
+            ONLY_THE_REFSPEC[1],
+            ONLY_THE_REFSPEC[2],
+            ONLY_THE_REFSPEC[3],
             "--prune",
-            "--no-write-fetch-head",
             remote,
             &refspec,
         ];

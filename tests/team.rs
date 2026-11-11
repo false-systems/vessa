@@ -847,6 +847,58 @@ fn a_partial_session_is_shared_as_partial() {
 }
 
 #[test]
+fn a_session_whose_id_cannot_be_shared_is_left_out_and_said() {
+    let world = World::new("ids");
+    let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");
+    let secret = ["gh", "p_", "Zq8Lm3Np5Rt7Vx9Bz1Cd3Fg5Hj7Kl9Mn1Pq"].concat();
+    // Two ids that read as paths, and one that holds a secret: each would
+    // be written alike, so none can be told apart from another.
+    let folder = world.sessions(
+        "sessions",
+        &[
+            ("a.jsonl", claude("/tmp/one", &alice, None, 100)),
+            ("b.jsonl", claude("/tmp/two", &alice, None, 200)),
+            (
+                "c.jsonl",
+                claude(&format!("id-{secret}"), &alice, None, 300),
+            ),
+            ("d.jsonl", claude("plain", &alice, None, 400)),
+        ],
+    );
+    let out = world.share(&alice, &folder, &["--json", "--no-push"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    let v = record(&out);
+    assert_eq!(ids(&v), ["plain"].map(String::from).into());
+    assert_eq!(v["source_warnings"], 1);
+    let said = stderr(&out);
+    assert!(said.contains("3 sessions of this repository"), "{said}");
+    assert!(!said.contains(&secret), "{said}");
+    // Shared again, the same.
+    let again = world.share(&alice, &folder, &["--json", "--no-push"]);
+    assert_eq!(record(&again)["sessions"], v["sessions"]);
+}
+
+#[test]
+fn team_fetches_no_tags() {
+    let world = World::new("tags");
+    let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");
+    // A tag made after the clone, and a remote set to fetch every tag.
+    let seed = world.root.join("seed");
+    world.git(&seed, &["tag", "v9"]);
+    world.git(&seed, &["push", "-q", text(&world.origin()), "v9"]);
+    world.git(&alice, &["config", "remote.origin.tagOpt", "--tags"]);
+    // A tag of this clone's only, and a setting that prunes tags.
+    world.git(&alice, &["tag", "mine"]);
+    world.git(&alice, &["config", "fetch.pruneTags", "true"]);
+    let folder = world.sessions("sessions", &[("a.jsonl", claude("a", &alice, None, 1))]);
+    assert_eq!(world.share(&alice, &folder, &[]).status.code(), Some(0));
+    let out = world.vessa(&alice, &["team", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(record(&out)["fetched"], true);
+    assert_eq!(world.git(&alice, &["tag", "--list"]), "mine");
+}
+
+#[test]
 fn share_needs_a_repository_and_a_person() {
     let world = World::new("needs");
     let outside = world.root.join("not-a-clone");
