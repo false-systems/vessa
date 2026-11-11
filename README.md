@@ -146,3 +146,5 @@ alone.
 - [Reference](docs/reference.md): every command, the JSON formats, and how each agent's records are counted.
 - [Agent guide](AGENTS.md): for agents that work on vessa itself.
 - [Licence](LICENSE): MIT.
+
+<p align="center"><sub>Part of <a href="https://false-systems.com">False Systems</a> · computing as craft</sub></p>
