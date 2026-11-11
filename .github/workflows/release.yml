@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - "v*"
+  # By hand on a branch: everything but the release itself, as a dry run.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -21,6 +23,7 @@ jobs:
           # Keep aligned with rust-toolchain.toml.
           toolchain: "1.98"
       - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           package=$(cargo pkgid -p vessa)
           version=${package##*#}
@@ -79,7 +82,10 @@ jobs:
       - name: Verify and package
         run: |
           set -euo pipefail
-          name="vessa-${GITHUB_REF_NAME}-${{ matrix.platform }}-${{ matrix.arch }}"
+          # A run by hand from a branch whose name holds a slash still makes a
+          # valid file name.
+          ref=${GITHUB_REF_NAME//\//-}
+          name="vessa-${ref}-${{ matrix.platform }}-${{ matrix.arch }}"
           mkdir package
           cp LICENSE README.md package/
           if [ "${{ matrix.platform }}" = windows ]; then
@@ -92,9 +98,12 @@ jobs:
             (cd package && 7z a -tzip "$GITHUB_WORKSPACE/$name.zip" vessa.exe LICENSE README.md >/dev/null)
           else
             binary="target/${{ matrix.target }}/release/vessa"
-            file "$binary" | grep -q "${{ matrix.file_match }}"
+            info=$(file "$binary")
+            echo "$info"
+            grep -q "${{ matrix.file_match }}" <<<"$info"
             if [ "${{ matrix.platform }}" = linux ]; then
-              file "$binary" | grep -q "statically linked"
+              # x86_64 musl builds are static-pie; file(1) words that apart.
+              grep -q -E "statically linked|static-pie linked" <<<"$info"
             fi
             "$binary" --help >/dev/null
             cp "$binary" package/
@@ -120,6 +129,7 @@ jobs:
           merge-multiple: true
       - run: sha256sum vessa-*.tar.gz vessa-*.zip > SHA256SUMS
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           generate_release_notes: true
           files: |
