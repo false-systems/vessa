@@ -203,7 +203,14 @@ pub fn sessions(store: &Path) -> Result<(Vec<Stored>, Vec<String>)> {
                 originator: None,
                 // opencode's store records no branch.
                 branch: None,
-                touched: Default::default(),
+                // Its folder is a place it worked, as every folder a
+                // session records is.
+                touched: row["directory"]
+                    .as_str()
+                    .filter(|d| !d.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .into_iter()
+                    .collect(),
                 launched: Vec::new(),
                 counted_elsewhere: 0,
                 synthetic: Default::default(),

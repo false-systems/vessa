@@ -1444,3 +1444,51 @@ fn share_needs_a_repository_and_a_person() {
     let out = world.share(&alice, &folder, &["--agent", "claude"]);
     assert_eq!(out.status.code(), Some(1));
 }
+
+#[test]
+fn an_opencode_subagent_working_in_the_clone_brings_its_session() {
+    let world = World::new("oc-subagent");
+    let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");
+    let folder = world.root.join("sessions");
+    std::fs::create_dir_all(&folder).unwrap();
+    // The session started outside the clone; its subagent's folder is the
+    // clone, and it made no structured file call.
+    support::store(
+        &folder.join("opencode.db"),
+        support::LAYOUT,
+        &[
+            ("ses_parent", None, text(&world.root), support::at(0)),
+            (
+                "ses_child",
+                Some("ses_parent"),
+                text(&alice),
+                support::at(1),
+            ),
+        ],
+        &[
+            (
+                "msg_0",
+                "ses_parent",
+                "assistant",
+                1,
+                support::at(1),
+                json!({"model":{"providerID":"demo","id":"demo-oc"},
+                    "tokens":{"input":2,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}})
+                .to_string(),
+            ),
+            (
+                "msg_1",
+                "ses_child",
+                "assistant",
+                1,
+                support::at(2),
+                json!({"model":{"providerID":"demo","id":"demo-oc"},
+                    "tokens":{"input":4,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}})
+                .to_string(),
+            ),
+        ],
+    );
+    let out = world.share(&alice, &folder, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(ids(&record(&out)), ["ses_parent".to_owned()].into());
+}
