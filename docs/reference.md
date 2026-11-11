@@ -883,9 +883,10 @@ vessa team --by branch  # the same sessions, by branch
 `vessa share` runs inside a clone, in any of its worktrees. A session, with
 its subagents, belongs to the repository when either is true:
 
-- **Its folder.** The folder its agent recorded (its `cwd`) is inside the
-  top folder of the clone's main worktree or of one of its linked
-  worktrees, as `git worktree list` names them.
+- **Its folders.** A folder it or one of its subagents recorded (its `cwd`,
+  at the start or in any later record or turn) is inside the top folder of
+  the clone's main worktree or of one of its linked worktrees, as
+  `git worktree list` names them.
 - **The files it touched.** One of its structured tool calls, or one of its
   subagents', names a file or folder inside one of those worktrees:
   - Claude Code: `file_path` of `Read`, `Write`, `Edit` and `MultiEdit`,

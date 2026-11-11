@@ -1095,6 +1095,8 @@ fn touched(
         if matches!(v["type"].as_str(), Some("session_meta" | "turn_context")) {
             if let Some(dir) = p["cwd"].as_str().filter(|d| !d.is_empty()) {
                 dir.clone_into(cwd);
+                // Every folder a session records is a place it worked.
+                out.insert(PathBuf::from(dir));
             }
         }
         if v["type"] != "response_item" {
@@ -1129,6 +1131,8 @@ fn touched(
     }
     if let Some(dir) = v["cwd"].as_str().filter(|d| !d.is_empty()) {
         dir.clone_into(cwd);
+        // Every folder a session records is a place it worked.
+        out.insert(PathBuf::from(dir));
     }
     let m = &v["message"];
     if m["role"] != "assistant" {
@@ -2693,6 +2697,22 @@ mod tests {
     }
 
     #[test]
+    fn every_folder_a_session_records_counts_not_only_its_first() {
+        // A session started in a parent folder that later works with the
+        // repository as its folder, with no structured file in between.
+        let claude = [
+            json!({"type":"user","cwd":"/w","message":{"role":"user","content":"start"}}),
+            json!({"type":"assistant","cwd":"/w/repo","message":{"role":"assistant","content":[]}}),
+        ];
+        assert_eq!(read("claude", &claude, ""), paths(&["/w", "/w/repo"]));
+        let codex = [
+            json!({"type":"session_meta","payload":{"cwd":"/w"}}),
+            json!({"type":"turn_context","payload":{"cwd":"/w/repo"}}),
+        ];
+        assert_eq!(read("codex", &codex, ""), paths(&["/w", "/w/repo"]));
+    }
+
+    #[test]
     fn claude_tool_calls_name_files_in_their_structured_fields_only() {
         let call = |name: &str, input: Value| {
             json!({"type":"assistant","cwd":"/w/repo","message":{"role":"assistant",
@@ -2711,6 +2731,7 @@ mod tests {
         assert_eq!(
             read("claude", &records, ""),
             paths(&[
+                "/w/repo",
                 "/w/repo/a.rs",
                 "/w/repo/b.rs",
                 "/w/repo/n.ipynb",
@@ -2735,7 +2756,7 @@ mod tests {
         ];
         assert_eq!(
             read("codex", &records, ""),
-            paths(&["/w/repo/sub", "/w/repo/src/lib.rs"])
+            paths(&["/w", "/w/repo", "/w/repo/sub", "/w/repo/src/lib.rs"])
         );
     }
 
@@ -2747,7 +2768,7 @@ mod tests {
                 {"type":"toolCall","name":"edit","arguments":{"path":"repo/a.rs"}},
                 {"type":"toolCall","name":"bash","arguments":{"command":"cat /w/other/x"}}]}}),
         ];
-        assert_eq!(read("pi", &records, ""), paths(&["/w/repo/a.rs"]));
+        assert_eq!(read("pi", &records, ""), paths(&["/w", "/w/repo/a.rs"]));
         // A relative path with no folder to resolve it against is left out.
         let records = [
             json!({"type":"message","message":{"role":"assistant","content":[
