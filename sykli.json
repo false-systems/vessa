@@ -35,11 +35,13 @@
         "src/render.rs",
         "src/scrub.rs",
         "src/secrets.rs",
+        "src/team.rs",
         "src/work.rs",
         "tests/cli.rs",
         "tests/instructions.rs",
         "tests/secrets.rs",
-        "tests/support/mod.rs"
+        "tests/support/mod.rs",
+        "tests/team.rs"
       ],
       "env": {
         "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
@@ -83,11 +85,13 @@
         "src/render.rs",
         "src/scrub.rs",
         "src/secrets.rs",
+        "src/team.rs",
         "src/work.rs",
         "tests/cli.rs",
         "tests/instructions.rs",
         "tests/secrets.rs",
-        "tests/support/mod.rs"
+        "tests/support/mod.rs",
+        "tests/team.rs"
       ],
       "env": {
         "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",
@@ -132,11 +136,13 @@
         "src/render.rs",
         "src/scrub.rs",
         "src/secrets.rs",
+        "src/team.rs",
         "src/work.rs",
         "tests/cli.rs",
         "tests/instructions.rs",
         "tests/secrets.rs",
-        "tests/support/mod.rs"
+        "tests/support/mod.rs",
+        "tests/team.rs"
       ],
       "env": {
         "CARGO_TARGET_DIR": "${worktree_cache}/cargo-target",

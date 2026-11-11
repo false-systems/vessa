@@ -67,6 +67,12 @@ fn sessions(
                         } else if let Err(error) = opencode(&v, line, &mut s) {
                             s.limitations.push(format!("message {line}: {error:#}"));
                         }
+                        // The files its tool parts name, against its folder.
+                        for path in v["data"]["paths"].as_array().into_iter().flatten() {
+                            if let Some(path) = path.as_str() {
+                                touch(&mut s.touched, path, &s.cwd);
+                            }
+                        }
                     }
                 }
                 Err(why) => s
@@ -99,6 +105,7 @@ fn sessions(
             old.limitations.extend(session.limitations);
             old.launched.extend(session.launched);
             old.synthetic.extend(session.synthetic);
+            old.touched.extend(session.touched);
         } else {
             merged.insert(key, session);
         }
@@ -805,6 +812,9 @@ struct Scan {
     cwd: Option<String>,
     entrypoint: Option<String>,
     agent_id: Option<String>,
+    /// The first branch a record names: Claude Code's `gitBranch`, Codex's
+    /// `session_meta.payload.git.branch`. An empty one names none.
+    branch: Option<String>,
     /// Whether any record is a Claude sidechain, and whether any says.
     sidechain: bool,
     sidechain_said: bool,
@@ -874,6 +884,14 @@ impl Scan {
             if slot.is_none() {
                 *slot = v[key].as_str().map(str::to_owned);
             }
+        }
+        if self.branch.is_none() {
+            let named = if v["type"] == "session_meta" {
+                &v["payload"]["git"]["branch"]
+            } else {
+                &v["gitBranch"]
+            };
+            self.branch = named.as_str().filter(|b| !b.is_empty()).map(str::to_owned);
         }
         self.sidechain |= v["isSidechain"] == true;
         self.sidechain_said |= v["isSidechain"].is_boolean();
@@ -968,6 +986,10 @@ impl Scan {
                 .unwrap_or_default(),
             entrypoint: (agent == "claude").then_some(self.entrypoint).flatten(),
             originator: (agent == "codex").then_some(opening.originator).flatten(),
+            branch: matches!(agent, "claude" | "codex")
+                .then_some(self.branch)
+                .flatten(),
+            touched: Default::default(),
             source: path.display().to_string(),
             usage: Vec::new(),
             limitations,
@@ -1018,8 +1040,11 @@ fn parse_file(path: &Path) -> Result<Parsed> {
     .to_owned();
     let mut previous: Option<[u64; 4]> = None;
     let mut pi_model_changed = false;
+    // The folder the session recorded at this point.
+    let mut cwd = session.cwd.clone();
     for (line, value) in records {
         crate::work::observe(&value, line, &mut session);
+        touched(&value, &agent, &mut cwd, &mut session.touched);
         let result = match agent.as_str() {
             "claude" => claude(&value, line, &mut session),
             "codex" => codex(
@@ -1044,6 +1069,123 @@ fn parse_file(path: &Path) -> Result<Parsed> {
         }
     }
     Ok(Parsed::Session(Box::new(session)))
+}
+
+/// The files and folders one record's structured tool calls name, into
+/// `out`; `cwd` follows the folder the session records. Only fields that
+/// hold a path are read, never free text: a shell command, a prompt or a
+/// reply is not searched for paths.
+///
+/// * Claude Code: `Read`, `Write`, `Edit` and `MultiEdit`'s `file_path`,
+///   `NotebookEdit`'s `notebook_path`, `Glob` and `Grep`'s `path`; each
+///   record's `cwd`.
+/// * Codex: a shell call's `workdir` (`exec_command`, `shell`), and the
+///   files an `apply_patch` names on its `*** Add File:`, `*** Update
+///   File:`, `*** Delete File:` and `*** Move to:` lines; the `cwd` of
+///   `session_meta` and of each `turn_context`.
+/// * pi: a tool call's `path` argument; the session header's `cwd`.
+fn touched(
+    v: &Value,
+    agent: &str,
+    cwd: &mut String,
+    out: &mut std::collections::BTreeSet<PathBuf>,
+) {
+    if agent == "codex" {
+        let p = &v["payload"];
+        if matches!(v["type"].as_str(), Some("session_meta" | "turn_context")) {
+            if let Some(dir) = p["cwd"].as_str().filter(|d| !d.is_empty()) {
+                dir.clone_into(cwd);
+                // Every folder a session records is a place it worked.
+                out.insert(PathBuf::from(dir));
+            }
+        }
+        if v["type"] != "response_item" {
+            return;
+        }
+        let name = p["name"].as_str().unwrap_or_default();
+        let arguments = || -> Value {
+            p["arguments"]
+                .as_str()
+                .and_then(|a| serde_json::from_str(a).ok())
+                .unwrap_or(Value::Null)
+        };
+        match (p["type"].as_str(), name) {
+            (Some("function_call"), "exec_command" | "shell" | "shell_command") => {
+                if let Some(dir) = arguments()["workdir"].as_str() {
+                    touch(out, dir, cwd);
+                }
+            }
+            (Some("function_call"), "apply_patch") => {
+                if let Some(patch) = arguments()["input"].as_str() {
+                    patched(patch).for_each(|path| touch(out, path, cwd));
+                }
+            }
+            (Some("custom_tool_call"), "apply_patch") => {
+                if let Some(patch) = p["input"].as_str() {
+                    patched(patch).for_each(|path| touch(out, path, cwd));
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+    if let Some(dir) = v["cwd"].as_str().filter(|d| !d.is_empty()) {
+        dir.clone_into(cwd);
+        // Every folder a session records is a place it worked.
+        out.insert(PathBuf::from(dir));
+    }
+    let m = &v["message"];
+    if m["role"] != "assistant" {
+        return;
+    }
+    for c in m["content"].as_array().into_iter().flatten() {
+        let (input, keys): (&Value, &[&str]) = match (c["type"].as_str(), c["name"].as_str()) {
+            (Some("tool_use"), Some("Read" | "Write" | "Edit" | "MultiEdit")) => {
+                (&c["input"], &["file_path"])
+            }
+            (Some("tool_use"), Some("NotebookEdit")) => {
+                (&c["input"], &["notebook_path", "file_path"])
+            }
+            (Some("tool_use"), Some("Glob" | "Grep")) => (&c["input"], &["path"]),
+            (Some("toolCall"), _) if agent == "pi" => (&c["arguments"], &["path"]),
+            _ => continue,
+        };
+        for key in keys {
+            if let Some(path) = input[*key].as_str() {
+                touch(out, path, cwd);
+            }
+        }
+    }
+}
+
+/// The files a Codex patch names on its header lines.
+fn patched(patch: &str) -> impl Iterator<Item = &str> {
+    patch.lines().filter_map(|line| {
+        [
+            "*** Add File: ",
+            "*** Update File: ",
+            "*** Delete File: ",
+            "*** Move to: ",
+        ]
+        .iter()
+        .find_map(|header| line.strip_prefix(header))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    })
+}
+
+/// `path` into `out`, made absolute against `cwd`; a relative path with no
+/// folder to resolve it against is left out.
+fn touch(out: &mut std::collections::BTreeSet<PathBuf>, path: &str, cwd: &str) {
+    if path.is_empty() {
+        return;
+    }
+    let path = Path::new(path);
+    if path.is_absolute() {
+        out.insert(path.to_path_buf());
+    } else if !cwd.is_empty() {
+        out.insert(Path::new(cwd).join(path));
+    }
 }
 
 fn string(v: &Value, key: &str) -> String {
@@ -2524,4 +2666,114 @@ fn elements_only(text: &str, names: &[&str]) -> bool {
         text = text[end + close.len()..].trim_start();
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::collections::BTreeSet;
+
+    fn read(agent: &str, records: &[Value], cwd: &str) -> BTreeSet<PathBuf> {
+        let mut cwd = cwd.to_owned();
+        let mut out = BTreeSet::new();
+        for v in records {
+            touched(v, agent, &mut cwd, &mut out);
+        }
+        out
+    }
+
+    fn paths(paths: &[&str]) -> BTreeSet<PathBuf> {
+        paths.iter().map(PathBuf::from).collect()
+    }
+
+    #[test]
+    fn a_patch_names_its_files_on_its_header_lines() {
+        let patch = "*** Begin Patch\n*** Add File: a.rs\n+x\n*** Update File: src/b.rs\n*** Move to: src/c.rs\n@@\n-*** Delete File: not/a/header\n*** Delete File: d.rs\n*** End Patch\n";
+        assert_eq!(
+            patched(patch).collect::<Vec<_>>(),
+            ["a.rs", "src/b.rs", "src/c.rs", "d.rs"]
+        );
+    }
+
+    #[test]
+    fn every_folder_a_session_records_counts_not_only_its_first() {
+        // A session started in a parent folder that later works with the
+        // repository as its folder, with no structured file in between.
+        let claude = [
+            json!({"type":"user","cwd":"/w","message":{"role":"user","content":"start"}}),
+            json!({"type":"assistant","cwd":"/w/repo","message":{"role":"assistant","content":[]}}),
+        ];
+        assert_eq!(read("claude", &claude, ""), paths(&["/w", "/w/repo"]));
+        let codex = [
+            json!({"type":"session_meta","payload":{"cwd":"/w"}}),
+            json!({"type":"turn_context","payload":{"cwd":"/w/repo"}}),
+        ];
+        assert_eq!(read("codex", &codex, ""), paths(&["/w", "/w/repo"]));
+    }
+
+    #[test]
+    fn claude_tool_calls_name_files_in_their_structured_fields_only() {
+        let call = |name: &str, input: Value| {
+            json!({"type":"assistant","cwd":"/w/repo","message":{"role":"assistant",
+                "content":[{"type":"tool_use","name":name,"input":input}]}})
+        };
+        let records = [
+            call("Edit", json!({"file_path":"/w/repo/a.rs"})),
+            call("Read", json!({"file_path":"b.rs"})),
+            call("NotebookEdit", json!({"notebook_path":"n.ipynb"})),
+            call("Grep", json!({"pattern":"x","path":"src"})),
+            call("Glob", json!({"pattern":"*.rs"})),
+            // A shell command is free text: never read for paths.
+            call("Bash", json!({"command":"cat /w/other/secret.rs"})),
+            json!({"type":"user","cwd":"/w/repo","message":{"role":"user","content":"edit /w/other/x.rs"}}),
+        ];
+        assert_eq!(
+            read("claude", &records, ""),
+            paths(&[
+                "/w/repo",
+                "/w/repo/a.rs",
+                "/w/repo/b.rs",
+                "/w/repo/n.ipynb",
+                "/w/repo/src"
+            ])
+        );
+    }
+
+    #[test]
+    fn codex_names_a_call_s_workdir_and_a_patch_s_files_against_the_turn_s_folder() {
+        let item = |payload: Value| json!({"type":"response_item","payload":payload});
+        let records = [
+            json!({"type":"session_meta","payload":{"cwd":"/w"}}),
+            json!({"type":"turn_context","payload":{"cwd":"/w/repo"}}),
+            item(json!({"type":"function_call","name":"exec_command",
+                "arguments":json!({"cmd":"ls /w/other","workdir":"sub"}).to_string()})),
+            item(json!({"type":"custom_tool_call","name":"apply_patch",
+                "input":"*** Begin Patch\n*** Update File: src/lib.rs\n*** End Patch\n"})),
+            item(json!({"type":"function_call","name":"exec_command",
+                "arguments":json!({"cmd":"cd /w/other && make"}).to_string()})),
+            item(json!({"type":"custom_tool_call","name":"exec","input":"open('/w/other/x')"})),
+        ];
+        assert_eq!(
+            read("codex", &records, ""),
+            paths(&["/w", "/w/repo", "/w/repo/sub", "/w/repo/src/lib.rs"])
+        );
+    }
+
+    #[test]
+    fn pi_names_a_tool_call_s_path_against_the_session_s_folder() {
+        let records = [
+            json!({"type":"session","cwd":"/w"}),
+            json!({"type":"message","message":{"role":"assistant","content":[
+                {"type":"toolCall","name":"edit","arguments":{"path":"repo/a.rs"}},
+                {"type":"toolCall","name":"bash","arguments":{"command":"cat /w/other/x"}}]}}),
+        ];
+        assert_eq!(read("pi", &records, ""), paths(&["/w", "/w/repo/a.rs"]));
+        // A relative path with no folder to resolve it against is left out.
+        let records = [
+            json!({"type":"message","message":{"role":"assistant","content":[
+            {"type":"toolCall","name":"read","arguments":{"path":"a.rs"}}]}}),
+        ];
+        assert!(read("pi", &records, "").is_empty());
+    }
 }

@@ -42,6 +42,17 @@ pub struct Session {
     /// `codex-tui`, or `codex_exec` for `codex exec`. Null when unknown.
     #[serde(default)]
     pub originator: Option<String>,
+    /// The git branch the transcript first records: Claude Code's
+    /// `gitBranch`, Codex's `session_meta.payload.git.branch`. None when it
+    /// records none. Only `share` uses it, so no export carries it.
+    #[serde(skip)]
+    pub branch: Option<String>,
+    /// The files and folders its structured tool calls name, made absolute
+    /// against the folder the session recorded at that point. Only `share`
+    /// uses them, to decide which repository a session touched; no output
+    /// carries them.
+    #[serde(skip)]
+    pub touched: std::collections::BTreeSet<std::path::PathBuf>,
     /// Subagents a Claude transcript says it launched. Checked against the
     /// transcripts read.
     #[serde(skip)]
@@ -260,7 +271,8 @@ pub fn aggregate_usage<'a>(usage: impl Iterator<Item = &'a Usage>) -> Result<Vec
     Ok(groups.into_values().collect())
 }
 
-fn add(a: Option<u64>, b: Option<u64>) -> Result<Option<u64>> {
+/// The sum of two counts; unknown when either is.
+pub fn add(a: Option<u64>, b: Option<u64>) -> Result<Option<u64>> {
     match (a, b) {
         (Some(a), Some(b)) => Ok(Some(
             a.checked_add(b)
