@@ -1051,8 +1051,8 @@ A share adds; it never edits. Each share is a new commit on the one before,
 with the person as its author and `shared_at` as its time, and holds only
 the sessions that are new, or whose record differs from their latest one
 anywhere in the ref's history. Nothing written is ever rewritten. Warnings
-other than the most recent share's are new too, since `team` shows those:
-such a share holds them and no session. A share with nothing new makes no
+other than the most recent share's (none, before a first share) are new
+too, since `team` shows those: such a share holds them and no session. A share with nothing new makes no
 commit, and says so; a share this clone made earlier and has not pushed yet
 is pushed then. The record's bytes are
 written as they are, with git's plumbing (`hash-object`, `mktree`,
@@ -1098,10 +1098,11 @@ One rule is applied on reading, within one person: a session's latest
 record that is a subagent alone, which another session's latest record
 names in `subagents`, gives way to that session, which counts it. How many
 did is shown (`subagents_counted_with_their_session`, and in the plain form
-beside the person). When such a record was shared after the session's, with
-other numbers than the session holds for it, the subagent went on after its
-session was shared (its session's transcript gone by then): what it added is
-not counted, and is counted in `subagents_newer_than_their_session`.
+beside the person). When such a record was shared after the session's, and
+holds other numbers than the session holds for it or is partial, the
+subagent went on after its session was shared (its session's transcript
+gone by then): what it says is not counted, and is counted in
+`subagents_newer_than_their_session`.
 
 A person is partial when their most recent share had source warnings, when
 one of their sessions' latest records is partial, or when a subagent went on

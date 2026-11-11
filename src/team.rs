@@ -237,10 +237,11 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
     };
     // Two copies of the ref that went apart are joined by a commit on both,
     // whether or not it adds a session; and warnings other than the most
-    // recent share's are new too, since `team` shows those.
+    // recent share's (none before a first share) are new too, since `team`
+    // shows those.
     let nothing = record.sessions.is_empty()
         && parents.len() < 2
-        && last_warnings.is_none_or(|last| last == source_warnings);
+        && last_warnings.unwrap_or(0) == source_warnings;
     if asked.dry_run {
         if nothing {
             eprintln!("vessa: dry run: nothing new to share");
@@ -1366,8 +1367,8 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
         // A subagent is counted with the session that names it: a record of
         // it alone gives way, and is counted here. One shared after that
         // session's record, with other numbers than that record holds for
-        // it, went on after: what it added is not counted, so the person is
-        // partial.
+        // it, or partial, went on after: what it says is not counted, so the
+        // person is partial.
         let mut named: BTreeMap<(String, String), (usize, Vec<Entry>)> = BTreeMap::new();
         for (at, s) in latest.values() {
             for sub in &s.subagents {
@@ -1380,9 +1381,9 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
         let newer = latest
             .iter()
             .filter(|(key, (at, s))| {
-                named
-                    .get(*key)
-                    .is_some_and(|(session_at, held)| at < session_at && &s.entries != held)
+                named.get(*key).is_some_and(|(session_at, held)| {
+                    at < session_at && (&s.entries != held || s.partial)
+                })
             })
             .count();
         let before = latest.len();

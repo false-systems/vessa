@@ -1325,6 +1325,70 @@ fn a_subagent_newer_than_its_session_s_record_makes_the_person_partial() {
 }
 
 #[test]
+fn a_subagent_partial_after_its_session_was_shared_makes_the_person_partial() {
+    let world = World::new("newer-partial");
+    let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");
+    let folder = world.root.join("sessions");
+    let subagents = folder.join("main-1").join("subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    std::fs::write(
+        folder.join("main-1.jsonl"),
+        claude("main-1", &alice, None, 100),
+    )
+    .unwrap();
+    let helper = subagents.join("agent-helper.jsonl");
+    std::fs::write(&helper, subagent("main-1", "helper", &alice, 70)).unwrap();
+    assert_eq!(
+        world.share(&alice, &folder, &["--no-push"]).status.code(),
+        Some(0)
+    );
+    // The session's transcript goes; its subagent's gains a damaged record,
+    // its numbers the same.
+    std::fs::remove_file(folder.join("main-1.jsonl")).unwrap();
+    std::fs::write(
+        &helper,
+        subagent("main-1", "helper", &alice, 70) + "not a record\n",
+    )
+    .unwrap();
+    let out = world.share(&alice, &folder, &["--json", "--no-push"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    assert_eq!(
+        ids(&record(&out)),
+        ["main-1/helper"].map(String::from).into()
+    );
+    let out = world.vessa(&alice, &["team", "--json", "--no-fetch"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    let ada = &record(&out)["people"][0];
+    assert_eq!(ada["subagents_newer_than_their_session"], 1);
+    assert_eq!(ada["partial"], true);
+}
+
+#[test]
+fn a_first_share_with_warnings_alone_is_written() {
+    let world = World::new("only-warnings");
+    let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");
+    // A file that is no session vessa can read, and a session whose id
+    // cannot be shared.
+    let folder = world.sessions(
+        "sessions",
+        &[
+            ("unreadable.jsonl", "{\"no\":\"header\"}\n".into()),
+            ("a.jsonl", claude("/tmp/id", &alice, None, 1)),
+        ],
+    );
+    let out = world.share(&alice, &folder, &["--json", "--no-push"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    let v = record(&out);
+    assert_eq!(v["sessions"], json!([]));
+    assert_eq!(v["source_warnings"], 2);
+    let out = world.vessa(&alice, &["team", "--json", "--no-fetch"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    let ada = &record(&out)["people"][0];
+    assert_eq!(ada["partial"], true);
+    assert_eq!(ada["sessions"], json!([]));
+}
+
+#[test]
 fn team_fetches_no_tags() {
     let world = World::new("tags");
     let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");
