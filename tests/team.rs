@@ -325,7 +325,18 @@ fn the_record_holds_numbers_only() {
                 "usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}),
     ];
     let session: String = lines.iter().map(|l| format!("{l}\n")).collect();
-    let folder = world.sessions("sessions", &[("privacy.jsonl", session)]);
+    // A Codex session beside it, which records its repository's address
+    // and commit.
+    let folder = world.sessions(
+        "sessions",
+        &[
+            ("privacy.jsonl", session),
+            (
+                "codex.jsonl",
+                codex("privacy-codex", &cwd, "feat/privacy", 500),
+            ),
+        ],
+    );
 
     // Partial: the subagent's transcript was not read.
     let dry = world.share(&alice, &folder, &["--dry-run"]);
@@ -390,6 +401,7 @@ fn the_record_holds_numbers_only() {
 
     // Every field is one the format names, and every string one of these.
     let v: Value = serde_json::from_str(&stored).unwrap();
+    assert_eq!(ids(&v), [id, "privacy-codex"].map(String::from).into());
     let keys = |v: &Value| {
         v.as_object()
             .unwrap()
@@ -449,6 +461,10 @@ fn the_record_holds_numbers_only() {
         "[path]",
         // vessa's limitation, by kind.
         "subagent_not_read",
+        "codex",
+        "privacy-codex",
+        "openai",
+        "demo-codex",
     ]);
     fn strings(v: &Value, out: &mut Vec<String>) {
         match v {
