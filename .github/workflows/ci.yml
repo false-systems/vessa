@@ -16,7 +16,7 @@ concurrency:
 jobs:
   rust:
     name: Rust
-    runs-on: arc-arm64
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
       CARGO_TARGET_DIR: target
