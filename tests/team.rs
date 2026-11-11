@@ -846,6 +846,57 @@ fn a_partial_session_is_shared_as_partial() {
     assert!(plain.contains("subagent_not_read"), "{plain}");
 }
 
+/// A Claude Code subagent `agent` of session `session`, recorded in `cwd`.
+fn subagent(session: &str, agent: &str, cwd: &Path, input: u64) -> String {
+    let task = json!({"type":"user","uuid":format!("{agent}-u1"),"sessionId":session,"agentId":agent,
+        "isSidechain":true,"cwd":text(cwd),"timestamp":"2026-09-30T09:02:00Z","entrypoint":"cli",
+        "message":{"role":"user","content":"Look into it."}});
+    let answer = json!({"type":"assistant","uuid":format!("{agent}-a1"),"requestId":format!("req_{agent}"),
+        "sessionId":session,"agentId":agent,"isSidechain":true,"cwd":text(cwd),"timestamp":"2026-09-30T09:03:00Z",
+        "message":{"id":format!("msg_01{agent}"),"role":"assistant","model":"demo-model","content":[],
+            "usage":{"input_tokens":input,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}});
+    format!("{task}\n{answer}\n")
+}
+
+#[test]
+fn a_subagent_is_shared_once_with_or_without_its_session() {
+    let world = World::new("subagent");
+    let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");
+    let folder = world.root.join("sessions");
+    let subagents = folder.join("main-1").join("subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    std::fs::write(
+        subagents.join("agent-helper.jsonl"),
+        subagent("main-1", "helper", &alice, 70),
+    )
+    .unwrap();
+    let shared = |world: &World| {
+        let out = world.share(&alice, &folder, &["--json", "--no-push"]);
+        assert!(out.status.code() == Some(0), "{}", stderr(&out));
+        record(&out)
+    };
+    // Its session's transcript is not here: the subagent stands alone.
+    let first = shared(&world);
+    assert_eq!(ids(&first), ["main-1/helper"].map(String::from).into());
+
+    // Its session appears: the subagent is counted with it, and only there.
+    std::fs::write(
+        folder.join("main-1.jsonl"),
+        claude("main-1", &alice, None, 100),
+    )
+    .unwrap();
+    let second = shared(&world);
+    assert_eq!(ids(&second), ["main-1"].map(String::from).into());
+    assert_eq!(second["sessions"][0]["subagents"], 1);
+    assert_eq!(second["sessions"][0]["entries"][0]["input_tokens"], 170);
+
+    // The session's transcript goes, the subagent's stays: the session
+    // keeps its record, and the subagent is not added beside it.
+    std::fs::remove_file(folder.join("main-1.jsonl")).unwrap();
+    let third = shared(&world);
+    assert_eq!(third["sessions"], second["sessions"]);
+}
+
 #[test]
 fn a_session_whose_id_cannot_be_shared_is_left_out_and_said() {
     let world = World::new("ids");

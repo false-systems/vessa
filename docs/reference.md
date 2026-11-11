@@ -999,6 +999,12 @@ with: agents delete old transcripts, and worktrees are removed. Sharing
 again with nothing changed shares the same sessions, byte for byte. When no
 session of the repository is found, nothing is written.
 
+A subagent is shared once. Read without its session's transcript, it is
+shared as a session of its own, under its own id. Once its session is read,
+it is counted there, and its own record goes. A subagent whose session was
+shared before, and whose session's transcript is gone, is not shared beside
+it: its usage is in that session's record.
+
 ### A push the remote refuses
 
 `share` then pushes that one ref to `origin`, or to the remote `--remote

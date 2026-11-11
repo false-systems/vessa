@@ -110,9 +110,19 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
         eprintln!("vessa: {}", clean(warning));
     }
     let mut source_warnings = report.warnings.len();
+    let families = model::families(&report.sessions);
+    // Subagents read with their session: each is counted there, so a record
+    // of one alone, shared while its session's transcript was not read,
+    // gives way to its session's.
+    let absorbed: BTreeSet<(String, String)> = families
+        .iter()
+        .flat_map(|f| f.subagents.iter().map(|s| (s.agent.clone(), s.id.clone())))
+        .collect();
+    // Each session read now, with the session it is a subagent of when
+    // that one was not read.
     let mut current = Vec::new();
     let mut withheld = 0;
-    for family in model::families(&report.sessions) {
+    for family in &families {
         if !inside(&family.main.cwd, &roots) {
             continue;
         }
@@ -123,7 +133,10 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
             withheld += 1;
             continue;
         }
-        current.push(shared(&family, &mut found)?);
+        current.push((
+            shared(family, &mut found)?,
+            family.main.subagent_of().map(str::to_owned),
+        ));
     }
     if withheld > 0 {
         eprintln!(
@@ -154,18 +167,25 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
     let mut sessions = BTreeMap::new();
     for record in earlier {
         for s in record.sessions {
-            sessions.insert((s.agent.clone(), s.id.clone()), s);
+            let key = (s.agent.clone(), s.id.clone());
+            if !absorbed.contains(&key) {
+                sessions.insert(key, s);
+            }
         }
     }
-    let read_now = current.len();
-    let now_read: BTreeSet<_> = current
-        .iter()
-        .map(|s| (s.agent.clone(), s.id.clone()))
-        .collect();
-    let kept = sessions.keys().filter(|k| !now_read.contains(*k)).count();
-    for s in current {
-        sessions.insert((s.agent.clone(), s.id.clone()), s);
+    let mut now_read = BTreeSet::new();
+    for (s, of) in current {
+        // A subagent whose session's transcript is gone, and whose session
+        // was shared with it: its usage is in that record already.
+        if of.is_some_and(|session| sessions.contains_key(&(s.agent.clone(), session))) {
+            continue;
+        }
+        let key = (s.agent.clone(), s.id.clone());
+        now_read.insert(key.clone());
+        sessions.insert(key, s);
     }
+    let read_now = now_read.len();
+    let kept = sessions.len() - read_now;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
