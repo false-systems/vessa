@@ -98,11 +98,12 @@ enum Cmd {
         #[arg(long)]
         raw: bool,
     },
-    /// Share your usage in this repository with its team: one record of
-    /// numbers for you (sessions recorded in this clone's worktrees, their
-    /// token counts and times), committed to refs/vessa/usage/ and pushed.
-    /// Never holds what anyone wrote, a path or the machine's name. With
-    /// --json or --dry-run: the vessa-team-usage.v1 record.
+    /// Share your usage in this repository with its team: the numbers of
+    /// your sessions recorded in this clone's worktrees, or that touched
+    /// files in them, new or changed since you last shared, added to
+    /// refs/vessa/usage/ and pushed. Never holds what anyone wrote, a path
+    /// or the machine's name. With --json or --dry-run: the
+    /// vessa-team-usage.v1 record.
     Share {
         /// The remote to push to.
         #[arg(long, default_value = "origin")]
@@ -114,9 +115,9 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
-    /// What the team shared in this repository: each person's latest
-    /// share, with a team total. Reads only what was shared. With --json:
-    /// vessa-team.v1.
+    /// What the team shared in this repository: each person's sessions, the
+    /// latest record of each from their shares' history, with a team total.
+    /// Reads only what was shared. With --json: vessa-team.v1.
     Team {
         /// The remote to fetch shares from.
         #[arg(long, default_value = "origin")]

@@ -203,6 +203,7 @@ pub fn sessions(store: &Path) -> Result<(Vec<Stored>, Vec<String>)> {
                 originator: None,
                 // opencode's store records no branch.
                 branch: None,
+                touched: Default::default(),
                 launched: Vec::new(),
                 counted_elsewhere: 0,
                 synthetic: Default::default(),
@@ -247,19 +248,21 @@ pub type BySession = BTreeMap<String, Vec<(usize, Value)>>;
 
 /// Every session's model responses (`assistant` and `compaction` messages),
 /// by session, as [`records`] gives them but with only the `tokens` and
-/// `model` of their data: what usage reads, in one query for the whole
-/// store. A response whose data is not JSON comes with `malformed`.
+/// `model` of their data, and the `paths` its tool parts name in their
+/// input (`state.input.path` or `filePath`): what usage and `share` read,
+/// in one query for the whole store. No other words of a message are read.
+/// A response whose data is not JSON comes with `malformed`.
 pub fn responses(store: &Path) -> Result<BySession> {
     let rows = query(
         store,
-        "select session_id, id, type, seq, time_created, json_valid(data) as valid, case when json_valid(data) then json_extract(data, '$.tokens') end as tokens, case when json_valid(data) then json_extract(data, '$.model') end as model from session_message where type in ('assistant', 'compaction') order by session_id, seq, id",
+        "select session_id, id, type, seq, time_created, json_valid(data) as valid, case when json_valid(data) then json_extract(data, '$.tokens') end as tokens, case when json_valid(data) then json_extract(data, '$.model') end as model, case when json_valid(data) and json_type(data, '$.content') = 'array' then (select json_group_array(p) from (select coalesce(json_extract(c.value, '$.state.input.path'), json_extract(c.value, '$.state.input.filePath')) as p from json_each(data, '$.content') as c where json_type(c.value) = 'object' and json_extract(c.value, '$.type') = 'tool') where typeof(p) = 'text') end as paths from session_message where type in ('assistant', 'compaction') order by session_id, seq, id",
     )?;
     let mut by_session = BySession::new();
     for row in rows {
         let mut record = message(&row)?;
         if row["valid"].as_i64() == Some(1) {
             let mut data = serde_json::Map::new();
-            for field in ["tokens", "model"] {
+            for field in ["tokens", "model", "paths"] {
                 let value = match &row[field] {
                     Value::String(json) => serde_json::from_str(json)
                         .with_context(|| format!("{field} is not JSON"))?,

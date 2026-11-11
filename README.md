@@ -106,9 +106,10 @@ means the command failed.
 
 A team sees what its agents used through the project's own git repository,
 with no server: whoever can push to it is the team. In a clone, `vessa share`
-commits one record of your numbers there (sessions, token counts, times) and
-pushes it; `vessa team` fetches everyone's and adds them up. What anyone
-wrote, paths and the machine's name are never shared.
+adds the numbers of your sessions in that repository (token counts and
+times, never rewriting an earlier share) and pushes them; `vessa team`
+fetches everyone's and adds them up. What anyone wrote, paths and the
+machine's name are never shared.
 
 ```sh
 vessa share   # your sessions in this repository, as numbers, pushed

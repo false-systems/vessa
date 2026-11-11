@@ -866,38 +866,74 @@ same metadata and coverage status as the JSON.
 
 ## With a team
 
-A repository's team is whoever can push to it. `vessa share` keeps each
-person's usage in that repository, under git refs of its own, and
+A repository's team is whoever can push to it. `vessa share` adds each
+person's usage to that repository, under git refs of its own, and
 `vessa team` reads what everyone shared. There is no server. Only numbers
 are shared: nothing anyone wrote, no path and no machine name.
 
 ```sh
-vessa share --dry-run   # the record that would be shared, and nothing else
+vessa share --dry-run   # what would be shared, and nothing else
 vessa share             # share your sessions in this repository, and push
-vessa team              # each person's latest share, with a team total
+vessa team              # each person's sessions, with a team total
 vessa team --by branch  # the same sessions, by branch
 ```
 
 ### Which sessions are shared
 
-`vessa share` runs inside a clone, in any of its worktrees. A session
-belongs to the repository when the folder its agent recorded (its `cwd`) is
-inside the top folder of the clone's main worktree or of one of its linked
-worktrees, as `git worktree list` names them. The two are compared as
-paths, part by part, after each is resolved as the file system resolves it
-(symbolic links, and Windows' short names and drive spellings). A folder
-since deleted is placed by the part of it that still exists. A session that
-recorded no folder, or a relative one, belongs to no repository. Time never
-decides.
+`vessa share` runs inside a clone, in any of its worktrees. A session, with
+its subagents, belongs to the repository when either is true:
+
+- **Its folder.** The folder its agent recorded (its `cwd`) is inside the
+  top folder of the clone's main worktree or of one of its linked
+  worktrees, as `git worktree list` names them.
+- **The files it touched.** One of its structured tool calls, or one of its
+  subagents', names a file or folder inside one of those worktrees:
+  - Claude Code: `file_path` of `Read`, `Write`, `Edit` and `MultiEdit`,
+    `notebook_path` of `NotebookEdit`, `path` of `Glob` and `Grep`;
+  - Codex: the `workdir` of a shell call (`exec_command`, `shell`), and the
+    files an `apply_patch` names on its `*** Add File:`, `*** Update
+    File:`, `*** Delete File:` and `*** Move to:` lines;
+  - pi: a tool call's `path` argument;
+  - opencode: a tool part's `state.input.path` or `filePath`.
+
+  A relative path is taken against the folder the session recorded at that
+  point: the record's `cwd` for Claude Code, the turn's for Codex, the
+  session's for pi and opencode.
+
+Paths are compared part by part, after each is resolved as the file system
+resolves it (symbolic links, and Windows' short names and drive
+spellings). A path that no longer exists is normalized by its words (`.`
+dropped, `..` taking away the name before it) and placed by the part of it
+that still exists. A session that recorded no folder, or only relative
+ones, is placed by what else it says. Time never decides.
+
+Free text is never read for paths: not a shell command, a prompt, a reply
+or a tool's output. A session that only ran shell commands in the
+repository from another folder is not found. So it is with Codex's `exec`
+tool, which takes code, and with the shell tools of every agent (Claude
+Code's `Bash`, pi's `bash`, opencode's `shell`): a session that worked
+only through them is found by its folder alone.
+
+The paths are used on this machine, to decide, and nowhere else: they are
+never written, logged or printed.
+
+A session that touched several repositories counts in full in each of
+them, and its record says how many in `repositories_touched`. The
+repositories are counted by the `.git` above its folder and each path it
+touched: the worktrees of one clone are one repository. `vessa team` marks
+such sessions, since a total across repositories would count them more
+than once.
 
 vessa reads every session, as `vessa usage` does, so each is counted as
 `usage` counts it, and then shares those of this repository. A session's
 subagents are counted with it. `--input` reads other places than the
 agents' own folders, as elsewhere; `--agent` and `--session` do not apply.
+`share` says on stderr how many sessions it found, and by which rule.
 
 ### The record
 
-A share is one `vessa-team-usage.v1` record for the person:
+Each share is one `vessa-team-usage.v1` record, the one file of a commit
+on the person's ref (see [Where it is kept](#where-it-is-kept)):
 
 ```json
 {
@@ -928,23 +964,23 @@ A share is one `vessa-team-usage.v1` record for the person:
 - `person`: `git config user.name` and `user.email` in the clone.
 - `shared_at`: when it was shared, in UTC.
 - `entries_include_subagents`: always true.
-- `source_warnings`: how many warnings leave the share incomplete: each
-  source vessa could not read, since sessions of this repository may be
-  among them, and one more when sessions of this repository were left out
-  because their id reads as a secret or a path. A share keeps the sessions
-  of the shares before it, so it carries the most any of them had: a
-  session that a source held then may be gone since, and missing. A share
-  with any is partial, and stays so.
-- `sessions`, in agent and id order. Each has:
+- `source_warnings`: the warnings of this share alone: each source vessa
+  could not read, since sessions of this repository may be among them, and
+  one more when sessions of this repository were left out because their id
+  reads as a secret or a path.
+- `sessions`: the sessions new since, or changed from, their latest record
+  in the ref's history, in agent and id order. Each is whole, as it stood
+  when shared:
   - `agent`, and `id`: the agent's own session id;
   - `started_at`, and `ended_at`: the time of its latest usage record, its
     subagents' included. RFC 3339 in UTC; null when unknown;
   - `branch`: the first git branch its transcript records (Claude Code's
-    `gitBranch`, Codex's `git.branch`), or `[path]` for a name with a
-    separator, such as `feat/team` (see below). Null when it records none,
-    as pi and opencode do not;
+    `gitBranch`, Codex's `git.branch`). Null when it records none, as pi and
+    opencode do not;
   - `subagents`: each subagent its entries include, with its `id`, as `vessa
     status` names it, and its own `entries`;
+  - `repositories_touched`: how many repositories it touched, only when
+    more than one;
   - `entries`: its tokens by provider and model, as `vessa usage` counts
     them, its subagents' included. A category the agent did not record is
     null;
@@ -964,37 +1000,42 @@ A share is one `vessa-team-usage.v1` record for the person:
 | `copied_launch_records` | and another hold copies of each other's launch records |
 | `codex_cache_writes` | is a Codex session that recorded cache writes |
 | `messages_unreadable` | is an opencode session whose messages could not be read |
-| `subagent_changed_after_share` | has a subagent whose numbers changed after the session was shared, read while the session's transcript was gone; the change is not counted |
 | `other` | has another limitation |
 
 **Never in the record:** what a person or an agent wrote (prompts, replies,
 thinking, tool input and output, commit messages, summaries), any file path,
-absolute or relative, the machine's name, and prices or costs. A
-limitation's own words are not kept, since they quote record ids, other
-sessions' ids and names: only its kind is.
+absolute or relative, the paths that placed a session, the machine's name,
+and prices or costs. A limitation's own words are not kept, since they
+quote record ids, other sessions' ids and names: only its kind is.
 
-A branch, provider or model name is scrubbed by the rules under
-[Redaction](#redaction), and one that reads as a path is written `[path]`.
-A name reads as a path when it holds a separator (`/` or `\`), starts with
-`~` or a dot, is a file URL, or ends in an extension model weights are kept
-in (`.gguf`, `.ggml`, `.ggjt`, `.bin`, `.safetensors`, `.pt`, `.pth`,
-`.onnx`, `.ckpt`, `.h5`, `.tflite`, `.mlmodel`, `.llamafile`, `.pkl`). From
-its text alone a name cannot be told from a relative path, so a branch such
-as `feat/team` is written `[path]` too, and `team --by branch` groups such
-branches together. Names withheld alike in one session are one entry. A
-separator is kept only in the one model shape vessa itself writes: the
-entry's own provider, `/`, then the model (`anthropic/claude-…` under the
-provider `anthropic`).
+**Branch names.** A branch is kept when it is a valid git branch name, as
+`git check-ref-format --branch` judges one (vessa checks git's rules
+itself), and is not a path from the root, from home or from a dot; else it
+is written `[path]`. `HEAD`, which Claude Code records for a detached
+checkout, is no branch name, so it is written `[path]` too. A branch kept is
+scrubbed by the rules under [Redaction](#redaction).
 
-A session is known by its id, and its subagents by theirs. A session is not
-shared at all when its id or a subagent's id would be changed by the scrub
-or reads as a path: any stand-in made from it would be its fingerprint. The
-one id with a separator that is written as it is, is the one vessa writes
-for a Claude Code subagent, `<session>/<agentId>`. `share` says how many
-sessions were left out, and counts it in `source_warnings`.
+**Provider and model names** are scrubbed by those rules, and one that
+reads as a path is written `[path]`. A name reads as a path when it holds a
+separator (`/` or `\`), starts with `~` or a dot, is a file URL, or ends in
+an extension model weights are kept in (`.gguf`, `.ggml`, `.ggjt`, `.bin`,
+`.safetensors`, `.pt`, `.pth`, `.onnx`, `.ckpt`, `.h5`, `.tflite`,
+`.mlmodel`, `.llamafile`, `.pkl`). Names withheld alike in one session are
+one entry. A separator is kept only in the one model shape vessa itself
+writes: the entry's own provider, `/`, then the model (`anthropic/claude-…`
+under the provider `anthropic`).
 
-`--dry-run` prints the record that would be written, and changes nothing.
-`--json` prints the record that was written, byte for byte.
+**Session ids.** A session is known by its id, and its subagents by
+theirs. A session is not shared at all when its id or a subagent's id would
+be changed by the scrub or reads as a path: any stand-in made from it would
+be its fingerprint. The one id with a separator that is written as it is,
+is the one vessa writes for a Claude Code subagent, `<session>/<agentId>`.
+`share` says how many sessions were left out, and counts it in
+`source_warnings`.
+
+`--dry-run` prints the record that would be written, and changes nothing;
+when nothing is new, it prints nothing and says so. `--json` prints the
+record that was written, byte for byte, and nothing when none was.
 
 ### Where it is kept
 
@@ -1006,34 +1047,21 @@ hash of the lower-cased email, so the ref name does not spell the address:
 printf %s ada@example.org | git hash-object --stdin | cut -c1-16
 ```
 
-Each share is a new commit on the one before, with the person as its author
-and `shared_at` as its time, so the ref's history shows each share. The
-record's bytes are written as they are, with git's plumbing (`hash-object`,
-`mktree`, `commit-tree`, `update-ref`).
+A share adds; it never edits. Each share is a new commit on the one before,
+with the person as its author and `shared_at` as its time, and holds only
+the sessions that are new, or whose record differs from their latest one
+anywhere in the ref's history. Nothing written is ever rewritten. A share
+with nothing new makes no commit, and says so; a share this clone made
+earlier and has not pushed yet is pushed then. The record's bytes are
+written as they are, with git's plumbing (`hash-object`, `mktree`,
+`commit-tree`, `update-ref`).
 
-A share holds the person's whole set for the repository, each session by
-agent and id. A session read now is shared with its current numbers. A
-session shared before and not found now keeps the record it was shared
-with: agents delete old transcripts, and worktrees are removed. Sharing
-again with nothing changed shares the same sessions, byte for byte. When no
-session of the repository is found, nothing is written.
-
-A subagent is shared once. A subagent read with its session belongs to
-that session: it is shared with it, and when the session is not shared
-(recorded outside the repository, or left out for its id), neither is the
-subagent. Read without its session's transcript, a subagent is placed by
-its own folder, and shared as a session of its own, under its own id.
-Whenever a session in the share names a subagent in `subagents`, a record
-of that subagent alone gives way to it: one read now while the session's
-transcript is gone, and one kept from a share this one follows, of this
-clone or of another. A record of a subagent alone that no session in the
-share names stays.
-
-A subagent read alone, while its session's transcript is gone, may hold
-other numbers than its session's record holds for it: it went on after
-that session was shared. The difference cannot be put in the session's
-record without counting the rest twice, so it is left out, and the session
-is partial, with the limitation `subagent_changed_after_share`.
+The history is the record: reading it gives each session's latest record.
+A session whose transcript is gone (agents delete old ones) or whose
+worktree was removed still counts, from its record. A share grows with what
+changed since the last one: one record for each new or changed session,
+none for the rest. The ref grows by that much at each share, and nothing is
+pruned.
 
 ### A push the remote refuses
 
@@ -1045,8 +1073,9 @@ same key: from another clone, another machine, or another person with the
 same email. vessa fetches that share into
 `refs/vessa/remotes/<remote>/usage/<key>`, pushes nothing, and says whose
 share it is (exit 1). Nothing on the remote is overwritten, and the new
-share stays in the clone. `vessa share` run again follows both shares,
-keeps the sessions of both, and pushes.
+share stays in the clone. `vessa share` run again joins the two copies with
+a commit on both, whether or not it adds a session, and pushes. Reading
+both histories then gives the sessions of both.
 
 ### `vessa team`
 
@@ -1056,9 +1085,21 @@ those the remote no longer has. It never fetches into `refs/vessa/usage/`,
 so a share kept in the clone is never replaced. `--no-fetch` reads only what
 the clone already has.
 
-Of each person it reads the latest share: the clone's own when it holds the
-remote's, else the remote's. It reads nothing else, never anyone's session
-files: `--input`, `--agent` and `--session` do not apply.
+Of each person it reads the whole history of their ref, this clone's copy
+and the remote's together, every parent of a join included. Of each session
+it keeps the record from the most recent share that holds it: a share comes
+before the ones it follows, and otherwise by its time. It reads nothing
+else, never anyone's session files: `--input`, `--agent` and `--session` do
+not apply.
+
+One rule is applied on reading, within one person: a session's latest
+record that is a subagent alone, which another session's latest record
+names in `subagents`, gives way to that session, which counts it. How many
+did is shown (`subagents_counted_with_their_session`, and in the plain form
+beside the person).
+
+A person is partial when their most recent share had source warnings, or
+when one of their sessions' latest records is partial.
 
 It prints one block per person, with when they last shared, their sessions,
 and their tokens by agent, provider and model, then the team total. `--by
@@ -1066,20 +1107,25 @@ agent|model|week|branch` groups the sessions by that instead. A week is the
 ISO week of a session's start, in UTC, named as `stats` names it. It says
 how many people have shared. A person who has not shared does not appear,
 and is never counted as zero. A sum with an unknown category is unknown.
-Partial sessions are counted, and listed with their limitations' kinds.
+Partial sessions, and sessions that touched several repositories, are
+counted and listed.
 
 With `--json` it emits `vessa-team.v1`:
 
 - `remote`; `fetched`, false with `--no-fetch` or when the fetch failed;
   `by`, `person` unless `--by` names another;
-- `people`: each person's `key`, `name`, `email`, `shared_at`, `pushed`
-  (false when the clone's own share is ahead of the remote's),
-  `source_warnings`, and `sessions` as shared;
+- `people`: each person's `key`, `name`, `email`, `shared_at` (their most
+  recent share), `shares` (how many their history holds), `pushed` (false
+  when this clone's copy is ahead of the remote's), `partial`,
+  `source_warnings` (of their most recent share),
+  `subagents_counted_with_their_session`, and `sessions`, each the latest
+  record;
 - `groups`: by person, with the person's key as `key`, or by what `--by`
   names. Each has its `key` (null when unknown: no branch recorded, no
-  start, no usage recorded), how many `people`, `sessions` and
-  `partial_sessions` it holds, and `entries` by agent, provider and model,
-  each with how many `sessions` it sums;
+  start, no usage recorded), how many `people`, `sessions`,
+  `partial_sessions` and `sessions_in_several_repositories` it holds, and
+  `entries` by agent, provider and model, each with how many `sessions` it
+  sums;
 - `total`: the same, for everyone, without a key;
 - `warnings`.
 
@@ -1095,8 +1141,8 @@ credentials. Every other command works offline.
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Every session shared or shown is complete, and every source was read. |
-| 4 | Partial: a session with limitations, a share made with unreadable sources, or a warning (a fetch that failed, a share that cannot be read, a clone's share that differs from the remote's). |
+| 0 | Every session found or shown is complete, and every source was read. |
+| 4 | Partial. `share`: a session of this repository with limitations, or a source warning. `team`: a partial person (their most recent share had warnings, or a session's latest record is partial), or a warning (a fetch that failed, a share that cannot be read). |
 | 1 | It failed: not in a clone, no git name or email, a remote name git would take for an option, a push the remote refused, or a git command that failed. |
 
 ## Privacy

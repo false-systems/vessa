@@ -21,11 +21,14 @@ cannot become an all-clear. Its optional JSON output creates no dependency
 on any consumer.
 
 `share` writes numbers only: never what anyone wrote, a path or the
-machine's name. It shares, as one record for the person under the
-repository's own `refs/vessa/usage/`, the sessions recorded inside the
-clone's worktrees, with their token counts, times, agent, model and branch
-names and the person's git name and email. `team` reads only what was
-shared, never anyone's session files.
+machine's name. It adds, under the repository's own `refs/vessa/usage/`,
+the person's sessions of the repository that are new or changed: those
+recorded inside the clone's worktrees, or whose structured tool calls name
+a file in them (never free text; those paths stay on the machine), with
+their token counts, times, agent, model and branch names and the person's
+git name and email. A share never rewrites an earlier one; the ref's
+history is the record. `team` reads only what was shared, never anyone's
+session files.
 
 No runtime dependency on any other repository. No database or daemon. Every
 command works offline, except `share` and `team`: they use the network only

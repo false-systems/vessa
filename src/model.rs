@@ -47,6 +47,12 @@ pub struct Session {
     /// records none. Only `share` uses it, so no export carries it.
     #[serde(skip)]
     pub branch: Option<String>,
+    /// The files and folders its structured tool calls name, made absolute
+    /// against the folder the session recorded at that point. Only `share`
+    /// uses them, to decide which repository a session touched; no output
+    /// carries them.
+    #[serde(skip)]
+    pub touched: std::collections::BTreeSet<std::path::PathBuf>,
     /// Subagents a Claude transcript says it launched. Checked against the
     /// transcripts read.
     #[serde(skip)]

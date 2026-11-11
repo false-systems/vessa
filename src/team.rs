@@ -2,22 +2,25 @@
 //! through that repository's own git refs. Whoever can push to it is its
 //! team; there is no server.
 //!
-//! `share` writes one numbers-only record for the person, as the one file
-//! of a commit on `refs/vessa/usage/<key>`, and pushes that ref. `team`
-//! fetches every person's ref into `refs/vessa/remotes/<remote>/usage/` and
-//! reads them. Pushing and fetching those refs is the only network use, and
-//! only these two commands make it. A record holds counts, times, the names
-//! of agents, providers, models and branches, native session ids and the
-//! person's git name and email: no words, no path, no machine name.
+//! `share` adds a commit to `refs/vessa/usage/<key>` whose one file holds
+//! the person's session records that are new or changed since their latest
+//! record, and pushes that ref. Nothing written is ever rewritten: the
+//! ref's history is the record. `team` fetches every person's ref into
+//! `refs/vessa/remotes/<remote>/usage/` and reads each history, keeping the
+//! latest record of each session. Pushing and fetching those refs is the
+//! only network use, and only these two commands make it. A record holds
+//! counts, times, the names of agents, providers, models and branches,
+//! native session ids and the person's git name and email: no words, no
+//! path, no machine name.
 
 use crate::model::{self, Entry};
 use crate::render::{for_terminal as clean, many, usage_line};
 use crate::scrub::Redactions;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 /// The record's schema.
@@ -28,9 +31,6 @@ const TEAM: &str = "vessa-team.v1";
 const FILE: &str = "usage.json";
 /// Where each person's share is kept, by key.
 const SHARED: &str = "refs/vessa/usage/";
-/// The limitation of a session whose subagent's numbers changed after the
-/// session was shared, read while the session's transcript is gone.
-const AFTER_SHARE: &str = "subagent_changed_after_share";
 
 /// What every fetch is given, so it fetches the refspec it names and
 /// nothing else, whatever this clone's settings say: no tags, no
@@ -48,7 +48,7 @@ fn fetched(remote: &str) -> String {
     format!("refs/vessa/remotes/{remote}/usage/")
 }
 
-/// One person's record: what `share` writes, whole, as one file.
+/// One share: the one file of a commit on the person's ref.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Record {
     schema: String,
@@ -56,9 +56,11 @@ struct Record {
     shared_at: String,
     /// Each session's entries include its subagents'. Always true.
     entries_include_subagents: bool,
-    /// Sources vessa could not read when this was shared; sessions of this
-    /// repository may be among them.
+    /// Warnings of this share alone: sources vessa could not read, sessions
+    /// of this repository among them, maybe; and one more when sessions were
+    /// left out for their id.
     source_warnings: usize,
+    /// The sessions new since, or changed from, their latest record.
     sessions: Vec<Shared>,
 }
 
@@ -68,7 +70,7 @@ struct Person {
     email: String,
 }
 
-/// One session, in numbers.
+/// One session with its subagents, in numbers, as it stood when shared.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct Shared {
     agent: String,
@@ -79,6 +81,10 @@ struct Shared {
     branch: Option<String>,
     /// The subagents its entries include.
     subagents: Vec<Subagent>,
+    /// How many repositories it touched, when more than one: it counts in
+    /// full in each.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repositories_touched: Option<usize>,
     partial: bool,
     /// vessa's limitations of this session, by kind (see [`kind`]).
     limitations: BTreeMap<String, usize>,
@@ -101,8 +107,8 @@ pub struct Share<'a> {
     pub json: bool,
 }
 
-/// Shares the sessions recorded in this clone's worktrees, read from
-/// `paths`: one record for the person, written and pushed.
+/// Shares the sessions of this repository, read from `paths`: those new or
+/// changed since their latest record, as one commit, pushed.
 pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Result<i32> {
     remote_name(asked.remote)?;
     let roots: Vec<PathBuf> = worktrees()?.iter().filter_map(|w| canonical(w)).collect();
@@ -113,7 +119,7 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
     let person = person()?;
     let key = key(&person.email)?;
     // Every session is read, as `vessa usage` reads them, so each is counted
-    // as it counts it; those recorded in this clone are then chosen.
+    // as it counts it; those of this repository are then chosen.
     let mut report = crate::import::read(paths)?;
     report.warnings.extend(not_installed);
     let mut found = crate::scrub::report(&mut report);
@@ -121,12 +127,12 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
         eprintln!("vessa: {}", clean(warning));
     }
     let mut source_warnings = report.warnings.len();
-    let families = model::families(&report.sessions);
-    // Each session read now.
+    let mut places = Places::default();
     let mut current = Vec::new();
-    let mut withheld = 0;
-    for family in &families {
-        if !inside(&family.main.cwd, &roots) {
+    let (mut by_folder, mut by_files, mut withheld) = (0, 0, 0);
+    for family in model::families(&report.sessions) {
+        let folder = inside(&family.main.cwd, &roots);
+        if !folder && !places.touches(&family, &roots) {
             continue;
         }
         // A session is known by its id, and its subagents by theirs. One
@@ -138,8 +144,18 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
             withheld += 1;
             continue;
         }
-        current.push(shared(family, &mut found)?);
+        let repositories = places.repositories(&family);
+        current.push(shared(&family, repositories, &mut found)?);
+        if folder {
+            by_folder += 1;
+        } else {
+            by_files += 1;
+        }
     }
+    eprintln!(
+        "vessa: {} of this repository: {by_folder} by the folder they recorded, {by_files} by the files they touched",
+        many(current.len(), "session"),
+    );
     if withheld > 0 {
         eprintln!(
             "vessa: {} of this repository {} an id that reads as a secret or a path, so {} not shared",
@@ -150,87 +166,30 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
         source_warnings += 1;
     }
 
-    // The share this one follows: this clone's, and the remote's last
+    // The shares this one follows: this clone's, and the remote's as last
     // fetched, unless one already holds the other.
     let mine = format!("{SHARED}{key}");
     let tracked = format!("{}{key}", fetched(asked.remote));
     let known = refs(&[&mine, &tracked])?;
     let local = known.get(&mine).cloned();
-    let parents = parents(local.as_deref(), known.get(&tracked).map(String::as_str))?;
-    let mut earlier = Vec::new();
-    for (commit, read) in parents.iter().zip(records(&parents)?) {
-        earlier.push(read.map_err(|why| {
+    let theirs = known.get(&tracked).cloned();
+    let parents = parents(local.as_deref(), theirs.as_deref())?;
+    // Each session's latest record in their history; a session whose record
+    // is the same is not written again.
+    let mut latest = BTreeMap::new();
+    for (commit, read) in history(&parents)? {
+        let record = read.map_err(|why| {
             anyhow!("the share at {commit} is not a {RECORD} record ({why}); nothing was written")
-        })?);
-    }
-    // A share made with sources vessa could not read may have missed
-    // sessions that are gone since; this one keeps its sessions, so it is
-    // no more complete than that one was.
-    let carried = earlier.iter().map(|r| r.source_warnings).max().unwrap_or(0);
-    if carried > source_warnings {
-        eprintln!(
-            "vessa: an earlier share this one follows was made with {} vessa could not read, so sessions of this repository may be missing from it",
-            many(carried, "warning"),
-        );
-        source_warnings = carried;
-    }
-    // A session shared before keeps its record, unless it is read now:
-    // agents delete old transcripts, and worktrees are removed.
-    earlier.sort_by(|a, b| a.shared_at.cmp(&b.shared_at));
-    let mut sessions = BTreeMap::new();
-    for record in earlier {
+        })?;
         for s in record.sessions {
-            sessions.insert((s.agent.clone(), s.id.clone()), s);
+            latest.entry((s.agent.clone(), s.id.clone())).or_insert(s);
         }
     }
-    let mut now_read = BTreeSet::new();
-    for s in current {
-        let key = (s.agent.clone(), s.id.clone());
-        now_read.insert(key.clone());
-        sessions.insert(key, s);
-    }
-    // A subagent is counted in the record of the session that names it. A
-    // record of it alone, read now while its session's transcript is gone
-    // or kept from a share this one follows, gives way to that session's.
-    // Each subagent a session names, with that session and the subagent's
-    // numbers as the session's record holds them.
-    type Key = (String, String);
-    let named: BTreeMap<Key, (Key, Vec<Entry>)> = sessions
-        .values()
-        .flat_map(|s| {
-            s.subagents.iter().map(|sub| {
-                (
-                    (s.agent.clone(), sub.id.clone()),
-                    ((s.agent.clone(), s.id.clone()), sub.entries.clone()),
-                )
-            })
-        })
-        .collect();
-    // A subagent read now alone, whose session (not read now) holds other
-    // numbers for it than it has now, changed after that session was
-    // shared. The change cannot be put in that session's record without
-    // counting the rest twice: the session is partial.
-    let mut changed = BTreeSet::new();
-    for (subagent, (session, recorded)) in &named {
-        if !now_read.contains(subagent) || now_read.contains(session) {
-            continue;
-        }
-        if sessions.get(subagent).map(|s: &Shared| &s.entries) != Some(recorded) {
-            changed.insert(session.clone());
-        }
-    }
-    for key in changed {
-        if let Some(s) = sessions.get_mut(&key) {
-            s.limitations.insert(AFTER_SHARE.to_owned(), 1);
-            s.partial = true;
-        }
-    }
-    sessions.retain(|key, _| !named.contains_key(key));
-    let read_now = now_read
+    let new: Vec<Shared> = current
         .iter()
-        .filter(|k| sessions.contains_key(*k))
-        .count();
-    let kept = sessions.len() - read_now;
+        .filter(|s| latest.get(&(s.agent.clone(), s.id.clone())) != Some(*s))
+        .cloned()
+        .collect();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
@@ -240,12 +199,12 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
         shared_at: show(chrono::DateTime::from_timestamp(i64::try_from(now)?, 0).context("clock")?),
         entries_include_subagents: true,
         source_warnings,
-        sessions: sessions.into_values().collect(),
+        sessions: new,
     };
     let mut bytes = serde_json::to_vec_pretty(&record)?;
     bytes.push(b'\n');
 
-    let partial: Vec<&Shared> = record.sessions.iter().filter(|s| s.partial).collect();
+    let partial: Vec<&Shared> = current.iter().filter(|s| s.partial).collect();
     let finish = |code: i32| -> i32 {
         for s in &partial {
             eprintln!(
@@ -273,13 +232,50 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
     } else {
         4
     };
+    // Two copies of the ref that went apart are joined by a commit on both,
+    // whether or not it adds a session.
+    let nothing = record.sessions.is_empty() && parents.len() < 2;
     if asked.dry_run {
-        std::io::stdout().lock().write_all(&bytes)?;
-        eprintln!("vessa: dry run: nothing was written or pushed");
+        if nothing {
+            eprintln!("vessa: dry run: nothing new to share");
+        } else {
+            std::io::stdout().lock().write_all(&bytes)?;
+            eprintln!("vessa: dry run: nothing was written or pushed");
+        }
         return Ok(finish(code));
     }
-    if record.sessions.is_empty() {
-        println!("No session of this repository was found on this machine, so nothing was shared.");
+    if nothing {
+        // With --json, stdout holds a record written, and only that.
+        let say = |text: String| {
+            if asked.json {
+                eprintln!("vessa: {text}");
+            } else {
+                println!("{text}");
+            }
+        };
+        if current.is_empty() {
+            say(
+                "No session of this repository was found on this machine, so nothing was shared."
+                    .into(),
+            );
+        } else {
+            say(format!(
+                "Nothing new to share: {} of this repository {} as last shared.",
+                many(current.len(), "session"),
+                if current.len() == 1 { "is" } else { "are" },
+            ));
+        }
+        // A share this clone made and has not pushed yet is pushed now.
+        if let (true, Some(local)) = (asked.push, &local) {
+            if theirs.as_ref() != Some(local) && parents == [local.clone()] {
+                push(asked.remote, &mine, &tracked, local)?;
+                say(format!(
+                    "{mine} is at {}; pushed to {}.",
+                    short(local),
+                    clean(asked.remote)
+                ));
+            }
+        }
         return Ok(finish(code));
     }
     let commit = commit(&record, &bytes, &parents, now)?;
@@ -300,27 +296,26 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
     if asked.json {
         std::io::stdout().lock().write_all(&bytes)?;
     } else {
+        let written = record.sessions.len();
         println!(
-            "Shared {} of this repository as {} <{}>{}.",
-            many(record.sessions.len(), "session"),
+            "Shared {} of this repository as {} <{}>, new or changed; {} as last shared.",
+            many(written, "session"),
             clean(&record.person.name),
             clean(&record.person.email),
-            if kept == 0 {
-                String::new()
-            } else {
-                format!(": {read_now} read now, {kept} kept from an earlier share")
-            },
+            current.len().saturating_sub(written),
         );
-        println!(
-            "{mine} is at {}; {pushed}.",
-            &commit[..12.min(commit.len())]
-        );
+        println!("{mine} is at {}; {pushed}.", short(&commit));
     }
     Ok(finish(code))
 }
 
-/// One session with its subagents, as the record keeps it.
-fn shared(family: &model::Family, found: &mut Redactions) -> Result<Shared> {
+fn short(commit: &str) -> &str {
+    &commit[..12.min(commit.len())]
+}
+
+/// One session with its subagents, as the record keeps it; `repositories`
+/// is how many it touched.
+fn shared(family: &model::Family, repositories: usize, found: &mut Redactions) -> Result<Shared> {
     let main = family.main;
     let mut limitations = BTreeMap::new();
     for said in family.limitations() {
@@ -348,8 +343,9 @@ fn shared(family: &model::Family, found: &mut Redactions) -> Result<Shared> {
             .filter_map(|u| u.at.as_deref().and_then(time))
             .max()
             .map(show),
-        branch: main.branch.as_deref().map(|b| name(b, found)),
+        branch: main.branch.as_deref().map(|b| branch(b, found)),
         subagents,
+        repositories_touched: (repositories > 1).then_some(repositories),
         partial: !limitations.is_empty(),
         limitations,
         entries,
@@ -384,8 +380,50 @@ fn named_entries(entries: Vec<Entry>, found: &mut Redactions) -> Result<Vec<Entr
     Ok(by_name.into_values().collect())
 }
 
-/// A provider or branch name a transcript gives, as the record keeps it:
-/// scrubbed of secrets, and `[path]` when it reads as one.
+/// A branch name a transcript gives, as the record keeps it: as it is when
+/// it is a valid git branch name, scrubbed of secrets; else `[path]`.
+fn branch(text: &str, found: &mut Redactions) -> String {
+    if branch_name(text) {
+        found.text(text)
+    } else {
+        "[path]".into()
+    }
+}
+
+/// Whether `name` is a valid git branch name, by `git check-ref-format
+/// --branch`'s rules, and is not a path from the root, from home or from a
+/// dot.
+fn branch_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "HEAD"
+        && !name.starts_with(['-', '/', '~', '.'])
+        && !Path::new(name).is_absolute()
+        && ref_name(&format!("refs/heads/{name}"))
+}
+
+/// Git's rules for a full ref name (git-check-ref-format): no component
+/// starts with `.` or ends with `.lock`; no `..`, `@{`, `//` or `\`; no
+/// control character, space, `~`, `^`, `:`, `?`, `*` or `[`; it neither
+/// starts nor ends with `/`, does not end with `.`, and is not `@`.
+fn ref_name(name: &str) -> bool {
+    let forbidden = |c: char| {
+        c.is_ascii_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
+    };
+    name != "@"
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name.contains("//")
+        && !name.starts_with('/')
+        && !name.ends_with('/')
+        && !name.ends_with('.')
+        && !name.chars().any(forbidden)
+        && name
+            .split('/')
+            .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+/// A provider name a transcript gives, as the record keeps it: scrubbed of
+/// secrets, and `[path]` when it reads as one.
 fn name(text: &str, found: &mut Redactions) -> String {
     let text = found.text(text);
     if path_like(&text) {
@@ -452,8 +490,8 @@ const MODEL_FILES: [&str; 14] = [
 
 /// Whether `text` reads as a file path: it holds a separator (`/` or `\`),
 /// starts from home or a dot, is a file URL, or ends in an extension model
-/// weights are kept in. A name with a separator reads as a path, a branch
-/// such as `feat/team` too: from its text alone, it cannot be told from one.
+/// weights are kept in. The rule for provider and model names and session
+/// ids; a branch name has its own ([`branch_name`]).
 fn path_like(text: &str) -> bool {
     text.contains(['/', '\\'])
         || text.starts_with(['~', '.'])
@@ -583,16 +621,20 @@ fn path_from(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
 }
 
-/// `path` as the file system resolves it: the longest part of it that
-/// exists, canonicalized, then the rest as given. None for a relative path,
-/// and for one whose missing part climbs out with `..`, which cannot be
-/// placed.
+/// `path` as the file system resolves it, when it exists. One that no
+/// longer does is normalized by its words (`.` dropped, `..` taking away
+/// the name before it), then its longest part that exists is resolved and
+/// the rest kept as given. None for a relative path.
 fn canonical(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute() {
         return None;
     }
+    if let Ok(real) = path.canonicalize() {
+        return Some(real);
+    }
+    let normal = lexical(path);
     let mut missing = Vec::new();
-    let mut at = path;
+    let mut at = normal.as_path();
     loop {
         if let Ok(real) = at.canonicalize() {
             return Some(missing.into_iter().rev().fold(real, |p, name| p.join(name)));
@@ -602,6 +644,22 @@ fn canonical(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// `path` normalized by its words alone: `.` dropped, and `..` taking away
+/// the name before it (never past the root).
+fn lexical(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Whether the folder a session recorded is inside one of `roots`, the
 /// canonical worktree folders: compared as paths, by their parts, after
 /// canonicalizing it too. A session that recorded none belongs nowhere.
@@ -609,6 +667,100 @@ fn inside(cwd: &str, roots: &[PathBuf]) -> bool {
     !cwd.is_empty()
         && canonical(Path::new(cwd))
             .is_some_and(|cwd| roots.iter().any(|root| cwd.starts_with(root)))
+}
+
+/// Where the paths sessions touched are: each resolved once, and the
+/// repository each folder is in. On this machine only, to decide: no path
+/// is kept past the run, written, logged or printed.
+#[derive(Default)]
+struct Places {
+    resolved: HashMap<PathBuf, Option<PathBuf>>,
+    repository: HashMap<PathBuf, Option<PathBuf>>,
+}
+
+impl Places {
+    fn resolve(&mut self, path: &Path) -> Option<PathBuf> {
+        if let Some(known) = self.resolved.get(path) {
+            return known.clone();
+        }
+        let resolved = canonical(path);
+        self.resolved.insert(path.to_path_buf(), resolved.clone());
+        resolved
+    }
+
+    /// The paths a session and its subagents touched.
+    fn touched<'a>(family: &'a model::Family) -> impl Iterator<Item = &'a PathBuf> {
+        std::iter::once(family.main)
+            .chain(family.subagents.iter().copied())
+            .flat_map(|s| &s.touched)
+    }
+
+    /// Whether a session or its subagents named a file or folder inside one
+    /// of `roots` in a structured tool call.
+    fn touches(&mut self, family: &model::Family, roots: &[PathBuf]) -> bool {
+        Self::touched(family).any(|path| {
+            self.resolve(path)
+                .is_some_and(|path| roots.iter().any(|root| path.starts_with(root)))
+        })
+    }
+
+    /// How many repositories a session touched: the one its folder is in,
+    /// and those of the files and folders its tool calls name. The
+    /// worktrees of one clone are one repository.
+    fn repositories(&mut self, family: &model::Family) -> usize {
+        let cwd = (!family.main.cwd.is_empty()).then(|| PathBuf::from(&family.main.cwd));
+        let paths: Vec<PathBuf> = cwd
+            .into_iter()
+            .chain(Self::touched(family).cloned())
+            .collect();
+        let mut repositories = BTreeSet::new();
+        for path in paths {
+            if let Some(repository) = self.resolve(&path).and_then(|p| self.repository_of(&p)) {
+                repositories.insert(repository);
+            }
+        }
+        repositories.len()
+    }
+
+    /// The repository a resolved path is in, as its git common folder: the
+    /// nearest folder above it with a `.git`, followed to the folder every
+    /// worktree of that clone shares. None outside any.
+    fn repository_of(&mut self, path: &Path) -> Option<PathBuf> {
+        let mut visited = Vec::new();
+        let mut found = None;
+        for folder in path.ancestors() {
+            if let Some(known) = self.repository.get(folder) {
+                found = known.clone();
+                break;
+            }
+            visited.push(folder.to_path_buf());
+            if let Some(common) = common_dir(folder) {
+                found = Some(common);
+                break;
+            }
+        }
+        for folder in visited {
+            self.repository.insert(folder, found.clone());
+        }
+        found
+    }
+}
+
+/// The git folder a worktree's `.git` leads to, shared by every worktree of
+/// its clone: `.git` itself when a folder; else the folder its `gitdir:`
+/// names, followed by that folder's `commondir` when there is one.
+fn common_dir(folder: &Path) -> Option<PathBuf> {
+    let git = folder.join(".git");
+    let meta = std::fs::metadata(&git).ok()?;
+    if meta.is_dir() {
+        return git.canonicalize().ok();
+    }
+    let text = std::fs::read_to_string(&git).ok()?;
+    let gitdir = folder.join(text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim());
+    match std::fs::read_to_string(gitdir.join("commondir")) {
+        Ok(common) => gitdir.join(common.trim()).canonicalize().ok(),
+        Err(_) => gitdir.canonicalize().ok(),
+    }
 }
 
 // ---- git -----------------------------------------------------------------------
@@ -792,6 +944,31 @@ fn is_ancestor(ancestor: &str, descendant: &str) -> Result<bool> {
     }
 }
 
+/// Every commit reachable from `tips`, all parents of a join included, the
+/// most recent first (git's date order: a commit before the ones it
+/// follows, else by time), with its parents.
+fn graph(tips: &[String]) -> Result<Vec<(String, Vec<String>)>> {
+    if tips.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = vec!["rev-list", "--date-order", "--parents"];
+    args.extend(tips.iter().map(String::as_str));
+    Ok(run(&args)?
+        .lines()
+        .filter_map(|line| {
+            let mut ids = line.split(' ').map(str::to_owned);
+            Some((ids.next()?, ids.collect()))
+        })
+        .collect())
+}
+
+/// The shares in the history of `tips`, the most recent first.
+fn history(tips: &[String]) -> Result<Vec<(String, Result<Record, String>)>> {
+    let commits: Vec<String> = graph(tips)?.into_iter().map(|(c, _)| c).collect();
+    let read = records(&commits)?;
+    Ok(commits.into_iter().zip(read).collect())
+}
+
 /// The commits a new share follows: this clone's share, and the remote's
 /// as last fetched, each unless the other already holds it.
 fn parents(local: Option<&str>, remote: Option<&str>) -> Result<Vec<String>> {
@@ -932,12 +1109,31 @@ impl By {
     }
 }
 
-/// One person's latest share.
+/// What one person shared: the latest record of each session in their
+/// ref's history.
 struct Shares {
     key: String,
-    record: Record,
-    /// The share shown is the one the remote holds, as last fetched.
+    /// The person, as their most recent share names them.
+    person: Person,
+    /// When their most recent share was made, and its own warnings.
+    shared_at: String,
+    source_warnings: usize,
+    /// How many shares their history holds.
+    shares: usize,
+    sessions: Vec<Shared>,
+    /// Records of a subagent alone that a session of theirs names: counted
+    /// with that session, not apart.
+    folded: usize,
+    /// This clone's share of theirs is on the remote, as last fetched.
     pushed: bool,
+}
+
+impl Shares {
+    /// Their most recent share had warnings, or a session's latest record
+    /// is partial.
+    fn partial(&self) -> bool {
+        self.source_warnings > 0 || self.sessions.iter().any(|s| s.partial)
+    }
 }
 
 type SessionKey = (String, String, String);
@@ -949,6 +1145,8 @@ struct Group {
     people: BTreeSet<String>,
     sessions: BTreeSet<SessionKey>,
     partial: BTreeSet<SessionKey>,
+    /// Sessions that touched several repositories.
+    several: BTreeSet<SessionKey>,
     lines: BTreeMap<(String, String, String), (Entry, BTreeSet<SessionKey>)>,
 }
 
@@ -959,6 +1157,9 @@ impl Group {
         self.sessions.insert(id.clone());
         if s.partial {
             self.partial.insert(id.clone());
+        }
+        if s.repositories_touched.is_some() {
+            self.several.insert(id.clone());
         }
         let Some(e) = entry else {
             return Ok(());
@@ -1002,7 +1203,8 @@ impl Group {
             .collect();
         serde_json::json!({
             "key": self.key, "people": self.people.len(), "sessions": self.sessions.len(),
-            "partial_sessions": self.partial.len(), "entries": entries,
+            "partial_sessions": self.partial.len(),
+            "sessions_in_several_repositories": self.several.len(), "entries": entries,
         })
     }
 
@@ -1037,8 +1239,10 @@ fn week(text: &str) -> Option<String> {
     ))
 }
 
-/// What the team shared: each person's latest share, read from this
-/// clone's refs after fetching the remote's, unless `fetch` is false.
+/// What the team shared, read from this clone's refs after fetching the
+/// remote's, unless `fetch` is false: each person's history, this clone's
+/// copy and the remote's together, and in it the latest record of each
+/// session.
 pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32> {
     remote_name(remote)?;
     let probe = ["rev-parse", "--git-dir"];
@@ -1076,8 +1280,7 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
         }
     }
 
-    // Each person's share: this clone's, else the remote's; of two, the
-    // one that holds the other.
+    // Each person's ref: this clone's copy and the remote's.
     let mut keys: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
     for (reference, commit) in refs(&[SHARED, &tracked])? {
         if let Some(key) = reference.strip_prefix(SHARED) {
@@ -1086,42 +1289,98 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
             keys.entry(key.to_owned()).or_default().1 = Some(commit);
         }
     }
-    let mut chosen = Vec::new();
-    for (key, pair) in keys {
-        let (commit, pushed) = match pair {
-            (Some(l), None) => (l, false),
-            (None, Some(r)) => (r, true),
-            (Some(l), Some(r)) if l == r => (l, true),
-            (Some(l), Some(r)) if is_ancestor(&r, &l)? => (l, false),
-            (Some(l), Some(r)) if is_ancestor(&l, &r)? => (r, true),
-            (Some(l), Some(_)) => {
-                warnings.push(format!(
-                    "the share under {key} in this clone and the one on {remote} differ, and this clone's is shown; `vessa share` keeps the sessions of both"
-                ));
-                (l, false)
-            }
-            (None, None) => continue,
-        };
-        chosen.push((key, commit, pushed));
-    }
-    let commits: Vec<String> = chosen.iter().map(|(_, c, _)| c.clone()).collect();
+    // Every person's history, read with one git each for the commits and
+    // their records.
+    let tips: Vec<String> = keys
+        .values()
+        .flat_map(|(l, r)| l.iter().chain(r))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let order = graph(&tips)?;
+    let parents: HashMap<&str, &[String]> = order
+        .iter()
+        .map(|(c, p)| (c.as_str(), p.as_slice()))
+        .collect();
+    let commits: Vec<String> = order.iter().map(|(c, _)| c.clone()).collect();
+    let mut records: HashMap<&str, Result<Record, String>> = commits
+        .iter()
+        .map(String::as_str)
+        .zip(records(&commits)?)
+        .collect();
     let mut shares = Vec::new();
-    for ((key, commit, pushed), read) in chosen.into_iter().zip(records(&commits)?) {
-        match read {
-            Ok(record) => shares.push(Shares {
-                key,
-                record,
-                pushed,
-            }),
-            Err(why) => warnings.push(format!(
-                "the share under {key} (commit {commit}) cannot be read, so it is left out: {why}"
-            )),
+    for (key, (local, theirs)) in &keys {
+        // The commits this person's copies reach.
+        let mut reach: HashSet<&str> = HashSet::new();
+        let mut todo: Vec<&str> = local.iter().chain(theirs).map(String::as_str).collect();
+        while let Some(commit) = todo.pop() {
+            if reach.insert(commit) {
+                todo.extend(
+                    parents
+                        .get(commit)
+                        .into_iter()
+                        .flat_map(|p| p.iter().map(String::as_str)),
+                );
+            }
         }
+        let mut latest: BTreeMap<(String, String), Shared> = BTreeMap::new();
+        let mut newest: Option<(Person, String, usize)> = None;
+        let mut count = 0;
+        for commit in commits
+            .iter()
+            .map(String::as_str)
+            .filter(|c| reach.contains(c))
+        {
+            match records.remove(commit) {
+                Some(Ok(record)) => {
+                    count += 1;
+                    newest.get_or_insert((record.person, record.shared_at, record.source_warnings));
+                    for s in record.sessions {
+                        latest.entry((s.agent.clone(), s.id.clone())).or_insert(s);
+                    }
+                }
+                Some(Err(why)) => warnings.push(format!(
+                    "the share {commit} under {key} cannot be read, so it is left out: {why}"
+                )),
+                None => {}
+            }
+        }
+        let Some((person, shared_at, source_warnings)) = newest else {
+            continue;
+        };
+        // A subagent is counted with the session that names it: a record of
+        // it alone gives way, and is counted here.
+        let named: BTreeSet<(String, String)> = latest
+            .values()
+            .flat_map(|s| {
+                s.subagents
+                    .iter()
+                    .map(|sub| (s.agent.clone(), sub.id.clone()))
+            })
+            .collect();
+        let before = latest.len();
+        latest.retain(|key, _| !named.contains(key));
+        let pushed = match (local, theirs) {
+            (None, _) => true,
+            (Some(_), None) => false,
+            (Some(l), Some(r)) => l == r || is_ancestor(l, r)?,
+        };
+        shares.push(Shares {
+            key: key.clone(),
+            person,
+            shared_at,
+            source_warnings,
+            shares: count,
+            folded: before - latest.len(),
+            sessions: latest.into_values().collect(),
+            pushed,
+        });
     }
     shares.sort_by_key(|s| {
         (
-            s.record.person.name.to_lowercase(),
-            s.record.person.email.to_lowercase(),
+            s.person.name.to_lowercase(),
+            s.person.email.to_lowercase(),
             s.key.clone(),
         )
     });
@@ -1130,7 +1389,17 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
     let mut groups: Vec<Group> = Vec::new();
     let mut index: HashMap<Option<String>, usize> = HashMap::new();
     for share in &shares {
-        for s in &share.record.sessions {
+        if by.is_none() {
+            // A person with no session still has a block.
+            index.entry(Some(share.key.clone())).or_insert_with(|| {
+                groups.push(Group {
+                    key: Some(share.key.clone()),
+                    ..Group::default()
+                });
+                groups.len() - 1
+            });
+        }
+        for s in &share.sessions {
             let mut add = |key: Option<String>, entry: Option<&Entry>| -> Result<()> {
                 let at = *index.entry(key.clone()).or_insert_with(|| {
                     groups.push(Group {
@@ -1162,11 +1431,8 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
         // In key order, the unknown last; by person, in the people's order.
         groups.sort_by(|a, b| (a.key.is_none(), &a.key).cmp(&(b.key.is_none(), &b.key)));
     }
-    let unreadable = shares
-        .iter()
-        .filter(|s| s.record.source_warnings > 0)
-        .count();
-    let code = if total.partial.is_empty() && unreadable == 0 && warnings.is_empty() {
+    let partial_people = shares.iter().filter(|s| s.partial()).count();
+    let code = if partial_people == 0 && warnings.is_empty() {
         0
     } else {
         4
@@ -1177,9 +1443,10 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
             .iter()
             .map(|s| {
                 serde_json::json!({
-                    "key": s.key, "name": s.record.person.name, "email": s.record.person.email,
-                    "shared_at": s.record.shared_at, "pushed": s.pushed,
-                    "source_warnings": s.record.source_warnings, "sessions": s.record.sessions,
+                    "key": s.key, "name": s.person.name, "email": s.person.email,
+                    "shared_at": s.shared_at, "shares": s.shares, "pushed": s.pushed,
+                    "partial": s.partial(), "source_warnings": s.source_warnings,
+                    "subagents_counted_with_their_session": s.folded, "sessions": s.sessions,
                 })
             })
             .collect();
@@ -1200,9 +1467,8 @@ pub fn team(remote: &str, fetch: bool, by: Option<By>, json: bool) -> Result<i32
     }
     if code == 4 {
         eprintln!(
-            "vessa: partial team usage (exit 4): {} with limitations, {} made with unreadable sources, {}",
-            many(total.partial.len(), "session"),
-            many(unreadable, "share"),
+            "vessa: partial team usage (exit 4): {} partial, {}",
+            people(partial_people),
             many(warnings.len(), "warning"),
         );
     }
@@ -1240,19 +1506,38 @@ fn print_team(
     let about = |s: &Shares| {
         let mut said = format!(
             "{} <{}> · last shared {} · {}",
-            clean(&s.record.person.name),
-            clean(&s.record.person.email),
-            clean(&s.record.shared_at),
-            many(s.record.sessions.len(), "session"),
+            clean(&s.person.name),
+            clean(&s.person.email),
+            clean(&s.shared_at),
+            many(s.sessions.len(), "session"),
         );
-        let partial = s.record.sessions.iter().filter(|x| x.partial).count();
+        let partial = s.sessions.iter().filter(|x| x.partial).count();
         if partial > 0 {
             said += &format!(" · {partial} partial");
         }
-        if s.record.source_warnings > 0 {
+        let several = s
+            .sessions
+            .iter()
+            .filter(|x| x.repositories_touched.is_some())
+            .count();
+        if several > 0 {
+            said += &format!(" · {several} also in other repositories");
+        }
+        if s.folded > 0 {
             said += &format!(
-                " · {} unreadable when shared",
-                many(s.record.source_warnings, "source")
+                " · {} counted with {}",
+                many(s.folded, "subagent"),
+                if s.folded == 1 {
+                    "its session"
+                } else {
+                    "their sessions"
+                }
+            );
+        }
+        if s.source_warnings > 0 {
+            said += &format!(
+                " · partial: {} unreadable in the latest share",
+                many(s.source_warnings, "source")
             );
         }
         if !s.pushed {
@@ -1302,14 +1587,35 @@ fn print_team(
     }
     println!("{said}");
     total.print();
+    if !total.several.is_empty() {
+        println!();
+        println!(
+            "{} touched several repositories and {} in full in each; totals across repositories would count {} more than once:",
+            many(total.several.len(), "session"),
+            if total.several.len() == 1 { "counts" } else { "count" },
+            if total.several.len() == 1 { "it" } else { "them" },
+        );
+        for share in shares {
+            for s in &share.sessions {
+                if let Some(n) = s.repositories_touched {
+                    println!(
+                        "  {} · {} {} · {n} repositories",
+                        clean(&share.person.name),
+                        clean(&s.agent),
+                        clean(&s.id),
+                    );
+                }
+            }
+        }
+    }
     if !total.partial.is_empty() {
         println!();
         println!("Partial sessions: their numbers are incomplete");
         for share in shares {
-            for s in share.record.sessions.iter().filter(|s| s.partial) {
+            for s in share.sessions.iter().filter(|s| s.partial) {
                 println!(
                     "  {} · {} {} · {}",
-                    clean(&share.record.person.name),
+                    clean(&share.person.name),
                     clean(&s.agent),
                     clean(&s.id),
                     kinds(&s.limitations)
@@ -1433,6 +1739,56 @@ mod tests {
     }
 
     #[test]
+    fn a_branch_name_is_kept_when_git_would_take_it() {
+        // Each as `git check-ref-format --branch` judges it.
+        for valid in [
+            "main",
+            "feat/team",
+            "user/ada/x",
+            "release-1.2",
+            "fix_it",
+            "@",
+        ] {
+            assert!(branch_name(valid), "{valid}");
+        }
+        for invalid in [
+            "",
+            "HEAD",
+            "/abs/path",
+            "~/x",
+            ".hidden",
+            "feat/.x",
+            "a..b",
+            "a b",
+            "x.lock",
+            "a//b",
+            "-x",
+            "a:b",
+            r"C:\x",
+            r"a\b",
+            "x/",
+            "x.",
+            "a@{b",
+            "a*b",
+            "a[b",
+            "a?b",
+            "a^b",
+        ] {
+            assert!(!branch_name(invalid), "{invalid}");
+        }
+        let mut found = Redactions::default();
+        assert_eq!(branch("feat/team", &mut found), "feat/team");
+        assert_eq!(branch("~/secret", &mut found), "[path]");
+    }
+
+    #[test]
+    fn a_missing_path_is_normalized_by_its_words() {
+        assert_eq!(lexical(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(lexical(Path::new("/../a")), PathBuf::from("/a"));
+        assert_eq!(lexical(Path::new("/a/b/../../..")), PathBuf::from("/"));
+    }
+
+    #[test]
     fn an_id_with_a_separator_is_written_only_as_a_claude_subagent_s() {
         let session = |agent: &str, id: &str, parent: Option<&str>| model::Session {
             agent: agent.into(),
@@ -1448,6 +1804,7 @@ mod tests {
             entrypoint: None,
             originator: None,
             branch: None,
+            touched: Default::default(),
             launched: Vec::new(),
             counted_elsewhere: 0,
             synthetic: Default::default(),
