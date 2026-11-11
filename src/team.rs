@@ -28,6 +28,9 @@ const TEAM: &str = "vessa-team.v1";
 const FILE: &str = "usage.json";
 /// Where each person's share is kept, by key.
 const SHARED: &str = "refs/vessa/usage/";
+/// The limitation of a session whose subagent recorded usage after the
+/// session was shared, while the session's transcript is gone.
+const AFTER_SHARE: &str = "subagent_usage_after_share";
 
 /// What every fetch is given, so it fetches the refspec it names and
 /// nothing else, whatever this clone's settings say: no tags, no
@@ -111,13 +114,6 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
     }
     let mut source_warnings = report.warnings.len();
     let families = model::families(&report.sessions);
-    // Subagents read with their session: each is counted there, so a record
-    // of one alone, shared while its session's transcript was not read,
-    // gives way to its session's.
-    let absorbed: BTreeSet<(String, String)> = families
-        .iter()
-        .flat_map(|f| f.subagents.iter().map(|s| (s.agent.clone(), s.id.clone())))
-        .collect();
     // Each session read now.
     let mut current = Vec::new();
     let mut withheld = 0;
@@ -176,10 +172,7 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
     let mut sessions = BTreeMap::new();
     for record in earlier {
         for s in record.sessions {
-            let key = (s.agent.clone(), s.id.clone());
-            if !absorbed.contains(&key) {
-                sessions.insert(key, s);
-            }
+            sessions.insert((s.agent.clone(), s.id.clone()), s);
         }
     }
     let mut now_read = BTreeSet::new();
@@ -191,11 +184,43 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
     // A subagent is counted in the record of the session that names it. A
     // record of it alone, read now while its session's transcript is gone
     // or kept from a share this one follows, gives way to that session's.
-    let named: BTreeSet<(String, String)> = sessions
+    let named: BTreeMap<(String, String), (String, String)> = sessions
         .values()
-        .flat_map(|s| s.subagents.iter().map(|id| (s.agent.clone(), id.clone())))
+        .flat_map(|s| {
+            s.subagents.iter().map(|id| {
+                (
+                    (s.agent.clone(), id.clone()),
+                    (s.agent.clone(), s.id.clone()),
+                )
+            })
+        })
         .collect();
-    sessions.retain(|key, _| !named.contains(key));
+    // Usage a subagent read now recorded after its session, not read now,
+    // was shared cannot be added to that session's record without counting
+    // the rest twice: the session is partial. So it is when either time is
+    // unknown.
+    let mut grew = BTreeSet::new();
+    for (subagent, session) in &named {
+        if !now_read.contains(subagent) || now_read.contains(session) {
+            continue;
+        }
+        let latest = |key: &(String, String)| {
+            sessions
+                .get(key)
+                .and_then(|s: &Shared| s.ended_at.as_deref())
+                .and_then(time)
+        };
+        if !matches!((latest(subagent), latest(session)), (Some(a), Some(b)) if a <= b) {
+            grew.insert(session.clone());
+        }
+    }
+    for key in grew {
+        if let Some(s) = sessions.get_mut(&key) {
+            s.limitations.insert(AFTER_SHARE.to_owned(), 1);
+            s.partial = true;
+        }
+    }
+    sessions.retain(|key, _| !named.contains_key(key));
     let read_now = now_read
         .iter()
         .filter(|k| sessions.contains_key(*k))

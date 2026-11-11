@@ -1015,6 +1015,88 @@ fn shares_that_diverged_count_a_subagent_once() {
 }
 
 #[test]
+fn a_subagent_that_recorded_more_after_its_session_was_shared_makes_it_partial() {
+    let world = World::new("grew");
+    let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");
+    let folder = world.root.join("sessions");
+    let subagents = folder.join("main-1").join("subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    std::fs::write(
+        folder.join("main-1.jsonl"),
+        claude("main-1", &alice, None, 100),
+    )
+    .unwrap();
+    let helper = subagents.join("agent-helper.jsonl");
+    std::fs::write(&helper, subagent("main-1", "helper", &alice, 70)).unwrap();
+    let out = world.share(&alice, &folder, &["--no-push"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+
+    // The session's transcript goes; its subagent records a request more,
+    // after the share.
+    std::fs::remove_file(folder.join("main-1.jsonl")).unwrap();
+    let later = json!({"type":"assistant","uuid":"helper-a2","requestId":"req_helper2","sessionId":"main-1",
+        "agentId":"helper","isSidechain":true,"cwd":text(&alice),"timestamp":"2026-09-30T10:00:00Z",
+        "message":{"id":"msg_01helper2","role":"assistant","model":"demo-model","content":[],
+            "usage":{"input_tokens":30,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}});
+    std::fs::write(
+        &helper,
+        subagent("main-1", "helper", &alice, 70) + &format!("{later}\n"),
+    )
+    .unwrap();
+    let out = world.share(&alice, &folder, &["--json", "--no-push"]);
+    // Counting the subagent beside its session would count its first
+    // request twice; leaving the later one out leaves the session partial.
+    assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+    let v = record(&out);
+    assert_eq!(ids(&v), ["main-1"].map(String::from).into());
+    let s = &v["sessions"][0];
+    assert_eq!(s["entries"][0]["input_tokens"], 170);
+    assert_eq!(s["partial"], true);
+    assert_eq!(s["limitations"], json!({"subagent_usage_after_share": 1}));
+    // Shared again, the same.
+    let again = world.share(&alice, &folder, &["--json", "--no-push"]);
+    assert_eq!(record(&again)["sessions"], v["sessions"]);
+}
+
+#[test]
+fn a_subagent_shared_alone_stays_when_its_session_is_not_shared() {
+    let world = World::new("elsewhere");
+    let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");
+    let outside = world.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    let folder = world.root.join("sessions");
+    let subagents = folder.join("main-1").join("subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    std::fs::write(
+        subagents.join("agent-helper.jsonl"),
+        subagent("main-1", "helper", &alice, 70),
+    )
+    .unwrap();
+    std::fs::write(
+        folder.join("other-1.jsonl"),
+        claude("other-1", &alice, None, 5),
+    )
+    .unwrap();
+    let out = world.share(&alice, &folder, &["--no-push"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    // Its session appears, recorded outside this clone: it is not this
+    // repository's, so the subagent's record stays.
+    std::fs::write(
+        folder.join("main-1.jsonl"),
+        claude("main-1", &outside, None, 100),
+    )
+    .unwrap();
+    let out = world.share(&alice, &folder, &["--json", "--no-push"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = record(&out);
+    assert_eq!(
+        ids(&v),
+        ["main-1/helper", "other-1"].map(String::from).into()
+    );
+    assert_eq!(v["sessions"][0]["entries"][0]["input_tokens"], 70);
+}
+
+#[test]
 fn a_share_stays_partial_while_it_keeps_sessions_of_one_that_was() {
     let world = World::new("coverage");
     let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");

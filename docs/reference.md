@@ -964,6 +964,7 @@ A share is one `vessa-team-usage.v1` record for the person:
 | `copied_launch_records` | and another hold copies of each other's launch records |
 | `codex_cache_writes` | is a Codex session that recorded cache writes |
 | `messages_unreadable` | is an opencode session whose messages could not be read |
+| `subagent_usage_after_share` | has a subagent that recorded usage after the session was shared, read while the session's transcript was gone; that usage is not counted |
 | `other` | has another limitation |
 
 **Never in the record:** what a person or an agent wrote (prompts, replies,
@@ -1023,7 +1024,16 @@ it is counted there, and its own record goes. Whenever a session in the
 share names a subagent in `subagents`, a record of that subagent alone
 gives way to it: one read now while the session's transcript is gone, and
 one kept from a share this one follows, of this clone or of another. A
-subagent no session in the share names is shared alone.
+subagent no session in the share names is shared alone, also when its
+session is read but not shared (recorded outside the repository, or left
+out for its id).
+
+A subagent read alone may have recorded usage after its session, whose
+transcript is gone, was shared. That usage cannot be added to the
+session's record without counting the rest twice, so it is left out and
+the session is partial, with the limitation `subagent_usage_after_share`.
+So it is when the subagent's latest usage, or the session's `ended_at`, has
+no time.
 
 ### A push the remote refuses
 
