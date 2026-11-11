@@ -118,29 +118,23 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
         .iter()
         .flat_map(|f| f.subagents.iter().map(|s| (s.agent.clone(), s.id.clone())))
         .collect();
-    // Each session read now, with the session it is a subagent of when
-    // that one was not read.
+    // Each session read now.
     let mut current = Vec::new();
     let mut withheld = 0;
     for family in &families {
         if !inside(&family.main.cwd, &roots) {
             continue;
         }
-        // A session is known by its id. One that reads as a secret or a
-        // path cannot be written as it is, and any stand-in made from it
-        // would be its fingerprint: it is left out, and said.
-        let known_by = std::iter::once(family.main).chain(family.subagents.iter().copied());
-        if known_by
-            .map(|s| &s.id)
-            .any(|id| name(id, &mut Redactions::default()) != *id)
-        {
+        // A session is known by its id, and its subagents by theirs. One
+        // that reads as a secret or a path cannot be written as it is, and
+        // any stand-in made from it would be its fingerprint: the session
+        // is left out, and said.
+        let mut known_by = std::iter::once(family.main).chain(family.subagents.iter().copied());
+        if !known_by.all(writable_id) {
             withheld += 1;
             continue;
         }
-        current.push((
-            shared(family, &mut found)?,
-            family.main.subagent_of().map(str::to_owned),
-        ));
+        current.push(shared(family, &mut found)?);
     }
     if withheld > 0 {
         eprintln!(
@@ -189,22 +183,23 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
         }
     }
     let mut now_read = BTreeSet::new();
-    for (s, of) in current {
-        // A subagent whose session's transcript is gone, and whose session
-        // was shared with it: its usage is in that record already.
-        let counted = |session: String| {
-            sessions
-                .get(&(s.agent.clone(), session))
-                .is_some_and(|r: &Shared| r.subagents.contains(&s.id))
-        };
-        if of.is_some_and(counted) {
-            continue;
-        }
+    for s in current {
         let key = (s.agent.clone(), s.id.clone());
         now_read.insert(key.clone());
         sessions.insert(key, s);
     }
-    let read_now = now_read.len();
+    // A subagent is counted in the record of the session that names it. A
+    // record of it alone, read now while its session's transcript is gone
+    // or kept from a share this one follows, gives way to that session's.
+    let named: BTreeSet<(String, String)> = sessions
+        .values()
+        .flat_map(|s| s.subagents.iter().map(|id| (s.agent.clone(), id.clone())))
+        .collect();
+    sessions.retain(|key, _| !named.contains(key));
+    let read_now = now_read
+        .iter()
+        .filter(|k| sessions.contains_key(*k))
+        .count();
     let kept = sessions.len() - read_now;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
@@ -301,11 +296,30 @@ fn shared(family: &model::Family, found: &mut Redactions) -> Result<Shared> {
     for said in family.limitations() {
         *limitations.entry(kind(&said).to_owned()).or_insert(0) += 1;
     }
-    let mut entries = family.totals()?;
-    for entry in &mut entries {
-        entry.provider = name(&entry.provider, found);
-        entry.model = name(&entry.model, found);
+    // Names withheld alike are one entry.
+    let mut by_name: BTreeMap<(String, String), Entry> = BTreeMap::new();
+    for e in family.totals()? {
+        let provider = name(&e.provider, found);
+        let model = model_name(&e.provider, &e.model, found);
+        match by_name.entry((provider.clone(), model.clone())) {
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(Entry {
+                    provider,
+                    model,
+                    ..e
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut slot) => {
+                let total = slot.get_mut();
+                total.input_tokens = model::add(total.input_tokens, e.input_tokens)?;
+                total.output_tokens = model::add(total.output_tokens, e.output_tokens)?;
+                total.cache_read_tokens = model::add(total.cache_read_tokens, e.cache_read_tokens)?;
+                total.cache_write_tokens =
+                    model::add(total.cache_write_tokens, e.cache_write_tokens)?;
+            }
+        }
     }
+    let entries = by_name.into_values().collect();
     Ok(Shared {
         agent: main.agent.clone(),
         // Checked by `share`: the id is written as it is.
@@ -328,8 +342,8 @@ fn shared(family: &model::Family, found: &mut Redactions) -> Result<Shared> {
     })
 }
 
-/// A name a transcript gives (a session id, branch, provider or model), as
-/// the record keeps it: scrubbed of secrets, and never a path.
+/// A provider or branch name a transcript gives, as the record keeps it:
+/// scrubbed of secrets, and `[path]` when it reads as one.
 fn name(text: &str, found: &mut Redactions) -> String {
     let text = found.text(text);
     if path_like(&text) {
@@ -339,18 +353,72 @@ fn name(text: &str, found: &mut Redactions) -> String {
     }
 }
 
-/// Whether `text` reads as a file path: absolute, from home, relative to a
-/// dot, a Windows drive or share, or a file URL. A branch name or a model
-/// id such as `anthropic/claude` is none of these.
+/// A model name, as [`name`] keeps it, except the one shape with a
+/// separator that vessa itself writes: its provider, `/`, then the model,
+/// as in `anthropic/claude-…` under the provider `anthropic`.
+fn model_name(provider: &str, model: &str, found: &mut Redactions) -> String {
+    let model = found.text(model);
+    let composed = !path_like(provider)
+        && model
+            .strip_prefix(provider)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|rest| !rest.is_empty() && !path_like(rest));
+    if composed || !path_like(&model) {
+        model
+    } else {
+        "[path]".into()
+    }
+}
+
+/// Whether a session's id can be written as it is: the scrub leaves it
+/// alone, and it reads as no path, unless it is the one id with a separator
+/// vessa itself writes, a Claude Code subagent's `<session>/<agentId>`.
+fn writable_id(s: &model::Session) -> bool {
+    if Redactions::default().text(&s.id) != s.id {
+        return false;
+    }
+    if !path_like(&s.id) {
+        return true;
+    }
+    s.agent == "claude"
+        && s.subagent_of().is_some_and(|session| {
+            !path_like(session)
+                && s.id
+                    .strip_prefix(session)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .is_some_and(|agent| !agent.is_empty() && !path_like(agent))
+        })
+}
+
+/// File extensions local model weights are kept in.
+const MODEL_FILES: [&str; 14] = [
+    "gguf",
+    "ggml",
+    "ggjt",
+    "bin",
+    "safetensors",
+    "pt",
+    "pth",
+    "onnx",
+    "ckpt",
+    "h5",
+    "tflite",
+    "mlmodel",
+    "llamafile",
+    "pkl",
+];
+
+/// Whether `text` reads as a file path: it holds a separator (`/` or `\`),
+/// starts from home or a dot, is a file URL, or ends in an extension model
+/// weights are kept in. A name with a separator reads as a path, a branch
+/// such as `feat/team` too: from its text alone, it cannot be told from one.
 fn path_like(text: &str) -> bool {
-    let b = text.as_bytes();
-    text.starts_with(['/', '\\', '~', '.'])
-        || text.contains('\\')
+    text.contains(['/', '\\'])
+        || text.starts_with(['~', '.'])
         || text.starts_with("file:")
-        || (b.len() >= 3
-            && b[0].is_ascii_alphabetic()
-            && b[1] == b':'
-            && matches!(b[2], b'/' | b'\\'))
+        || text.rsplit_once('.').is_some_and(|(_, extension)| {
+            MODEL_FILES.contains(&extension.to_ascii_lowercase().as_str())
+        })
 }
 
 /// The kind of one of vessa's limitations. The record keeps the kind, a
@@ -1282,23 +1350,87 @@ mod tests {
             r"\\server\share",
             "file:///tmp/x",
             r"models\x",
+            "models/private.gguf",
+            "private.GGUF",
+            "weights.safetensors",
+            "feat/team",
+            "anthropic/claude-opus",
+            ".hidden",
         ] {
             assert!(path_like(path), "{path}");
         }
         for name in [
-            "anthropic/claude-opus",
             "demo-model",
-            "feat/team",
-            "zai/glm-4.6",
+            "glm-4.6",
+            "claude-3.5",
             "gpt-5.1-codex",
+            "llama3:8b",
             "HEAD",
+            "main",
         ] {
             assert!(!path_like(name), "{name}");
         }
         let mut found = Redactions::default();
         assert_eq!(name("/home/ada/x.gguf", &mut found), "[path]");
+        assert_eq!(name("feat/team", &mut found), "[path]");
         let key = ["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"].concat();
         assert_eq!(name(&key, &mut found), "[redacted]");
+        // A model keeps a separator only in vessa's own shape: its provider,
+        // then the model.
+        let model = |provider: &str, model: &str| model_name(provider, model, &mut found.clone());
+        assert_eq!(
+            model("anthropic", "anthropic/claude-opus"),
+            "anthropic/claude-opus"
+        );
+        assert_eq!(model("openrouter", "anthropic/claude-opus"), "[path]");
+        assert_eq!(model("anthropic", "anthropic/models/x"), "[path]");
+        assert_eq!(model("anthropic", "anthropic/x.gguf"), "[path]");
+        assert_eq!(model("anthropic", "anthropic/"), "[path]");
+        assert_eq!(model("a/b", "a/b/c"), "[path]");
+        assert_eq!(model("anthropic", "models/private.gguf"), "[path]");
+    }
+
+    #[test]
+    fn an_id_with_a_separator_is_written_only_as_a_claude_subagent_s() {
+        let session = |agent: &str, id: &str, parent: Option<&str>| model::Session {
+            agent: agent.into(),
+            id: id.into(),
+            parent: parent.map(str::to_owned),
+            started_at: None,
+            cwd: String::new(),
+            source: String::new(),
+            usage: Vec::new(),
+            limitations: Vec::new(),
+            ohjaa: Vec::new(),
+            work: Vec::new(),
+            entrypoint: None,
+            originator: None,
+            branch: None,
+            launched: Vec::new(),
+            counted_elsewhere: 0,
+            synthetic: Default::default(),
+            root: None,
+            subagent: false,
+            partly_sidechain: false,
+        };
+        assert!(writable_id(&session("claude", "s-1", None)));
+        assert!(writable_id(&session("claude", "s-1/agent-a", Some("s-1"))));
+        assert!(!writable_id(&session(
+            "claude",
+            "s-1/agent-a/b",
+            Some("s-1")
+        )));
+        assert!(!writable_id(&session("claude", "s-1/x.gguf", Some("s-1"))));
+        assert!(!writable_id(&session("claude", "drafts/plan", None)));
+        assert!(!writable_id(&session(
+            "claude",
+            "drafts/plan",
+            Some("other")
+        )));
+        assert!(!writable_id(&session("codex", "s-1/agent-a", Some("s-1"))));
+        assert!(!writable_id(&session("pi", r"notes\plan", None)));
+        let key = ["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"].concat();
+        assert!(!writable_id(&session("claude", &key, None)));
     }
 
     #[test]

@@ -323,10 +323,25 @@ fn the_record_holds_numbers_only() {
             "message":{"id":"msg_01privacy2","role":"assistant","model":"/Users/ada/secret-project/model.gguf",
                 "content":[{"type":"text","text":"Local answer."}],
                 "usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}),
+        // Local models named by a relative path, and by a Windows one.
+        json!({"type":"assistant","uuid":"p-a3","requestId":"req_privacy3","sessionId":id,"cwd":text(&cwd),
+            "timestamp":"2026-09-30T09:05:00Z","isSidechain":false,
+            "message":{"id":"msg_01privacy3","role":"assistant","model":"models/private.gguf","content":[],
+                "usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}),
+        json!({"type":"assistant","uuid":"p-a4","requestId":"req_privacy4","sessionId":id,"cwd":text(&cwd),
+            "timestamp":"2026-09-30T09:06:00Z","isSidechain":false,
+            "message":{"id":"msg_01privacy4","role":"assistant","model":r"weights\private-model","content":[],
+                "usage":{"input_tokens":4,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}),
+        // A model named in the provider/model shape vessa itself writes.
+        json!({"type":"assistant","uuid":"p-a5","requestId":"req_privacy5","sessionId":id,"cwd":text(&cwd),
+            "timestamp":"2026-09-30T09:07:00Z","isSidechain":false,
+            "message":{"id":"msg_01privacy5","role":"assistant","model":"anthropic/demo-opus","content":[],
+                "usage":{"input_tokens":8,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}),
     ];
     let session: String = lines.iter().map(|l| format!("{l}\n")).collect();
     // A Codex session beside it, which records its repository's address
-    // and commit.
+    // and commit; and two sessions whose ids are relative paths, which
+    // cannot be shared at all.
     let folder = world.sessions(
         "sessions",
         &[
@@ -334,6 +349,14 @@ fn the_record_holds_numbers_only() {
             (
                 "codex.jsonl",
                 codex("privacy-codex", &cwd, "feat/privacy", 500),
+            ),
+            (
+                "drafts.jsonl",
+                claude("drafts/private-plan.md", &cwd, None, 9),
+            ),
+            (
+                "windows.jsonl",
+                claude(r"sessions\private-plan", &cwd, None, 9),
             ),
         ],
     );
@@ -343,6 +366,8 @@ fn the_record_holds_numbers_only() {
     assert_eq!(dry.status.code(), Some(4), "{}", stderr(&dry));
     let shared = world.share(&alice, &folder, &["--no-push", "--json"]);
     assert_eq!(shared.status.code(), Some(4), "{}", stderr(&shared));
+    let said = stderr(&shared);
+    assert!(said.contains("2 sessions of this repository"), "{said}");
     let reference = world.usage_ref(&alice);
     let stored = world.record_at(&alice, &reference);
     // `--json` prints exactly the bytes written.
@@ -372,6 +397,14 @@ fn the_record_holds_numbers_only() {
         "p-u1",
         "model.gguf",
         "Local answer",
+        "private.gguf",
+        "models/",
+        "weights",
+        "private-model",
+        "private-plan",
+        "drafts",
+        // A branch with a separator reads as a path too.
+        "feat/privacy",
     ]
     .map(String::from)
     .into();
@@ -454,9 +487,9 @@ fn the_record_holds_numbers_only() {
         "ada@example.org",
         "claude",
         id,
-        "feat/privacy",
         "anthropic",
         "demo-model",
+        "anthropic/demo-opus",
         // The local model's file, withheld.
         "[path]",
         // vessa's limitation, by kind.
@@ -492,8 +525,21 @@ fn the_record_holds_numbers_only() {
             .unwrap()
     };
     assert_eq!(entry("demo-model")["input_tokens"], 120);
-    assert_eq!(entry("[path]")["input_tokens"], 1);
-    assert_eq!(s["branch"], "feat/privacy");
+    assert_eq!(entry("anthropic/demo-opus")["input_tokens"], 8);
+    // The three local models, withheld alike, are one entry.
+    assert_eq!(entry("[path]")["input_tokens"], 7);
+    assert_eq!(
+        s["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["model"] == "[path]")
+            .count(),
+        1
+    );
+    assert_eq!(s["branch"], "[path]");
+    assert_eq!(v["sessions"][1]["branch"], "[path]");
+    assert_eq!(v["source_warnings"], 1);
     assert_eq!(s["limitations"], json!({"subagent_not_read": 1}));
 
     // The commit holds the one file, and its message and author no path.
@@ -672,7 +718,8 @@ fn two_people_share_and_team_shows_both() {
     assert_eq!(
         groups,
         vec![
-            (json!("feat/parser"), json!(2)),
+            // A branch name with a separator is withheld as a path.
+            (json!("[path]"), json!(2)),
             (json!("main"), json!(1)),
             (json!("side"), json!(1)),
         ]
@@ -924,6 +971,47 @@ fn a_subagent_is_shared_once_with_or_without_its_session() {
         ids(&fourth),
         ["main-1", "main-1/late"].map(String::from).into()
     );
+}
+
+#[test]
+fn shares_that_diverged_count_a_subagent_once() {
+    let world = World::new("diverged");
+    let alice = world.clone("alice", "Ada Lovelace", "ada@example.org");
+    let again = world.clone("again", "Ada Lovelace", "ada@example.org");
+    // One clone read the session with its subagent, and shared first.
+    let first = world.root.join("sessions-alice");
+    let subagents = first.join("main-1").join("subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    std::fs::write(
+        first.join("main-1.jsonl"),
+        claude("main-1", &alice, None, 100),
+    )
+    .unwrap();
+    std::fs::write(
+        subagents.join("agent-helper.jsonl"),
+        subagent("main-1", "helper", &alice, 70),
+    )
+    .unwrap();
+    let out = world.share(&alice, &first, &[]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    // The other read the subagent alone; its push is refused.
+    let second = world.root.join("sessions-again");
+    let subagents = second.join("main-1").join("subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    std::fs::write(
+        subagents.join("agent-helper.jsonl"),
+        subagent("main-1", "helper", &again, 70),
+    )
+    .unwrap();
+    let out = world.share(&again, &second, &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    // Shared again, it follows both: the subagent is counted with its
+    // session, and not beside it as well.
+    let out = world.share(&again, &second, &["--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let v = record(&out);
+    assert_eq!(ids(&v), ["main-1"].map(String::from).into());
+    assert_eq!(v["sessions"][0]["entries"][0]["input_tokens"], 170);
 }
 
 #[test]

@@ -940,8 +940,9 @@ A share is one `vessa-team-usage.v1` record for the person:
   - `started_at`, and `ended_at`: the time of its latest usage record, its
     subagents' included. RFC 3339 in UTC; null when unknown;
   - `branch`: the first git branch its transcript records (Claude Code's
-    `gitBranch`, Codex's `git.branch`). Null when it records none, as pi and
-    opencode do not;
+    `gitBranch`, Codex's `git.branch`), or `[path]` for a name with a
+    separator, such as `feat/team` (see below). Null when it records none,
+    as pi and opencode do not;
   - `subagents`: the ids of the subagents its entries include, as `vessa
     status` names them;
   - `entries`: its tokens by provider and model, as `vessa usage` counts
@@ -969,14 +970,27 @@ A share is one `vessa-team-usage.v1` record for the person:
 thinking, tool input and output, commit messages, summaries), any file path,
 absolute or relative, the machine's name, and prices or costs. A
 limitation's own words are not kept, since they quote record ids, other
-sessions' ids and names: only its kind is. A branch, provider or model name
-is scrubbed by the rules under [Redaction](#redaction), and one that reads
-as a path (from the root, from home, from a dot, a Windows drive or share, a
-file URL, or with a backslash) is written `[path]`. A session is known by
-its id, so a session whose id the scrub would change, or that reads as a
-path, is not shared at all: any stand-in made from it would be its
-fingerprint. `share` says how many were left out, and counts it in
-`source_warnings`.
+sessions' ids and names: only its kind is.
+
+A branch, provider or model name is scrubbed by the rules under
+[Redaction](#redaction), and one that reads as a path is written `[path]`.
+A name reads as a path when it holds a separator (`/` or `\`), starts with
+`~` or a dot, is a file URL, or ends in an extension model weights are kept
+in (`.gguf`, `.ggml`, `.ggjt`, `.bin`, `.safetensors`, `.pt`, `.pth`,
+`.onnx`, `.ckpt`, `.h5`, `.tflite`, `.mlmodel`, `.llamafile`, `.pkl`). From
+its text alone a name cannot be told from a relative path, so a branch such
+as `feat/team` is written `[path]` too, and `team --by branch` groups such
+branches together. Names withheld alike in one session are one entry. A
+separator is kept only in the one model shape vessa itself writes: the
+entry's own provider, `/`, then the model (`anthropic/claude-…` under the
+provider `anthropic`).
+
+A session is known by its id, and its subagents by theirs. A session is not
+shared at all when its id or a subagent's id would be changed by the scrub
+or reads as a path: any stand-in made from it would be its fingerprint. The
+one id with a separator that is written as it is, is the one vessa writes
+for a Claude Code subagent, `<session>/<agentId>`. `share` says how many
+sessions were left out, and counts it in `source_warnings`.
 
 `--dry-run` prints the record that would be written, and changes nothing.
 `--json` prints the record that was written, byte for byte.
@@ -1005,10 +1019,11 @@ session of the repository is found, nothing is written.
 
 A subagent is shared once. Read without its session's transcript, it is
 shared as a session of its own, under its own id. Once its session is read,
-it is counted there, and its own record goes. A subagent whose session's
-transcript is gone is not shared beside that session's record when the
-record names it in `subagents`: its usage is there. One the record does not
-name is shared alone.
+it is counted there, and its own record goes. Whenever a session in the
+share names a subagent in `subagents`, a record of that subagent alone
+gives way to it: one read now while the session's transcript is gone, and
+one kept from a share this one follows, of this clone or of another. A
+subagent no session in the share names is shared alone.
 
 ### A push the remote refuses
 
