@@ -617,6 +617,21 @@ fn a_subagent_active_since_counts_with_its_session_however_old() {
                 ),
             ),
             ("rollout-codex-helper.jsonl", codex_sub),
+            // A subagent whose session's transcript is nowhere: that session's
+            // messages are unknown.
+            (
+                "lost-main/subagents/agent-orphan.jsonl",
+                [
+                    json!({"isSidechain":true,"agentId":"orphan","type":"user","uuid":"o1","sessionId":"lost-main",
+                        "cwd":text(&widget),"timestamp":at("10:50:00"),"message":{"role":"user","content":"Look around."}}),
+                    json!({"isSidechain":true,"agentId":"orphan","type":"assistant","uuid":"o2","requestId":"req_o2",
+                        "sessionId":"lost-main","cwd":text(&widget),"timestamp":at("10:51:00"),
+                        "message":{"id":"msg_01o2","role":"assistant","model":"demo-model","content":[{"type":"text","text":"Done."}],
+                            "usage":{"input_tokens":1,"output_tokens":1}}}),
+                ]
+                .map(|v| v.to_string() + "\n")
+                .concat(),
+            ),
         ],
     );
     written_at(&folder.join("claude-main.jsonl"), "09:59:00");
@@ -650,6 +665,7 @@ fn a_subagent_active_since_counts_with_its_session_however_old() {
             "Agent-Session: claude claude-main (0 messages, 2026-10-01 10:20–10:21 UTC)",
             "Agent-Session: codex codex-main (0 messages, 2026-10-01 10:30–10:31 UTC)",
             "Agent-Session: opencode ses_main (0 messages, 2026-10-01 10:40 UTC)",
+            "Agent-Session: claude lost-main (at least 0 messages, 2026-10-01 10:50–10:51 UTC)",
         ],
         "{}",
         stderr(&out)
@@ -796,6 +812,17 @@ fn a_squash_carries_the_pointers_of_the_commits_it_squashes() {
     let (message, out) = world.prepare(&widget, &folder, &squash, &["squash"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(message.starts_with(&squash), "{message}");
+    assert_eq!(
+        trailers(&message),
+        [
+            format!("Agent-Session: {pointed}").as_str(),
+            "Agent-Session: claude now (1 message, 2026-10-01 10:40 UTC)"
+        ]
+    );
+    // Concluded with `git commit -m`, git says the message is the person's;
+    // the squash is still the squash, as its SQUASH_MSG says.
+    let (message, out) = world.prepare(&widget, &folder, "Squash the side branch.\n", &["message"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert_eq!(
         trailers(&message),
         [

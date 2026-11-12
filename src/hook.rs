@@ -121,10 +121,10 @@ pub fn prepare_commit_msg(file: &Path, source: Option<&str>, paths: Vec<PathBuf>
     }
     let started = Instant::now();
     let (sent, received) = std::sync::mpsc::channel();
-    let (path, from) = (file.to_path_buf(), source.map(str::to_owned));
+    let path = file.to_path_buf();
     // Read apart, so a slow read can be left behind: the commit goes on.
     std::thread::spawn(move || {
-        let _ = sent.send(pointers(&path, from.as_deref(), &paths));
+        let _ = sent.send(pointers(&path, &paths));
     });
     let found = match received.recv_timeout(BUDGET) {
         Ok(Ok(found)) => found,
@@ -267,7 +267,7 @@ fn scissors(line: &str) -> bool {
 }
 
 /// The pointers a commit's message `file` lacks.
-fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Found> {
+fn pointers(file: &Path, paths: &[PathBuf]) -> Result<Found> {
     let message = std::fs::read(file)
         .with_context(|| format!("cannot read the message {}", file.display()))?;
     let message = String::from_utf8(message).context("the message is not UTF-8")?;
@@ -320,10 +320,17 @@ fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Foun
         None => now()? - chrono::TimeDelta::seconds(RECENT),
     };
     let mut named = named_in(&message);
-    if source == Some("squash") {
-        // A squash holds the messages of the commits it squashes, indented,
-        // under `commit <sha>` lines: their pointers become its own.
-        let squashed: Vec<&str> = message
+    // `git merge --squash` lists the commits it squashes in SQUASH_MSG,
+    // each under a `commit <sha>` line, and their pointers become the
+    // squash's own: whatever git says the message is, as a squash concluded
+    // with `-m` is still one.
+    let squash = match std::fs::read_to_string(git_dir.join("SQUASH_MSG")) {
+        Ok(listed) => Some(listed),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => bail!("cannot read SQUASH_MSG: {error}"),
+    };
+    if let Some(listed) = &squash {
+        let squashed: Vec<&str> = listed
             .lines()
             .filter_map(|line| line.strip_prefix("commit "))
             .filter(|sha| sha.len() >= 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
@@ -421,7 +428,9 @@ fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Foun
         .collect();
     let mut withheld = 0;
     for (main, members, mut span) in chosen {
-        let (mut messages, mut partial) = (0, false);
+        // A session read only by its subagent: what was typed in it is
+        // unknown.
+        let (mut messages, mut partial) = (0, main.subagent_of().is_some());
         for s in &members {
             let typed = said.get(&(s.agent.clone(), s.id.clone()));
             if let Some((first, last)) = typed.and_then(|t| t.1) {

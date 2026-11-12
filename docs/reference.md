@@ -789,7 +789,8 @@ Agent-Session: claude 8f3fa77a-5e7d-4a63-a519-d62bbb9a6b1d (3 messages, 2026-11-
   headless turns are not a person's, and a toimija launch prompt counts by
   its task. `at least 3 messages` when a transcript holds a record vessa
   could not read, a message with no time, or a transcript that could not
-  be read, so more may have been said. A session that worked with
+  be read, or when only a subagent's transcript was found and not its
+  session's, so more may have been said. A session that worked with
   no one typing, such as `claude -p`, has `0 messages`;
 - when it was active after the parent, to the minute, in UTC: its first and
   last record then.
@@ -829,7 +830,7 @@ The parent's time is HEAD's commit time, with these exceptions:
 | --- | --- |
 | The first of a repository | It has no parent: sessions active in the last 24 hours. |
 | A merge | After the newest of the commits it joins, whether git writes its message or `git commit -m` concludes it (`MERGE_HEAD` says it is one). The merged commits name their own sessions; the merge, those active after all of them, as in resolving a conflict. |
-| `git merge --squash` | The trailers of the commits it squashes, as git reads them, each as it was, then the sessions active after HEAD. |
+| `git merge --squash` | The trailers of the commits it squashes (as `SQUASH_MSG` lists them, however the squash is concluded), as git reads them, each as it was, then the sessions active after HEAD. |
 | An amend | git does not tell the hook it is one: after HEAD's time. The message's own pointers stay, unless `-m` replaces the message. |
 | A rebase, cherry-pick or `git am` | None added: the replayed commit keeps the pointers its message carries. A squash in a rebase keeps them as text in the message; a fixup drops the folded message, and its pointers with it. |
 | `git commit` without `-m` or `-F`, or with a template, or with a message of no words (`-m ""`) | None added, and said: git aborts a commit left empty, or left as its template, only while it is, and a pointer would make it neither. Commit with words, given with `-m` or `-F`, to have them. |
