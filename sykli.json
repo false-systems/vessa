@@ -26,6 +26,7 @@
         "install.sh",
         "installer/test.sh",
         "rust-toolchain.toml",
+        "src/hook.rs",
         "src/import.rs",
         "src/main.rs",
         "src/metrics.rs",
@@ -36,6 +37,7 @@
         "src/team.rs",
         "src/work.rs",
         "tests/cli.rs",
+        "tests/hook.rs",
         "tests/instructions.rs",
         "tests/support/mod.rs",
         "tests/team.rs"
@@ -73,6 +75,7 @@
         "install.sh",
         "installer/test.sh",
         "rust-toolchain.toml",
+        "src/hook.rs",
         "src/import.rs",
         "src/main.rs",
         "src/metrics.rs",
@@ -83,6 +86,7 @@
         "src/team.rs",
         "src/work.rs",
         "tests/cli.rs",
+        "tests/hook.rs",
         "tests/instructions.rs",
         "tests/support/mod.rs",
         "tests/team.rs"
@@ -121,6 +125,7 @@
         "install.sh",
         "installer/test.sh",
         "rust-toolchain.toml",
+        "src/hook.rs",
         "src/import.rs",
         "src/main.rs",
         "src/metrics.rs",
@@ -131,6 +136,7 @@
         "src/team.rs",
         "src/work.rs",
         "tests/cli.rs",
+        "tests/hook.rs",
         "tests/instructions.rs",
         "tests/support/mod.rs",
         "tests/team.rs"

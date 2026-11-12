@@ -25,6 +25,7 @@ Contents:
 - [Messages](#messages)
 - [Redaction](#redaction)
 - [What counts as a person's message](#what-counts-as-a-persons-message)
+- [Commit pointers](#commit-pointers)
 - [With a team](#with-a-team)
 - [Privacy](#privacy)
 - [Limits](#limits)
@@ -40,7 +41,9 @@ Contents:
 | `vessa stats` | Usage by calendar period, in UTC. `--period day\|week\|month\|year`; the default is `month`. |
 | `vessa report --output FILE` | Writes a standalone, private HTML report. Refuses to overwrite. |
 | `vessa receipt` | Emits one session's usage as an `agent-usage.v1` receipt. |
-| `vessa messages` | Lists the messages people typed, each with the agent reply it follows. `--since`, `--raw`. |
+| `vessa messages` | Lists the messages people typed, each with the agent reply it follows. `--since`, `--raw`, `--commit REV`. |
+| `vessa hook install` | Writes a `prepare-commit-msg` hook into this clone: each commit then points to the agent sessions that made it. See [Commit pointers](#commit-pointers). |
+| `vessa hook prepare-commit-msg FILE [SOURCE [SHA]]` | What that hook runs: adds an `Agent-Session` trailer per session. Never stops a commit. |
 | `vessa claude-statusline` | Renders Claude Code's status-line JSON from stdin. |
 | `vessa share` | Shares your usage in this repository with its team: one record of numbers, committed under `refs/vessa/usage/` and pushed. `--dry-run`, `--no-push`, `--remote`. |
 | `vessa team` | What the team shared: each person's latest share, and a team total. `--by agent\|model\|week\|branch`, `--no-fetch`, `--remote`. |
@@ -526,13 +529,16 @@ nothing: no cache, no database. Text goes only to stdout.
 vessa messages --since 7d
 vessa messages --since 2026-10-01 --agent codex --json
 vessa messages --session ID --json
+vessa messages --commit HEAD
 ```
 
 `--since` takes RFC 3339, a UTC date (`YYYY-MM-DD`) or an age (`7d`, `12h`).
 The boundary is exclusive: only messages after that time are listed. A
 reader can pass the time of the last message it handled and not get that
 message again. `--agent` and `--session` select as elsewhere; a Claude Code
-subagent's own id selects it alone.
+subagent's own id selects it alone. `--commit REV` selects the sessions a
+commit's `Agent-Session` trailers name, in that commit's window (see
+[Commit pointers](#commit-pointers)).
 
 With `--json` it emits `vessa-messages.v1`: one JSON document with one
 message per line. Each message is written as soon as its transcript is read,
@@ -739,6 +745,132 @@ The briefing in a launch prompt starts in one of two ways:
   `Sessions in the other worktrees of this clone at launch`,
   `System perimeter (derived by ohjaa at launch; …`. In this case a task
   that contains a blank line followed by one of those openings ends early.
+
+## Commit pointers
+
+A commit can point to the agent sessions that made it, and from there to
+what people asked in them. Only the pointers go into the commit, and so to
+wherever it is pushed. The words stay on this machine, where
+`vessa messages --commit` lists them.
+
+```sh
+vessa hook install                 # once per clone
+git commit -m "Fix the parser"     # the commit now names its sessions
+vessa messages --commit HEAD       # what people typed in them, for this commit
+```
+
+### The hook
+
+`vessa hook install` writes `prepare-commit-msg` into the clone's common git
+folder (`git rev-parse --git-common-dir`), so every worktree of the clone
+has it. It is three lines that run `vessa hook prepare-commit-msg "$@"`.
+Run again, it says the hook is unchanged. It refuses, and says why, when
+another `prepare-commit-msg` is there, which it leaves as it is, and when
+`core.hooksPath` sends git elsewhere. To keep a hook of your own, call
+`vessa hook prepare-commit-msg "$@"` from it.
+
+### The trailer
+
+The hook adds one trailer for each agent session of this clone that was
+active after the commit's parent:
+
+```text
+Agent-Session: claude 8f3fa77a-5e7d-4a63-a519-d62bbb9a6b1d (3 messages, 2026-11-12 11:02–11:40 UTC)
+```
+
+- the agent: `claude`, `codex`, `pi` or `opencode`;
+- the agent's own session id. A subagent counts with its session, which
+  the trailer names;
+- how many messages people typed in it, its subagents included, after the
+  parent, by the rules of [What counts as a person's
+  message](#what-counts-as-a-persons-message): harness, tool, subagent and
+  headless turns are not a person's, and a toimija launch prompt counts by
+  its task. `at least 3 messages` when a transcript holds a record vessa
+  could not read, so more may have been said. A session that worked with
+  no one typing, such as `claude -p`, has `0 messages`;
+- when it was active after the parent, to the minute, in UTC: its first and
+  last record then.
+
+**Never in the trailer:** what anyone typed or an agent replied, a path, a
+user name or the machine's name. A session whose id reads as a secret or a
+path, by the rules `share` applies to ids, gets no trailer; the hook says
+how many on stderr.
+
+### Which sessions
+
+A session belongs to the clone by the rule `share` uses (see [Which
+sessions are shared](#which-sessions-are-shared)): a folder it or a subagent
+recorded is inside one of the clone's worktrees, or a structured tool call
+names a file there. Free text never places one. It was active when it holds
+a record, or an opencode message, dated after the parent's commit time.
+
+Only transcripts, and opencode stores, last written after that time are
+opened; the rest are only looked at. `--input` reads other places than the
+agents' own folders, as elsewhere. A source that cannot be read is said on
+stderr: the commit may then miss a pointer, and the hook does not pretend
+otherwise.
+
+### What git says the commit is
+
+The parent's time is HEAD's commit time, with these exceptions:
+
+| Commit | Window and pointers |
+| --- | --- |
+| The first of a repository | It has no parent: sessions active in the last 24 hours. |
+| A merge | After the newest of the commits it joins. The merged commits name their own sessions; the merge, those active after all of them, as in resolving a conflict. |
+| `git merge --squash` | The trailers of the commits it squashes, as git reads them, each as it was, then the sessions active after HEAD. |
+| An amend | git does not tell the hook it is one: after HEAD's time. The message's own pointers stay, unless `-m` replaces the message. |
+| A rebase, cherry-pick or `git am` | None added: the replayed commit keeps the pointers its message carries. A squash in a rebase keeps them as text in the message; a fixup drops the folded message, and its pointers with it. |
+| `git commit` without `-m` or `-F`, or with a template | None added, and said: git aborts a commit left empty, or left as its template, only while it is, and a pointer would make it neither. Commit with `-m` or `-F` to have them. |
+
+A session already named on an `Agent-Session` line anywhere in the message
+(down to the diff `git commit -v` shows) is not named again, so running the
+hook twice, an amend or a reused message adds nothing twice. The hook adds
+the trailers with `git interpret-trailers`, which puts them where git keeps
+trailers. Where a message the person writes in the editor holds them, the
+person sees them before the commit is made; to abort that commit, delete
+them too.
+
+### Never in the way
+
+The hook never stops or holds up a commit. On any error it adds nothing,
+says why in one line on stderr, and exits 0. It gives up after 3 seconds
+and says so. The hook script ends in `|| true`, so a commit goes on even
+where `vessa` is not on `PATH`. It uses no network.
+
+How long it takes depends on how many session files were written since the
+parent. On one machine with about 1,100 transcripts, it took 0.1 seconds with 13
+written since the parent, and under 0.7 seconds with 409, read in parallel.
+
+### `vessa messages --commit REV`
+
+`messages --commit REV` reads the commit's `Agent-Session` trailers and
+lists, for each session they name, the messages people typed in it after
+the commit's parent and up to the commit, each with the reply it follows,
+scrubbed as `messages` always is. The window is the hook's: after the
+newest parent's commit time (a first commit's, less 24 hours), up to the
+commit's own, inclusive. A commit that names no session lists none.
+`--since`, `--session` and `--agent` do not apply.
+
+A session that is not among the sessions read on this machine, such as a
+teammate's, is said to be, never shown as having no messages: a warning
+on stderr, `"found": false`, and exit 4.
+
+A rebase, cherry-pick or squash gives a commit a new time and parent, so
+its window moves with it; its trailers still say what was counted when it
+was made, and `vessa messages --session ID` lists a session whole.
+
+With `--json`, the `vessa-messages.v1` document adds:
+
+- `commit`: the commit's full `id`; `after` and `until`, the window; and
+  `sessions`, each session its trailers name: `agent`, `id`, its `trailer`
+  as written (scrubbed), `found` and how many `messages` it and its
+  subagents gave here;
+- in `coverage`, `until`, and `later`: the messages after the commit.
+  `user_turns` is then `human`, every count in `excluded`, `earlier`,
+  `later` and `undated`.
+
+Neither appears without `--commit`.
 
 ## With a team
 
@@ -1033,8 +1165,11 @@ credentials. Every other command works offline.
 ## Privacy
 
 - vessa reads local files and writes only where you tell it to: stdout, the
-  `--output` file of `report`, and, for `share`, its record under this
-  repository's `refs/vessa/usage/`.
+  `--output` file of `report`, for `share` its record under this
+  repository's `refs/vessa/usage/`, for `hook install` the hook, and for
+  the hook the `Agent-Session` trailers in the message git gives it.
+- A commit holds pointers only: an agent, a session id, a count and a time
+  (see [Commit pointers](#commit-pointers)).
 - Only `messages` prints conversation text, and it redacts secret-looking
   tokens unless `--raw` is given.
 - Text from transcripts that a command prints for a terminal (the status

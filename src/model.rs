@@ -404,6 +404,10 @@ pub struct Conversation {
     pub headless: bool,
     /// Its messages listed.
     pub messages: usize,
+    /// Its transcript has limitations, so more may have been said than
+    /// `messages` counts.
+    #[serde(skip)]
+    pub limited: bool,
 }
 
 /// What `vessa messages` read, and why each user turn it did not list is
@@ -424,9 +428,16 @@ pub struct Coverage {
     /// User turns that are no person's message, by rule.
     pub excluded: BTreeMap<&'static str, usize>,
     pub since: Option<String>,
+    /// The window's end, inclusive: a commit's time, with `--commit`. Not
+    /// written otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
     /// Messages from `since` or before.
     pub earlier: usize,
-    /// Messages with no time, which `since` cannot place.
+    /// Messages after `until`; written only with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub later: Option<usize>,
+    /// Messages with no time, which `since` or `until` cannot place.
     pub undated: usize,
     /// Sources Vessa knows of and does not read.
     pub gaps: Vec<String>,

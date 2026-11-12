@@ -111,11 +111,7 @@ pub struct Share<'a> {
 /// changed since their latest record, as one commit, pushed.
 pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Result<i32> {
     remote_name(asked.remote)?;
-    let roots: Vec<PathBuf> = worktrees()?.iter().filter_map(|w| canonical(w)).collect();
-    ensure!(
-        !roots.is_empty(),
-        "git lists no worktree of this clone, so no session can be placed in it"
-    );
+    let mut here = Here::clone()?;
     let person = person()?;
     let key = key(&person.email)?;
     // Every session is read, as `vessa usage` reads them, so each is counted
@@ -127,14 +123,12 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
         eprintln!("vessa: {}", clean(warning));
     }
     let mut source_warnings = report.warnings.len();
-    let mut places = Places::default();
     let mut current = Vec::new();
     let (mut by_folder, mut by_files, mut withheld) = (0, 0, 0);
     for family in model::families(&report.sessions) {
-        let folder = inside(&family.main.cwd, &roots);
-        if !folder && !places.touches(&family, &roots) {
+        let Some(placed) = here.placed(&family) else {
             continue;
-        }
+        };
         // A session is known by its id, and its subagents by theirs. One
         // that reads as a secret or a path cannot be written as it is, and
         // any stand-in made from it would be its fingerprint: the session
@@ -144,12 +138,11 @@ pub fn share(paths: &[PathBuf], not_installed: Vec<String>, asked: Share) -> Res
             withheld += 1;
             continue;
         }
-        let repositories = places.repositories(&family);
+        let repositories = here.places.repositories(&family);
         current.push(shared(&family, repositories, &mut found)?);
-        if folder {
-            by_folder += 1;
-        } else {
-            by_files += 1;
+        match placed {
+            Placed::Folder => by_folder += 1,
+            Placed::Files => by_files += 1,
         }
     }
     eprintln!(
@@ -457,15 +450,21 @@ fn model_name(provider: &str, model: &str, found: &mut Redactions) -> String {
     }
 }
 
-/// Whether a session's id can be written as it is: the scrub leaves it
-/// alone, and it reads as no path, unless it is the one id with a separator
-/// vessa itself writes, a Claude Code subagent's `<session>/<agentId>`.
+/// Whether an id can be written as it is: the scrub leaves it alone, and it
+/// reads as no path.
+pub(crate) fn plain_id(id: &str) -> bool {
+    Redactions::default().text(id) == id && !path_like(id)
+}
+
+/// Whether a session's id can be written as it is: [`plain_id`], unless it
+/// is the one id with a separator vessa itself writes, a Claude Code
+/// subagent's `<session>/<agentId>`.
 fn writable_id(s: &model::Session) -> bool {
+    if plain_id(&s.id) {
+        return true;
+    }
     if Redactions::default().text(&s.id) != s.id {
         return false;
-    }
-    if !path_like(&s.id) {
-        return true;
     }
     s.agent == "claude"
         && s.subagent_of().is_some_and(|session| {
@@ -676,6 +675,51 @@ fn inside(cwd: &str, roots: &[PathBuf]) -> bool {
             .is_some_and(|cwd| roots.iter().any(|root| cwd.starts_with(root)))
 }
 
+/// The clone vessa runs in, and the rule that places a session in it, which
+/// `share` and the commit hook both use: a session, with its subagents,
+/// belongs to the clone by the folder it recorded, or by the files and
+/// folders its structured tool calls name, inside one of its worktrees.
+pub(crate) struct Here {
+    /// The canonical top folders of the clone's worktrees.
+    roots: Vec<PathBuf>,
+    places: Places,
+}
+
+/// How a session belongs to the clone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placed {
+    /// The folder it recorded is inside a worktree.
+    Folder,
+    /// It recorded none inside, but named a file or folder inside one.
+    Files,
+}
+
+impl Here {
+    /// The clone of the folder vessa runs in; an error outside one.
+    pub(crate) fn clone() -> Result<Self> {
+        let roots: Vec<PathBuf> = worktrees()?.iter().filter_map(|w| canonical(w)).collect();
+        ensure!(
+            !roots.is_empty(),
+            "git lists no worktree of this clone, so no session can be placed in it"
+        );
+        Ok(Here {
+            roots,
+            places: Places::default(),
+        })
+    }
+
+    /// How a session with its subagents belongs to this clone, if it does.
+    pub(crate) fn placed(&mut self, family: &model::Family) -> Option<Placed> {
+        if inside(&family.main.cwd, &self.roots) {
+            Some(Placed::Folder)
+        } else if self.places.touches(family, &self.roots) {
+            Some(Placed::Files)
+        } else {
+            None
+        }
+    }
+}
+
 /// Where the paths sessions touched are: each resolved once, and the
 /// repository each folder is in. On this machine only, to decide: no path
 /// is kept past the run, written, logged or printed.
@@ -773,7 +817,7 @@ fn common_dir(folder: &Path) -> Option<PathBuf> {
 // ---- git -----------------------------------------------------------------------
 
 /// git, run where vessa was started, saying what it says in one language.
-fn output(args: &[&str], input: Option<&[u8]>, env: &[(&str, &str)]) -> Result<Output> {
+pub(crate) fn output(args: &[&str], input: Option<&[u8]>, env: &[(&str, &str)]) -> Result<Output> {
     let mut command = Command::new("git");
     command
         .args(args)
@@ -822,7 +866,7 @@ fn git(args: &[&str], input: Option<&[u8]>, env: &[(&str, &str)]) -> Result<Stri
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
-fn run(args: &[&str]) -> Result<String> {
+pub(crate) fn run(args: &[&str]) -> Result<String> {
     git(args, None, &[])
 }
 

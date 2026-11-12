@@ -1,3 +1,4 @@
+mod hook;
 mod import;
 mod metrics;
 mod model;
@@ -87,6 +88,16 @@ enum Cmd {
         /// stderr. Nothing else turns the scrub off.
         #[arg(long)]
         raw: bool,
+        /// The messages of the sessions this commit's Agent-Session
+        /// trailers name, typed after its parent and up to it; a session
+        /// not on this machine is said to be.
+        #[arg(long, value_name = "REV", conflicts_with = "since")]
+        commit: Option<String>,
+    },
+    /// Pointers from commits to the agent sessions that made them.
+    Hook {
+        #[command(subcommand)]
+        hook: HookCmd,
     },
     /// Share your usage in this repository with its team: the numbers of
     /// your sessions recorded in this clone's worktrees, or that touched
@@ -119,6 +130,26 @@ enum Cmd {
         /// or branch, instead of by person.
         #[arg(long, value_enum)]
         by: Option<team::By>,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum HookCmd {
+    /// Write the prepare-commit-msg hook into this clone's common git
+    /// folder, for every worktree of it. Refuses to replace another hook.
+    Install,
+    /// What the hook runs: appends an Agent-Session trailer to the message
+    /// for each agent session of this clone active since the commit's
+    /// parent (the agent, its session id, how many messages people typed
+    /// since, and when). Never words, paths or names. Never stops a commit.
+    PrepareCommitMsg {
+        /// The commit message file git gives the hook.
+        file: PathBuf,
+        /// Where the message comes from, as git says: message, template,
+        /// merge, squash or commit.
+        source: Option<String>,
+        /// The commit a reused message comes from.
+        sha: Option<String>,
     },
 }
 
@@ -162,8 +193,21 @@ fn run_once(cli: Cli) -> Result<i32> {
         println!("{}", metrics::claude_statusline(&input));
         return Ok(0);
     }
-    if let Cmd::Messages { since, raw } = &cli.command {
-        return messages(&cli, since.as_deref(), *raw);
+    if let Cmd::Messages { since, raw, commit } = &cli.command {
+        return messages(&cli, since.as_deref(), *raw, commit.as_deref());
+    }
+    if let Cmd::Hook { hook } = &cli.command {
+        return match hook {
+            HookCmd::Install => hook::install(),
+            // Never stops a commit: whatever fails is said, and it exits 0.
+            HookCmd::PrepareCommitMsg { file, source, .. } => match inputs(&cli) {
+                Ok((paths, _)) => Ok(hook::prepare_commit_msg(file, source.as_deref(), paths)),
+                Err(error) => {
+                    eprintln!("vessa: no Agent-Session pointers added: {error:#}");
+                    Ok(0)
+                }
+            },
+        };
     }
     if let Cmd::Share {
         remote,
@@ -262,9 +306,11 @@ fn run_once(cli: Cli) -> Result<i32> {
         eprintln!("vessa: {}", clean(warning));
     }
     match cli.command {
-        Cmd::ClaudeStatusline | Cmd::Messages { .. } | Cmd::Share { .. } | Cmd::Team { .. } => {
-            unreachable!()
-        }
+        Cmd::ClaudeStatusline
+        | Cmd::Messages { .. }
+        | Cmd::Hook { .. }
+        | Cmd::Share { .. }
+        | Cmd::Team { .. } => unreachable!(),
         Cmd::Status => {
             let families = model::families(&report.sessions);
             ensure!(
@@ -651,11 +697,12 @@ impl<W: Write> Document<W> {
         Ok(())
     }
 
-    /// Ends the document with what was read, and what was redacted (`found`;
-    /// None under `--raw`).
+    /// Ends the document with what was read, the commit read for, if any,
+    /// and what was redacted (`found`; None under `--raw`).
     fn finish(
         &mut self,
         listing: &import::Listing,
+        commit: Option<&serde_json::Value>,
         found: Option<&scrub::Redactions>,
     ) -> Result<()> {
         if self.written == 0 {
@@ -670,6 +717,10 @@ impl<W: Write> Document<W> {
         serde_json::to_writer(&mut self.out, &listing.coverage)?;
         write!(self.out, ",\n\"warnings\":")?;
         serde_json::to_writer(&mut self.out, &listing.warnings)?;
+        if let Some(commit) = commit {
+            write!(self.out, ",\n\"commit\":")?;
+            serde_json::to_writer(&mut self.out, commit)?;
+        }
         self.redacted(found)?;
         writeln!(self.out, "}}")?;
         self.out.flush()?;
@@ -743,17 +794,60 @@ fn plain(
 }
 
 /// Each message is written as its transcript is read; secrets are scrubbed
-/// unless the person explicitly asks for `messages --raw`.
-fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
+/// unless the person explicitly asks for `messages --raw`. With `commit`,
+/// the sessions its Agent-Session trailers name, in its window.
+fn messages(cli: &Cli, from: Option<&str>, raw: bool, commit: Option<&str>) -> Result<i32> {
     if let Some(agent) = &cli.agent {
         supported(agent)?;
+    }
+    let commit = match commit {
+        Some(rev) => {
+            ensure!(
+                cli.agent.is_none() && cli.session.is_none(),
+                "--commit selects the sessions its Agent-Session trailers name; --agent and --session do not apply"
+            );
+            Some(hook::commit(rev)?)
+        }
+        None => None,
+    };
+    // The sessions the commit names, once each, and its trailers that name
+    // none vessa can read.
+    let mut named: Vec<(String, String)> = Vec::new();
+    let mut unnamed = Vec::new();
+    for (value, session) in commit.iter().flat_map(|c| &c.trailers) {
+        match session {
+            Some(session) if !named.contains(session) => named.push(session.clone()),
+            Some(_) => {}
+            None => unnamed.push(value.as_str()),
+        }
     }
     let select = import::Selection {
         agent: cli.agent.clone(),
         session: cli.session.clone(),
-        since: from.map(since).transpose()?,
+        named: named.clone(),
+        since: match &commit {
+            Some(c) => Some(c.after),
+            None => from.map(since).transpose()?,
+        },
+        until: commit.as_ref().map(|c| c.until),
     };
     let (paths, not_installed) = inputs(cli)?;
+    // A commit that names no session has no messages to list.
+    let nothing = commit.is_some() && named.is_empty();
+    let read = |emit: &mut dyn FnMut(&model::Message) -> Result<()>| {
+        if nothing {
+            return Ok(import::Listing {
+                coverage: model::Coverage {
+                    since: select.since.map(|t| t.to_rfc3339()),
+                    until: select.until.map(|t| t.to_rfc3339()),
+                    later: Some(0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+        import::messages(&paths, &select, !raw, emit)
+    };
     // What is redacted, by rule; None under `--raw`, which redacts nothing.
     // Each message is scrubbed as it is printed, after it was read, so the
     // rules that tell a person's messages apart see the words as written.
@@ -761,18 +855,60 @@ fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
     if raw {
         eprintln!("vessa: --raw: secret-looking tokens are printed as written, not redacted");
     }
+    // What the commit's trailers say, as they are printed: scrubbed too.
+    let said = |text: &str, found: Option<&mut scrub::Redactions>| match found {
+        Some(found) => found.text(text),
+        None => text.to_owned(),
+    };
+    // What is said of the commit beside its messages: each session it names,
+    // as found here, and its trailers that name none.
+    let about = |listing: &mut import::Listing, found: Option<&mut scrub::Redactions>| {
+        let c = commit.as_ref()?;
+        let mut found = found;
+        let short = &c.id[..12.min(c.id.len())];
+        for value in &unnamed {
+            listing.warnings.push(format!(
+                "an Agent-Session trailer of commit {short} names no session: {}",
+                said(value, found.as_deref_mut())
+            ));
+        }
+        let mut sessions = Vec::new();
+        for n in &listing.named {
+            let trailer = c
+                .trailers
+                .iter()
+                .find(|(_, s)| s.as_ref() == Some(&(n.agent.clone(), n.id.clone())))
+                .map(|(value, _)| said(value, found.as_deref_mut()))
+                .unwrap_or_default();
+            if !n.found {
+                listing.warnings.push(format!(
+                    "{} {}: named by commit {short}, and not among the sessions read on this machine, so its messages cannot be listed",
+                    n.agent, n.id
+                ));
+            }
+            sessions.push(serde_json::json!({
+                "agent": n.agent, "id": n.id, "trailer": trailer,
+                "found": n.found, "messages": n.messages,
+            }));
+        }
+        Some(serde_json::json!({
+            "id": c.id, "after": c.after.to_rfc3339(), "until": c.until.to_rfc3339(),
+            "sessions": sessions,
+        }))
+    };
     let mut out = std::io::BufWriter::new(std::io::stdout().lock());
     let listing = if cli.json {
         let mut doc = Document::new(&mut out);
-        let read = import::messages(&paths, &select, !raw, &mut |m| match found.as_mut() {
+        let read = read(&mut |m| match found.as_mut() {
             Some(found) => doc.message(&found.message(m)),
             None => doc.message(m),
         });
         match read {
             Ok(mut listing) => {
                 listing.warnings.extend(not_installed);
+                let commit = about(&mut listing, found.as_mut());
                 scrubbed(&mut listing, found.as_mut());
-                doc.finish(&listing, found.as_ref())?;
+                doc.finish(&listing, commit.as_ref(), found.as_ref())?;
                 listing
             }
             Err(error) => {
@@ -781,10 +917,38 @@ fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
             }
         }
     } else {
-        let mut listing = import::messages(&paths, &select, !raw, &mut |m| {
-            plain(&mut out, m, found.as_mut())
-        })?;
+        if let Some(c) = &commit {
+            writeln!(
+                out,
+                "Commit {}: {} named; their messages after {}, up to {}",
+                &c.id[..12.min(c.id.len())],
+                render::many(named.len(), "agent session"),
+                c.after.to_rfc3339(),
+                c.until.to_rfc3339(),
+            )?;
+        }
+        let mut listing = read(&mut |m| plain(&mut out, m, found.as_mut()))?;
         listing.warnings.extend(not_installed);
+        if let Some(commit) = about(&mut listing, found.as_mut()) {
+            for s in commit["sessions"].as_array().into_iter().flatten() {
+                let text = |key: &str| render::for_terminal(s[key].as_str().unwrap_or_default());
+                writeln!(
+                    out,
+                    "{} {}: {} · committed as: {}",
+                    text("agent"),
+                    text("id"),
+                    if s["found"] == true {
+                        format!(
+                            "{} in this window",
+                            render::many(s["messages"].as_u64().unwrap_or(0) as usize, "message")
+                        )
+                    } else {
+                        "not on this machine".into()
+                    },
+                    text("trailer"),
+                )?;
+            }
+        }
         scrubbed(&mut listing, found.as_mut());
         let c = &listing.coverage;
         let rules = c
@@ -807,11 +971,18 @@ fn messages(cli: &Cli, from: Option<&str>, raw: bool) -> Result<i32> {
             c.subagent_transcripts,
         )?;
         if let Some(since) = &c.since {
-            writeln!(
-                out,
-                "after {since}: {} earlier and {} undated messages not listed; {} transcripts unmodified since, not read",
-                c.earlier, c.undated, c.unmodified_transcripts
-            )?;
+            match (&c.until, c.later) {
+                (Some(until), Some(later)) => writeln!(
+                    out,
+                    "after {since}, up to {until}: {} earlier, {later} later and {} undated messages not listed; {} transcripts unmodified since, not read",
+                    c.earlier, c.undated, c.unmodified_transcripts
+                )?,
+                _ => writeln!(
+                    out,
+                    "after {since}: {} earlier and {} undated messages not listed; {} transcripts unmodified since, not read",
+                    c.earlier, c.undated, c.unmodified_transcripts
+                )?,
+            }
         }
         out.flush()?;
         listing
