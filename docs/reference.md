@@ -808,12 +808,14 @@ a record, or an opencode message, dated after the parent's commit time.
 
 Only transcripts, and opencode stores, last written after that time are
 opened; the rest are only looked at. A store counts as written when its
-log, `opencode.db-wal`, was, since SQLite writes there first. One more is
-opened: the session of a subagent active since, when its own transcript is
-older, so that its folder and files place the subagent too. It is the
-transcript whose name ends with the session's id, as Claude Code and Codex
-name them, checked once read. It counts toward the subagent's place, not
-its time or messages. opencode keeps both in one store. `--input` reads
+log, `opencode.db-wal`, was, since SQLite writes there first. Older
+transcripts are opened for two sessions: the session of a subagent active
+since, so that its folder and files place the subagent too, and the session
+a Codex fork active since was forked from, whose transcript tells the
+history the fork copied from its own turns. Each is the transcript whose
+name ends with the session's id, as Claude Code and Codex name them,
+checked once read. It counts toward the other's place or messages, not its
+time. opencode keeps a subagent's session in the same store. `--input` reads
 other places than the agents' own folders, as elsewhere. A source that
 cannot be read is said on stderr: the commit may then miss a pointer, and
 the hook does not pretend otherwise.

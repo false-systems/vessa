@@ -364,11 +364,20 @@ fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Foun
         }
         chosen.push((family.main, members, span));
     }
-    // Their messages, read from their own transcripts alone.
+    // Their messages, read from their own transcripts, and from the
+    // transcript a Codex fork was forked from, which tells the history it
+    // copied from its own turns.
     let mut read_from: Vec<PathBuf> = chosen
         .iter()
         .flat_map(|(_, members, _)| members)
-        .flat_map(|s| active.read_from.get(&(s.agent.clone(), s.id.clone())))
+        .flat_map(|s| {
+            let fork = (s.agent == "codex" && !s.subagent)
+                .then(|| s.parent.clone())
+                .flatten();
+            std::iter::once(s.id.clone())
+                .chain(fork)
+                .filter_map(|id| active.read_from.get(&(s.agent.clone(), id)))
+        })
         .flatten()
         .cloned()
         .collect();

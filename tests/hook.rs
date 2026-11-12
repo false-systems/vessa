@@ -645,6 +645,74 @@ fn a_subagent_active_since_counts_with_its_session_however_old() {
 }
 
 #[test]
+fn a_codex_fork_counts_only_its_own_messages_however_old_its_parent() {
+    let world = World::new("fork");
+    let widget = world.clone("widget");
+    let meta = |id: &str, extra: Value, time: &str| {
+        let mut payload = json!({"id":id,"cwd":text(&widget),"source":"cli","originator":"codex-tui","timestamp":at(time)});
+        payload
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({"timestamp":at(time),"type":"session_meta","payload":payload})
+    };
+    let turn = |role: &str, time: &str, words: &str| {
+        let kind = if role == "user" {
+            "input_text"
+        } else {
+            "output_text"
+        };
+        json!({"timestamp":at(time),"type":"response_item","payload":{"type":"message","role":role,
+            "content":[{"type":kind,"text":words}]}})
+    };
+    let history = [
+        ("user", "09:20:00", "Add the parser."),
+        ("assistant", "09:21:00", "Added the parser."),
+        ("user", "09:30:00", "Now test it."),
+        ("assistant", "09:31:00", "The tests pass."),
+    ];
+    let lines = |rows: Vec<Value>| rows.iter().map(|r| format!("{r}\n")).collect::<String>();
+    let mut parent = vec![meta("codex-parent", json!({}), "09:20:00")];
+    parent.extend(
+        history
+            .iter()
+            .map(|(role, time, words)| turn(role, time, words)),
+    );
+    // A fork copies its parent's transcript behind its own header, stamped
+    // with the fork's time, after the parent commit; then its own turns.
+    let mut fork = vec![
+        meta(
+            "codex-fork",
+            json!({"forked_from_id":"codex-parent"}),
+            "10:10:00",
+        ),
+        meta("codex-parent", json!({}), "09:20:00"),
+    ];
+    fork.extend(
+        history
+            .iter()
+            .map(|(role, _, words)| turn(role, "10:10:00", words)),
+    );
+    fork.push(turn("user", "10:15:00", "Try a different parser."));
+    let folder = world.sessions(
+        "sessions",
+        &[
+            ("rollout-codex-parent.jsonl", lines(parent)),
+            ("rollout-codex-fork.jsonl", lines(fork)),
+        ],
+    );
+    written_at(&folder.join("rollout-codex-parent.jsonl"), "09:59:00");
+    let (message, out) = world.prepare(&widget, &folder, "Fix.\n", &["message"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        trailers(&message),
+        ["Agent-Session: codex codex-fork (1 message, 2026-10-01 10:10–10:15 UTC)"],
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn a_merge_points_to_the_work_after_every_commit_it_joins() {
     let world = World::new("merge");
     let widget = world.clone("widget");

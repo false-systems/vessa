@@ -329,10 +329,12 @@ pub fn active(written: &Written, since: chrono::DateTime<chrono::FixedOffset>) -
                 .push(format!("{}: {error:#}", store.display())),
         }
     }
-    // The sessions subagents count with that were not read: each in the
-    // transcript whose name ends with its id, as the agents name them,
-    // read and checked. A Codex subagent may name a thread that is a
-    // subagent too, so this goes on until none is wanted.
+    // The sessions subagents count with that were not read, and the
+    // sessions Codex forks were forked from, whose transcripts tell a fork's
+    // copied history from its own turns: each in the transcript whose name
+    // ends with its id, as the agents name them, read and checked. A Codex
+    // subagent may name a thread that is a subagent too, and a fork may be
+    // of a fork, so this goes on until none is wanted.
     let mut looked = std::collections::HashSet::new();
     loop {
         let mut sessions: Vec<&mut Session> = read.iter_mut().map(|(_, (s, _))| s).collect();
@@ -343,7 +345,16 @@ pub fn active(written: &Written, since: chrono::DateTime<chrono::FixedOffset>) -
             .collect();
         let wanted: BTreeMap<(String, String), Vec<PathBuf>> = read
             .iter()
-            .filter_map(|(_, (s, _))| Some((s.agent.clone(), s.subagent_of()?.to_owned())))
+            .flat_map(|(_, (s, _))| {
+                let fork = (s.agent == "codex" && !s.subagent)
+                    .then(|| s.parent.clone())
+                    .flatten();
+                s.subagent_of()
+                    .map(str::to_owned)
+                    .into_iter()
+                    .chain(fork)
+                    .map(|id| (s.agent.clone(), id))
+            })
             .filter(|key| !have.contains(key) && looked.insert(key.clone()))
             .map(|(agent, id)| {
                 let named = written
