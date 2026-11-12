@@ -247,11 +247,22 @@ pub fn written_since(paths: &[PathBuf], since: chrono::DateTime<chrono::FixedOff
     let mut warnings = Vec::new();
     let (files, stores) = transcripts(paths, &mut warnings);
     let mut written = Vec::new();
-    for path in files.into_iter().chain(stores) {
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified());
+    for path in files.into_iter().chain(stores.iter().cloned()) {
         if path.extension().is_some_and(|s| s == "json") {
             continue;
         }
-        match std::fs::metadata(&path).and_then(|m| m.modified()) {
+        let mut at = modified(&path);
+        // SQLite writes a store's changes to its log, `<store>-wal`, first:
+        // the store's own file can be older than what it holds.
+        if stores.contains(&path) {
+            let mut log = path.clone().into_os_string();
+            log.push("-wal");
+            if let (Ok(store), Ok(log)) = (&at, modified(Path::new(&log))) {
+                at = Ok(log.max(*store));
+            }
+        }
+        match at {
             Ok(at) if chrono::DateTime::<chrono::Utc>::from(at) > since => written.push(path),
             Ok(_) => {}
             Err(error) => warnings.push(format!("{}: {error}", path.display())),

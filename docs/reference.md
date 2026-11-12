@@ -805,10 +805,11 @@ names a file there. Free text never places one. It was active when it holds
 a record, or an opencode message, dated after the parent's commit time.
 
 Only transcripts, and opencode stores, last written after that time are
-opened; the rest are only looked at. `--input` reads other places than the
-agents' own folders, as elsewhere. A source that cannot be read is said on
-stderr: the commit may then miss a pointer, and the hook does not pretend
-otherwise.
+opened; the rest are only looked at. A store counts as written when its
+log, `opencode.db-wal`, was, since SQLite writes there first. `--input`
+reads other places than the agents' own folders, as elsewhere. A source
+that cannot be read is said on stderr: the commit may then miss a pointer,
+and the hook does not pretend otherwise.
 
 ### What git says the commit is
 
@@ -825,11 +826,13 @@ The parent's time is HEAD's commit time, with these exceptions:
 
 A session already named on an `Agent-Session` line anywhere in the message
 (down to the diff `git commit -v` shows) is not named again, so running the
-hook twice, an amend or a reused message adds nothing twice. The hook adds
-the trailers with `git interpret-trailers`, which puts them where git keeps
-trailers. Where a message the person writes in the editor holds them, the
-person sees them before the commit is made; to abort that commit, delete
-them too.
+hook twice, an amend or a reused message adds nothing twice. vessa writes
+the trailers itself where git keeps them: after the last paragraph, which
+they join when it already holds trailers and is not the subject, and before
+the comments that close the message. It runs no trailer command git is
+configured with. A message that is not UTF-8 gets none. Where a message
+the person writes in the editor holds them, the person sees them before
+the commit is made; to abort that commit, delete them too.
 
 ### Never in the way
 
@@ -863,9 +866,9 @@ was made, and `vessa messages --session ID` lists a session whole.
 With `--json`, the `vessa-messages.v1` document adds:
 
 - `commit`: the commit's full `id`; `after` and `until`, the window; and
-  `sessions`, each session its trailers name: `agent`, `id`, its `trailer`
-  as written (scrubbed), `found` and how many `messages` it and its
-  subagents gave here;
+  `sessions`, each session its trailers name: `agent`, `id` and its
+  `trailer` as written, each scrubbed since anyone can write a trailer;
+  `found`; and how many `messages` it and its subagents gave here;
 - in `coverage`, `until`, and `later`: the messages after the commit.
   `user_turns` is then `human`, every count in `excluded`, `earlier`,
   `later` and `undated`.

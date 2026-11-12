@@ -150,38 +150,19 @@ pub fn prepare_commit_msg(file: &Path, source: Option<&str>, paths: Vec<PathBuf>
     for note in &found.notes {
         eprintln!("vessa: {}", shown(note));
     }
-    if found.trailers.is_empty() {
+    let Some(message) = found.message else {
         return 0;
-    }
-    let mut args = vec![
-        "interpret-trailers",
-        "--in-place",
-        "--where",
-        "end",
-        "--if-exists",
-        "addIfDifferent",
-        "--if-missing",
-        "add",
-    ];
-    let trailers: Vec<String> = found
-        .trailers
-        .iter()
-        .map(|value| format!("{KEY}: {value}"))
-        .collect();
-    for trailer in &trailers {
-        args.extend(["--trailer", trailer]);
-    }
-    let file = file.to_string_lossy();
-    args.push(&file);
-    match team::run(&args) {
-        Ok(_) => eprintln!(
+    };
+    // Written here, by vessa alone: no command git is configured with runs.
+    match std::fs::write(file, message) {
+        Ok(()) => eprintln!(
             "vessa: this commit points to {} ({KEY} trailers, {} ms)",
-            many(found.trailers.len(), "agent session"),
+            many(found.added, "agent session"),
             started.elapsed().as_millis()
         ),
         Err(error) => eprintln!(
-            "vessa: no Agent-Session pointers added: {}",
-            shown(&format!("{error:#}"))
+            "vessa: no Agent-Session pointers added: cannot write {}: {error}",
+            shown(&file.display().to_string())
         ),
     }
     0
@@ -196,16 +177,83 @@ fn shown(text: &str) -> String {
 /// What the hook found to add, and what it has to say.
 #[derive(Default)]
 struct Found {
-    /// The trailers' values, in the order they are added.
-    trailers: Vec<String>,
+    /// The message with its pointers, when it gains any.
+    message: Option<String>,
+    /// How many trailers it gains.
+    added: usize,
     notes: Vec<String>,
+}
+
+/// `message` with an `Agent-Session` trailer for each of `values` it does
+/// not already hold, where git keeps trailers: after the last paragraph,
+/// which they join when it is one of trailers already (not the subject), and
+/// before the comments that close the message and the diff `git commit -v`
+/// shows below its cut line. None when it gains none.
+fn with_trailers(message: &str, values: &[String]) -> Option<(String, usize)> {
+    let lines: Vec<&str> = message.split_inclusive('\n').collect();
+    let cut = lines
+        .iter()
+        .position(|line| scissors(line))
+        .unwrap_or(lines.len());
+    let blank = |line: &str| line.trim().is_empty();
+    let mut end = cut;
+    while end > 0 && (blank(lines[end - 1]) || lines[end - 1].starts_with('#')) {
+        end -= 1;
+    }
+    let body = &lines[..end];
+    let start = body
+        .iter()
+        .rposition(|line| blank(line))
+        .map_or(0, |i| i + 1);
+    let paragraph = &body[start..];
+    // A trailer line is `Key: value`; a line that opens with a space or a
+    // tab goes on the one before.
+    let trailer = |line: &&str| {
+        line.split_once(':').is_some_and(|(key, _)| {
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    };
+    let joined = start > 0
+        && paragraph.first().is_some_and(trailer)
+        && paragraph
+            .iter()
+            .all(|line| trailer(line) || line.starts_with([' ', '\t']));
+    let mut new: Vec<String> = Vec::new();
+    for value in values {
+        let line = format!("{KEY}: {value}");
+        let held = joined && paragraph.iter().any(|old| old.trim_end() == line);
+        if !held && !new.contains(&line) {
+            new.push(line);
+        }
+    }
+    if new.is_empty() {
+        return None;
+    }
+    let mut out: String = body.concat();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !joined && !out.is_empty() {
+        out.push('\n');
+    }
+    for line in &new {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&lines[end..].concat());
+    Some((out, new.len()))
+}
+
+/// Whether `line` is the line `git commit -v` puts above the diff.
+fn scissors(line: &str) -> bool {
+    line.starts_with('#') && line.trim_start_matches('#').trim() == SCISSORS
 }
 
 /// The pointers a commit's message `file` lacks.
 fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Found> {
     let message = std::fs::read(file)
         .with_context(|| format!("cannot read the message {}", file.display()))?;
-    let message = String::from_utf8_lossy(&message);
+    let message = String::from_utf8(message).context("the message is not UTF-8")?;
     // `rev-parse` names the git folder even before a first commit, which it
     // says by failing to verify HEAD.
     let out = team::output(
@@ -218,6 +266,8 @@ fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Foun
     let git_dir = PathBuf::from(lines.next().context("not inside a git repository")?);
     let head = lines.next().filter(|_| out.status.success());
     let mut found = Found::default();
+    // The trailers' values, in the order they are added.
+    let mut values: Vec<String> = Vec::new();
     // A rebase, a cherry-pick or `git am` replays commits made before: each
     // keeps the pointers its message carries, and gets none of the
     // sessions active now.
@@ -249,8 +299,8 @@ fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Foun
         for value in trailers_of(&squashed)? {
             if let Some(session) = session_of(&value) {
                 named.insert(session);
-                if !found.trailers.contains(&value) {
-                    found.trailers.push(value);
+                if !values.contains(&value) {
+                    values.push(value);
                 }
             }
         }
@@ -355,7 +405,7 @@ fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Foun
             withheld += 1;
             continue;
         }
-        found.trailers.push(format!(
+        values.push(format!(
             "{agent} {id} ({}{}, {})",
             if partial { "at least " } else { "" },
             many(messages, "message"),
@@ -371,6 +421,10 @@ fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Foun
             if withheld == 1 { "it" } else { "them" },
         ));
     }
+    if let Some((message, added)) = with_trailers(&message, &values) {
+        found.message = Some(message);
+        found.added = added;
+    }
     Ok(found)
 }
 
@@ -380,7 +434,7 @@ fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Foun
 fn named_in(message: &str) -> BTreeSet<(String, String)> {
     message
         .lines()
-        .take_while(|line| line.trim_start_matches('#').trim() != SCISSORS)
+        .take_while(|line| !scissors(line))
         .filter(|line| !line.starts_with('#'))
         .filter_map(|line| {
             let line = line.trim();

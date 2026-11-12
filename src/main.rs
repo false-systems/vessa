@@ -886,9 +886,11 @@ fn messages(cli: &Cli, from: Option<&str>, raw: bool, commit: Option<&str>) -> R
                     n.agent, n.id
                 ));
             }
+            // Anyone can write a trailer: what it names is printed scrubbed.
             sessions.push(serde_json::json!({
-                "agent": n.agent, "id": n.id, "trailer": trailer,
-                "found": n.found, "messages": n.messages,
+                "agent": said(&n.agent, found.as_deref_mut()),
+                "id": said(&n.id, found.as_deref_mut()),
+                "trailer": trailer, "found": n.found, "messages": n.messages,
             }));
         }
         Some(serde_json::json!({

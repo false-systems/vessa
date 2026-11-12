@@ -867,3 +867,104 @@ fn messages_of_a_commit_are_its_sessions_in_its_window() {
     );
     assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
 }
+
+#[test]
+fn trailers_go_where_git_keeps_them_and_no_configured_command_runs() {
+    let world = World::new("placed");
+    let widget = world.clone("widget");
+    let folder = world.sessions(
+        "sessions",
+        &[(
+            "in-repo.jsonl",
+            claude("in-repo", &widget, &[("10:05:00", "Run the checks.")]),
+        )],
+    );
+    let ours = "Agent-Session: claude in-repo (1 message, 2026-10-01 10:05 UTC)";
+    // A trailer command git is configured with would hold the commit and
+    // add its own words: the hook never runs one.
+    world.git(
+        &widget,
+        &["config", "trailer.held.command", "sleep 5; echo held"],
+    );
+    let diff = "# ------------------------ >8 ------------------------\n# Do not modify or remove the line above.\ndiff --git a/x b/x\n Agent-Session: claude in-repo (9 messages, 2026-10-01 10:05 UTC)\n";
+    for (message, expected) in [
+        ("Fix.".to_owned(), format!("Fix.\n\n{ours}\n")),
+        (
+            "Fix.\n\nWhy.\n\nSigned-off-by: Ada <ada@example.org>\n".to_owned(),
+            format!("Fix.\n\nWhy.\n\nSigned-off-by: Ada <ada@example.org>\n{ours}\n"),
+        ),
+        (
+            format!("Fix.\n\nWhy.\n\n# Please enter the commit message.\n{diff}"),
+            format!("Fix.\n\nWhy.\n\n{ours}\n\n# Please enter the commit message.\n{diff}"),
+        ),
+        (
+            "Fix.\n\n    Agent-Session: claude other (1 message)\n".to_owned(),
+            format!("Fix.\n\n    Agent-Session: claude other (1 message)\n\n{ours}\n"),
+        ),
+    ] {
+        let started = std::time::Instant::now();
+        let (after, out) = world.prepare(&widget, &folder, &message, &["message"]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(after, expected, "{}", stderr(&out));
+    }
+}
+
+#[test]
+fn an_opencode_store_whose_log_was_written_since_is_read() {
+    let world = World::new("wal");
+    let widget = world.clone("widget");
+    let elsewhere = world.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let folder = world.sessions("sessions", &[]);
+    let db = folder.join("opencode.db");
+    opencode(&db, &widget, &elsewhere, "10:12:00", "Tidy the docs.");
+    // SQLite writes to the store's log, `opencode.db-wal`, first: the store's
+    // own file can be older than the parent while its log is not.
+    let store = std::fs::File::options().write(true).open(&db).unwrap();
+    let parent = std::time::UNIX_EPOCH
+        + std::time::Duration::from_millis(u64::try_from(millis("09:59:00")).unwrap());
+    store.set_modified(parent).unwrap();
+    drop(store);
+    std::fs::write(folder.join("opencode.db-wal"), "").unwrap();
+    let (message, out) = world.prepare(&widget, &folder, "Fix.\n", &["message"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        trailers(&message),
+        ["Agent-Session: opencode ses_widget (1 message, 2026-10-01 10:12–10:13 UTC)"],
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn what_a_commit_says_of_its_sessions_is_printed_scrubbed() {
+    let world = World::new("scrubbed");
+    let widget = world.clone("widget");
+    // Anyone can write a trailer: one whose id reads as a key is printed
+    // redacted, as everything `messages` prints is.
+    let key = ["gh", "p_", "Ab3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dF3hJ5"].concat();
+    let said = format!("Fix.\n\nAgent-Session: claude {key} (1 message, 2026-10-01 10:10 UTC)\n");
+    std::fs::write(widget.join("README.md"), "# Widget, fixed\n").unwrap();
+    world.git(&widget, &["add", "README.md"]);
+    assert!(world
+        .git_at(&widget, "10:30:00", &["commit", "-q", "-m", &said])
+        .status
+        .success());
+    let folder = world.sessions("sessions", &[]);
+    for json in [true, false] {
+        let mut args = vec!["--input", text(&folder), "messages", "--commit", "HEAD"];
+        if json {
+            args.push("--json");
+        }
+        let out = world.vessa(&widget, &args);
+        assert_eq!(out.status.code(), Some(4), "{}", stderr(&out));
+        let printed = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
+        assert!(!printed.contains(&key), "{printed}");
+        assert!(printed.contains("[redacted]"), "{printed}");
+    }
+}
