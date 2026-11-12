@@ -136,15 +136,15 @@ Agent-Session: claude 8f3fa77a-5e7d-4a63-a519-d62bbb9a6b1d (3 messages, 2026-11-
 
 ## How it fits
 
-vessa is one of four small tools for working with coding agents. Each one works
-alone.
+vessa is one of four small tools for working with coding agents. Each one does
+one job and works alone.
 
-<img src="docs/assets/loop.svg" alt="A piece of work moves through five steps: start, check, review, land, deploy. toimija starts it, sykli does the other four, ohjaa holds what agents know, and vessa counts what agents used." width="100%">
+<img src="docs/assets/loop.svg" alt="A piece of work moves through five steps: start, check, review, land, deploy. toimija starts it. sykli checks and reviews it, lets it land on main only with proof and a review, and runs the deploy. ohjaa holds what agents know, and vessa counts what agents used and points each commit back to its session." width="100%">
 
-- **toimija** starts the session and gives the agent the facts of the repository.
-- **sykli** runs the declared checks, keeps the proof, and reviews, lands and deploys the work.
-- **ohjaa** holds what agents are told. A person decides it.
-- **vessa** counts what agents used, and keeps the thread from a commit back to what people asked.
+- **toimija** starts the session and tells the agent where the work stands.
+- **sykli** decides whether a change may reach main: it runs the declared checks, keeps the proof and has a second agent review the change, and its hook refuses a push to main without both. Deploys run through it too.
+- **ohjaa** holds what agents are told, and writes it into each agent's own instruction file. A person decides it.
+- **vessa** counts what agents used, and points each commit back to the agent sessions behind it.
 
 [Your first loop](https://github.com/false-systems/toimija/blob/main/docs/first-loop.md) walks one change through all four tools.
 
