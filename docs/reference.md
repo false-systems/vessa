@@ -25,7 +25,7 @@ Contents:
 - [Messages](#messages)
 - [Redaction](#redaction)
 - [What counts as a person's message](#what-counts-as-a-persons-message)
-- [Secrets scan](#secrets-scan)
+- [Commit pointers](#commit-pointers)
 - [With a team](#with-a-team)
 - [Privacy](#privacy)
 - [Limits](#limits)
@@ -41,8 +41,9 @@ Contents:
 | `vessa stats` | Usage by calendar period, in UTC. `--period day\|week\|month\|year`; the default is `month`. |
 | `vessa report --output FILE` | Writes a standalone, private HTML report. Refuses to overwrite. |
 | `vessa receipt` | Emits one session's usage as an `agent-usage.v1` receipt. |
-| `vessa messages` | Lists the messages people typed, each with the agent reply it follows. `--since`, `--raw`. |
-| `vessa secrets` | Scans for credentials this machine holds. Prints location, rule and count, never a value. `--since`. |
+| `vessa messages` | Lists the messages people typed, each with the agent reply it follows. `--since`, `--raw`, `--commit REV`. |
+| `vessa hook install` | Writes a `prepare-commit-msg` hook into this clone: each commit then points to the agent sessions that made it. See [Commit pointers](#commit-pointers). |
+| `vessa hook prepare-commit-msg FILE [SOURCE [SHA]]` | What that hook runs: adds an `Agent-Session` trailer per session. Never stops a commit. |
 | `vessa claude-statusline` | Renders Claude Code's status-line JSON from stdin. |
 | `vessa share` | Shares your usage in this repository with its team: one record of numbers, committed under `refs/vessa/usage/` and pushed. `--dry-run`, `--no-push`, `--remote`. |
 | `vessa team` | What the team shared: each person's latest share, and a team total. `--by agent\|model\|week\|branch`, `--no-fetch`, `--remote`. |
@@ -267,11 +268,6 @@ database) is a source warning, never an empty store. So is a store when
   as a prompt.
 - **`--since`.** A session whose newest message is not after the given time
   is counted in `unmodified_transcripts` and not read.
-- **Secrets scan.** A `user` message is `person`. An assistant's text and
-  reasoning blocks are `agent`. A tool block's `state.input` is
-  `tool_input`, and every other field of its `state` is `tool_output`.
-  Everything else is `other`. A message whose data is not JSON is a gap, and
-  is still scanned as text.
 
 ## Session headers
 
@@ -492,8 +488,7 @@ session's agent and id. Directory and time never establish a link.
 - A record that names no session vessa read is reported as a warning.
 - A session the export says it could not read is reported as a warning.
 - Receipt totals and transcript totals are never added together.
-- An export holds no conversation content. `messages` does not read one,
-  and `secrets` reports it as unreadable.
+- An export holds no conversation content, and `messages` does not read one.
 
 ```sh
 vessa report --input /path/to/session.jsonl --input /path/to/export.json --output work.html
@@ -534,13 +529,16 @@ nothing: no cache, no database. Text goes only to stdout.
 vessa messages --since 7d
 vessa messages --since 2026-10-01 --agent codex --json
 vessa messages --session ID --json
+vessa messages --commit HEAD
 ```
 
 `--since` takes RFC 3339, a UTC date (`YYYY-MM-DD`) or an age (`7d`, `12h`).
 The boundary is exclusive: only messages after that time are listed. A
 reader can pass the time of the last message it handled and not get that
 message again. `--agent` and `--session` select as elsewhere; a Claude Code
-subagent's own id selects it alone.
+subagent's own id selects it alone. `--commit REV` selects the sessions a
+commit's `Agent-Session` trailers name, in that commit's window (see
+[Commit pointers](#commit-pointers)).
 
 With `--json` it emits `vessa-messages.v1`: one JSON document with one
 message per line. Each message is written as soon as its transcript is read,
@@ -726,7 +724,9 @@ harness's words:
   reason is listed as `rejection`. A rejection with no reason stays a
   `tool_result`.
 - **A task in a launch prompt.** A toimija launch prompt opens with a fixed
-  sentence, after the launcher's alerts when there are any
+  sentence, one for a session in a repository, one outside any, and one in
+  a workspace (a folder that holds repositories), after the launcher's
+  alerts when there are any
   (`## Before anything else (from the launcher)`). It holds the session
   packet, then `\nTask: <task>\n`, then a briefing. The task is the text
   between the last `Task:` line and the start of the briefing, and is listed
@@ -748,121 +748,145 @@ The briefing in a launch prompt starts in one of two ways:
   `System perimeter (derived by ohjaa at launch; …`. In this case a task
   that contains a blank line followed by one of those openings ends early.
 
-## Secrets scan
+## Commit pointers
 
-`vessa secrets` scans Claude Code, Codex, pi and opencode records for the
-credentials this machine holds. It covers subagent and headless transcripts,
-user and assistant text, tool inputs and tool outputs. A finding is an
-alarm: one of your credentials reached an agent session, and so the provider
-that ran it. Nothing is stored, and no network is used.
+A commit can point to the agent sessions that made it, and from there to
+what people asked in them. Only the pointers go into the commit, and so to
+wherever it is pushed. The words stay on this machine, where
+`vessa messages --commit` lists them.
 
 ```sh
-vessa secrets --input examples/codex.jsonl --json
-vessa secrets --since 7d --agent claude
+vessa hook install                 # once per clone
+git commit -m "Fix the parser"     # the commit now names its sessions
+vessa messages --commit HEAD       # what people typed in them, for this commit
 ```
 
-### What it compares with
+### The hook
 
-The credentials are read at the start of each scan, kept in memory only,
-compared by value, and never printed, logged or written. The sources are:
+`vessa hook install` writes `prepare-commit-msg` into the clone's common git
+folder (`git rev-parse --git-common-dir`), so every worktree of the clone
+has it. It is three lines that run `vessa hook prepare-commit-msg "$@"`.
+Run again, it says the hook is unchanged. It refuses, and says why, when
+another `prepare-commit-msg` is there, which it leaves as it is, and when
+`core.hooksPath` sends git elsewhere. To keep a hook of your own, call
+`vessa hook prepare-commit-msg "$@"` from it.
 
-- environment variables with a secret-like name: one containing `TOKEN`,
-  `SECRET`, `PASSWORD`, `PASSWD`, `KEY`, `CREDENTIAL` or `AUTH`, but not a
-  socket, path, file, folder or session key;
-- the GitHub CLI's login (`gh auth token`), when `gh` is on `PATH`;
-- `~/.aws/credentials`, `~/.config/gh/hosts.yml`, `~/.git-credentials`,
-  `~/.netrc`, `~/.npmrc`, `~/.docker/config.json`, `~/.codex/auth.json`,
-  `~/.pi/agent/auth.json`, `~/.claude/.credentials.json` and
-  `~/.ssh/id_{ed25519,rsa,ecdsa}`.
+### The trailer
 
-From a file, a credential is each secret-shaped string the detector
-recognizes in it. From a variable or `gh`, it is also the whole value, when
-that is 16 bytes or more, whatever its shape. Each credential is looked for
-in every record as it stands, so it is found however it is labelled there.
-macOS Keychain items are not read, since reading one can prompt. A source
-that exists but cannot be read leaves the scan partial.
+The hook adds one trailer for each agent session of this clone that was
+active after the commit's parent:
 
-The report names each source in `compared_with`: its name, whether it was
-`read`, `absent` or `unreadable`, and how many credentials it held. It never
-shows a value.
+```text
+Agent-Session: claude 8f3fa77a-5e7d-4a63-a519-d62bbb9a6b1d (3 messages, 2026-11-12 11:02–11:40 UTC)
+```
 
-### Other secret-shaped strings
+- the agent: `claude`, `codex`, `pi` or `opencode`;
+- the agent's own session id. A subagent counts with its session, which
+  the trailer names;
+- how many messages people typed in it, its subagents included, after the
+  parent, by the rules of [What counts as a person's
+  message](#what-counts-as-a-persons-message): harness, tool, subagent and
+  headless turns are not a person's, and a toimija launch prompt counts by
+  its task. `at least 3 messages` when a transcript holds a record vessa
+  could not read, a message with no time, or a transcript that could not
+  be read, or when only a subagent's transcript was found and not its
+  session's, so more may have been said. A session that worked with
+  no one typing, such as `claude -p`, has `0 messages`;
+- when it was active after the parent, to the minute, in UTC: its first and
+  last record then.
 
-Every other secret-shaped string the detector finds is counted by rule in
-`candidates` and never listed: other people's keys, test fixtures, examples,
-signatures, ids. The detector is the one [Redaction](#redaction) uses. Of
-those, `placeholders` counts the plain ones: a few characters repeated
-(`sk-a1a1a1…`), a straight run of the alphabet or digits, or an AWS
-documentation example (`…EXAMPLE`).
+**Never in the trailer:** what anyone typed or an agent replied, a path, a
+user name or the machine's name. A session whose id reads as a secret or a
+path, by the rules `share` applies to ids, gets no trailer; the hook says
+how many on stderr.
 
-Recognized key formats take precedence, then explicit secret labels
-(`password`, `api_key`, `token` and similar words), then the generic long
-mixed-string rule. A finding's `rule` is the one the detector gives the
-credential where it stands, or `no_known_shape` where it gives none. Its
-`held` names the source that holds it.
+### Which sessions
 
-### `vessa-secrets.v1`
+A session belongs to the clone by the rule `share` uses (see [Which
+sessions are shared](#which-sessions-are-shared)): a folder it or a subagent
+recorded is inside one of the clone's worktrees, or a structured tool call
+names a file there. Free text never places one. It was active when it holds
+a record, or an opencode message, dated after the parent's commit time.
 
-The document has `complete`, `since`, `transcripts`, `findings`,
-`unreadable`, `compared_with`, `candidates` and `placeholders`.
+Only transcripts, and opencode stores, last written after that time are
+opened; the rest are only looked at. A store counts as written when its
+log, `opencode.db-wal`, was, since SQLite writes there first. Older
+transcripts are opened for two sessions: the session of a subagent active
+since, so that its folder and files place the subagent too, and the session
+a Codex fork active since was forked from, whose transcript tells the
+history the fork copied from its own turns. Each is the transcript whose
+name ends with the session's id, as Claude Code and Codex name them,
+checked once read. It counts toward the other's place or messages, not its
+time. opencode keeps a subagent's session in the same store. `--input` reads
+other places than the agents' own folders, as elsewhere. A source that
+cannot be read is said on stderr: the commit may then miss a pointer, and
+the hook does not pretend otherwise.
 
-Each finding has:
+### What git says the commit is
 
-- `agent` and `session`, and optional `cwd`;
-- `at`, with `at_inferred`;
-- the source path and line. For opencode, the source is its store and the
-  line is the message's `seq`;
-- `where`: `person`, `agent`, `tool_input`, `tool_output` or `other`.
-  `person` means a user-role input. It does not prove a human wrote it;
-- `rule`, `held` and `count`;
-- `opaque_count` and `opaque_native` (below).
+The parent's time is HEAD's commit time, with these exceptions:
 
-`count` is the number of matched occurrences in the selected records, not
-the number of unique credentials. Mirrored or copied records can repeat an
-occurrence.
+| Commit | Window and pointers |
+| --- | --- |
+| The first of a repository | It has no parent: sessions active in the last 24 hours. |
+| A merge | After the newest of the commits it joins, whether git writes its message or `git commit -m` concludes it (`MERGE_HEAD` says it is one). The merged commits name their own sessions; the merge, those active after all of them, as in resolving a conflict. |
+| `git merge --squash` | The trailers of the commits it squashes (as `SQUASH_MSG` lists them, however the squash is concluded), as git reads them, each as it was, then the sessions active after HEAD. |
+| An amend | git does not tell the hook it is one: after HEAD's time. The message's own pointers stay, unless `-m` replaces the message. |
+| A rebase, cherry-pick or `git am` | None added: the replayed commit keeps the pointers its message carries. A squash in a rebase keeps them as text in the message; a fixup drops the folded message, and its pointers with it. |
+| `git commit` without `-m` or `-F`, or with a template, or with a message of no words (`-m ""`) | None added, and said: git aborts a commit left empty, or left as its template, only while it is, and a pointer would make it neither. Commit with words, given with `-m` or `-F`, to have them. |
 
-**Opaque fields.** `opaque_count` is the part of `count` found in Claude
-Code thinking-signature fields or Codex encrypted-reasoning fields. These
-fields are scanned like any other. Being in one is not an exemption, and
-does not mean the content is safe. `opaque_native: true` says the opaque
-occurrences were found at the agent's own positions for those fields: Claude
-Code assistant thinking blocks or Codex response-item reasoning payloads.
-User blocks, tool content, unknown records and fields that merely share a
-name do not count. A report without `opaque_count` leaves it unknown, not
-zero. A report without `opaque_native` is unverified and must not be used to
-dismiss an alert.
+A session already named on an `Agent-Session` line anywhere in the message
+(down to the diff `git commit -v` shows) is not named again, so running the
+hook twice, an amend or a reused message adds nothing twice. vessa writes
+the trailers itself where git keeps them: after the last paragraph, which
+they join when it already holds trailers and is not the subject, and before
+the comments that close the message. It runs no trailer command git is
+configured with. A message that is not UTF-8 gets none. Where a message
+the person writes in the editor holds them, the person sees them before
+the commit is made; to abort that commit, delete them too.
 
-**Time.** A record with no valid time of its own takes the time of the
-record before it in its transcript, and says so (`at_inferred: true`). Known
-file-history snapshots use their nested timestamp. Without a record before
-it, a finding's time stays unknown (`at: null`). `undated_records` counts
-finding records that produced a timestamp warning under `--since`.
+### Never in the way
 
-**Damaged records.** Valid records around a damaged record are still
-scanned. A match found in a damaged record has null time and location kind,
-because its fields could not be decoded. Summaries keep known counts as
-lower bounds. Unknown record shapes are scanned as `other`.
+The hook never stops or holds up a commit. On any error it adds nothing,
+says why in one line on stderr, and exits 0. It gives up after 3 seconds
+and says so. It writes the message beside the file git gave it, then
+renames it over that file, so a write that fails leaves the message as it
+was. The hook script ends in `|| true`, so a commit goes on even where
+`vessa` is not on `PATH`. It uses no network.
 
-No value, message text or fingerprint is emitted. Metadata is scrubbed too,
-including session ids and path components. There is no `--raw` mode.
+How long it takes depends on how many session files were written since the
+parent. On one machine with about 1,100 transcripts, it took 0.1 seconds with 13
+written since the parent, and under 0.7 seconds with 409, read in parallel.
 
-### Selection and coverage
+### `vessa messages --commit REV`
 
-`--since` has the same syntax and exclusive boundary as for `messages`. An
-inferred time places a finding only when it is inside the window. A finding
-that stays undated makes a time-filtered scan partial; it does not silently
-fall outside the window.
+`messages --commit REV` reads the commit's `Agent-Session` trailers and
+lists, for each session they name, the messages people typed in it after
+the commit's parent and up to the commit, each with the reply it follows,
+scrubbed as `messages` always is. The window is the hook's: after the
+newest parent's commit time (a first commit's, less 24 hours), up to the
+commit's own, inclusive. A commit that names no session lists none.
+`--since`, `--session` and `--agent` do not apply.
 
-`--session` selects a session and its known subagents. A subagent alone does
-not establish coverage of its unread parent.
+A session that is not among the sessions read on this machine, such as a
+teammate's, is said to be, never shown as having no messages: a warning
+on stderr, `"found": false`, and exit 4.
 
-Damaged JSON or UTF-8 records, unreadable paths, identity failures, missing
-selected sessions, unsupported exports and opencode stores that could not be
-read are reported in `unreadable`, with `complete: false` and exit 4.
+A rebase, cherry-pick or squash gives a commit a new time and parent, so
+its window moves with it; its trailers still say what was counted when it
+was made, and `vessa messages --session ID` lists a session whole.
 
-A complete scan means the selected sources were read. It does not mean the
-detector can recognize every possible secret. The plain output gives the
-same metadata and coverage status as the JSON.
+With `--json`, the `vessa-messages.v1` document adds:
+
+- `commit`: the commit's full `id`; `after` and `until`, the window; and
+  `sessions`, each session its trailers name: `agent`, `id` and its
+  `trailer` as written, each scrubbed since anyone can write a trailer;
+  `found`; and how many `messages` it and its subagents gave here;
+- in `coverage`, `until`, and `later`: the messages after the commit.
+  `user_turns` is then `human`, every count in `excluded`, `earlier`,
+  `later` and `undated`.
+
+Neither appears without `--commit`.
 
 ## With a team
 
@@ -1157,8 +1181,11 @@ credentials. Every other command works offline.
 ## Privacy
 
 - vessa reads local files and writes only where you tell it to: stdout, the
-  `--output` file of `report`, and, for `share`, its record under this
-  repository's `refs/vessa/usage/`.
+  `--output` file of `report`, for `share` its record under this
+  repository's `refs/vessa/usage/`, for `hook install` the hook, and for
+  the hook the `Agent-Session` trailers in the message git gives it.
+- A commit holds pointers only: an agent, a session id, a count and a time
+  (see [Commit pointers](#commit-pointers)).
 - Only `messages` prints conversation text, and it redacts secret-looking
   tokens unless `--raw` is given.
 - Text from transcripts that a command prints for a terminal (the status
@@ -1197,5 +1224,4 @@ generated reports do not belong in this repository.
 
 The exports use these schemas: `vessa-usage.v2`, `vessa-status.v2`,
 `vessa-statistics.v2`, `vessa-session-headers.v1`, `vessa-messages.v1`,
-`vessa-secrets.v1`, `vessa-team-usage.v1`, `vessa-team.v1` and
-`agent-usage.v1`. Consumers must check the schema.
+`vessa-team-usage.v1`, `vessa-team.v1` and `agent-usage.v1`. Consumers must check the schema.

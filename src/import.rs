@@ -218,96 +218,342 @@ fn transcript_sources(paths: &[PathBuf]) -> Sources {
     }
 }
 
-/// Secret-shaped occurrences, including tool traffic and subagent transcripts.
-/// Reuses native discovery, identity and lineage; never keeps conversation text.
-pub fn secrets(
-    paths: &[PathBuf],
-    select: &Selection,
-    held: &crate::held::Held,
-) -> crate::secrets::Report {
-    let mut report = crate::secrets::Report::new(select.since);
-    let sources = transcript_sources(paths);
-    for (path, why) in sources.gaps {
-        report.gap(&path.display().to_string(), None, why);
-    }
-    for path in paths {
-        if path.is_file()
-            && !crate::opencode::is_store(path)
-            && !matches!(
-                path.extension().and_then(|s| s.to_str()),
-                Some("jsonl" | "json")
-            )
-        {
-            report.gap(
-                &path.display().to_string(),
-                None,
-                "not a supported native transcript".into(),
-            );
-        }
-    }
-    let mut headers: Vec<(PathBuf, Session)> =
-        opencode_sessions(&sources.stores, &mut |store, why| {
-            report.gap(&store.display().to_string(), None, why)
-        })
-        .into_iter()
-        .map(|(store, stored)| (store, stored.session))
-        .collect();
-    for path in sources.files {
+/// When a session was active: its first and last dated record.
+pub type Span = (
+    chrono::DateTime<chrono::FixedOffset>,
+    chrono::DateTime<chrono::FixedOffset>,
+);
+
+/// Widens `span` to hold `at`.
+pub fn widen(span: &mut Option<Span>, at: chrono::DateTime<chrono::FixedOffset>) {
+    *span = Some(match *span {
+        Some((first, last)) => (first.min(at), last.max(at)),
+        None => (at, at),
+    });
+}
+
+/// The session sources written to after a time.
+pub struct Written {
+    /// Transcripts and opencode stores, by their canonical paths.
+    pub paths: Vec<PathBuf>,
+    /// The other transcripts: what a session active since may count with.
+    pub others: Vec<PathBuf>,
+    /// What could not be listed or looked at.
+    pub warnings: Vec<String>,
+}
+
+/// The transcripts and opencode stores under `paths` last written to after
+/// `since`, found as every reader finds them; only their metadata is read.
+/// A file of linked session records holds no session, and is left out.
+pub fn written_since(paths: &[PathBuf], since: chrono::DateTime<chrono::FixedOffset>) -> Written {
+    let mut warnings = Vec::new();
+    let (files, stores) = transcripts(paths, &mut warnings);
+    let (mut written, mut others) = (Vec::new(), Vec::new());
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified());
+    for path in files.into_iter().chain(stores.iter().cloned()) {
         if path.extension().is_some_and(|s| s == "json") {
-            report.gap(
-                &path.display().to_string(),
-                None,
-                "a file of linked session records contains no conversation content".into(),
-            );
             continue;
         }
-        match header(&path) {
-            Ok(session) => headers.push((path, session)),
-            Err(error) => report.gap(
-                &path.display().to_string(),
-                None,
-                format!("native identity unreadable: {error:#}"),
-            ),
-        }
-    }
-    roots(
-        &mut headers.iter_mut().map(|(_, s)| s).collect::<Vec<_>>(),
-        false,
-    );
-    let chosen = |s: &Session| {
-        select.agent.as_ref().is_none_or(|a| *a == s.agent)
-            && select
-                .session
-                .as_ref()
-                .is_none_or(|id| *id == s.id || s.subagent_of() == Some(id.as_str()))
-    };
-    if let Some(id) = &select.session {
-        if !headers.iter().any(|(_, s)| chosen(s) && s.id == *id) {
-            report.gap("selected session", None, format!("native session {id} was not read; subagents alone cannot establish its coverage"));
-        }
-    }
-    for (path, session) in headers.into_iter().filter(|(_, s)| chosen(s)) {
-        if session.agent == "opencode" {
-            match crate::opencode::records(&path, &session.id) {
-                Ok(records) => crate::secrets::scan_records(
-                    &path,
-                    &session,
-                    records,
-                    select.since,
-                    held,
-                    &mut report,
-                ),
-                Err(error) => report.gap(
-                    &path.display().to_string(),
-                    None,
-                    format!("opencode session {}: {error:#}", session.id),
-                ),
+        let mut at = modified(&path);
+        // SQLite writes a store's changes to its log, `<store>-wal`, first:
+        // the store's own file can be older than what it holds.
+        if stores.contains(&path) {
+            let mut log = path.clone().into_os_string();
+            log.push("-wal");
+            if let (Ok(store), Ok(log)) = (&at, modified(Path::new(&log))) {
+                at = Ok(log.max(*store));
             }
-        } else {
-            crate::secrets::scan_file(&path, &session, select.since, held, &mut report);
+        }
+        match at {
+            Ok(at) if chrono::DateTime::<chrono::Utc>::from(at) > since => written.push(path),
+            Ok(_) if !stores.contains(&path) => others.push(path),
+            Ok(_) => {}
+            Err(error) => warnings.push(format!("{}: {error}", path.display())),
         }
     }
-    report
+    Written {
+        paths: written,
+        others,
+        warnings,
+    }
+}
+
+/// The sessions active after a time, as the commit hook reads them.
+#[derive(Default)]
+pub struct Active {
+    /// Each session read, with its header and the files and folders its
+    /// structured tool calls name, as `share` places it; no usage is read.
+    /// Parents first, then by agent and id.
+    pub sessions: Vec<Session>,
+    /// When each was active after that time, by agent and id: its records
+    /// dated after it, and for an opencode session its model responses.
+    pub spans: HashMap<(String, String), Span>,
+    /// Where each was read: its transcripts, or its store.
+    pub read_from: HashMap<(String, String), Vec<PathBuf>>,
+    pub warnings: Vec<String>,
+}
+
+/// The sessions of `written` (from [`written_since`]), each with when it was
+/// active after `since`: a transcript read one record at a time, keeping
+/// none, several at once; of a store, only its sessions with a message
+/// after `since`, and those they count with. A subagent counts with its
+/// session, whose folder and files place it: a session whose own transcript
+/// was last written before `since` is read too, for that, when a subagent of
+/// it was active after. Copies of one session are one, as every reader
+/// merges them.
+pub fn active(written: &Written, since: chrono::DateTime<chrono::FixedOffset>) -> Active {
+    let mut found = Active::default();
+    let (stores, files): (Vec<PathBuf>, Vec<PathBuf>) = written
+        .paths
+        .iter()
+        .cloned()
+        .partition(|path| crate::opencode::is_store(path));
+    let mut read = Vec::new();
+    let take = |files: &[PathBuf], read: &mut Vec<_>, warnings: &mut Vec<String>| {
+        for (path, result) in files
+            .iter()
+            .zip(each(files, |path| active_file(path, since)))
+        {
+            match result {
+                Ok(session) => read.push((path.clone(), session)),
+                Err(error) => warnings.push(format!("{}: {error:#}", path.display())),
+            }
+        }
+    };
+    take(&files, &mut read, &mut found.warnings);
+    for store in &stores {
+        match active_store(store, since, &mut found.warnings) {
+            Ok(sessions) => read.extend(sessions.into_iter().map(|s| (store.clone(), s))),
+            Err(error) => found
+                .warnings
+                .push(format!("{}: {error:#}", store.display())),
+        }
+    }
+    // The sessions subagents count with that were not read, and the
+    // sessions Codex forks were forked from, whose transcripts tell a fork's
+    // copied history from its own turns: each in the transcript whose name
+    // ends with its id, as the agents name them, read and checked. A Codex
+    // subagent may name a thread that is a subagent too, and a fork may be
+    // of a fork, so this goes on until none is wanted.
+    let mut looked = std::collections::HashSet::new();
+    loop {
+        let mut sessions: Vec<&mut Session> = read.iter_mut().map(|(_, (s, _))| s).collect();
+        roots(&mut sessions, false);
+        let have: std::collections::HashSet<(String, String)> = read
+            .iter()
+            .map(|(_, (s, _))| (s.agent.clone(), s.id.clone()))
+            .collect();
+        let wanted: BTreeMap<(String, String), Vec<PathBuf>> = read
+            .iter()
+            .flat_map(|(_, (s, _))| {
+                let fork = (s.agent == "codex" && !s.subagent)
+                    .then(|| s.parent.clone())
+                    .flatten();
+                s.subagent_of()
+                    .map(str::to_owned)
+                    .into_iter()
+                    .chain(fork)
+                    .map(|id| (s.agent.clone(), id))
+            })
+            .filter(|key| !have.contains(key) && looked.insert(key.clone()))
+            .map(|(agent, id)| {
+                let named = written
+                    .others
+                    .iter()
+                    .filter(|p| {
+                        p.file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|stem| stem.ends_with(id.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                ((agent, id), named)
+            })
+            .collect();
+        if wanted.is_empty() {
+            break;
+        }
+        let mut more = Vec::new();
+        for named in wanted.values() {
+            take(named, &mut more, &mut found.warnings);
+        }
+        read.extend(
+            more.into_iter()
+                .filter(|(_, (s, _))| wanted.contains_key(&(s.agent.clone(), s.id.clone()))),
+        );
+    }
+    let mut merged: BTreeMap<(String, String), Session> = BTreeMap::new();
+    for (path, (session, span)) in read {
+        let key = (session.agent.clone(), session.id.clone());
+        if let Some((first, last)) = span {
+            let into = found.spans.entry(key.clone()).or_insert((first, last));
+            *into = (into.0.min(first), into.1.max(last));
+        }
+        found.read_from.entry(key.clone()).or_default().push(path);
+        match merged.get_mut(&key) {
+            Some(old) => old.touched.extend(session.touched),
+            None => {
+                merged.insert(key, session);
+            }
+        }
+    }
+    let mut sessions: Vec<Session> = merged.into_values().collect();
+    roots(&mut sessions.iter_mut().collect::<Vec<_>>(), false);
+    sessions.sort_by_key(|s| s.parent.is_some());
+    found.sessions = sessions;
+    found
+}
+
+/// `work` done on each of `items`, on as many threads as this machine runs
+/// at once, the results in the items' order.
+fn each<T: Send>(items: &[PathBuf], work: impl Fn(&Path) -> T + Sync) -> Vec<T> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(items.len());
+    let mut done: Vec<(usize, T)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(item) = items.get(i) else {
+                            return done;
+                        };
+                        done.push((i, work(item)));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, result)| result).collect()
+}
+
+/// One transcript's header, the paths its tool calls name, and when it was
+/// active after `since`, read one record at a time. A record that is not
+/// JSON is skipped, as `share` skips it.
+fn active_file(
+    path: &Path,
+    since: chrono::DateTime<chrono::FixedOffset>,
+) -> Result<(Session, Option<Span>)> {
+    let file = BufReader::new(std::fs::File::open(path)?);
+    let mut scan = Scan::default();
+    // The records before one says which agent wrote the file, which decides
+    // how its tool calls are read.
+    let mut early = Vec::new();
+    let mut agent = None;
+    let (mut cwd, mut touched, mut span) = (String::new(), Default::default(), None);
+    for line in file.split(b'\n') {
+        let line = line?;
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        scan.observe(&v);
+        if let Some(at) = timestamp(&v)
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+            .filter(|at| *at > since)
+        {
+            widen(&mut span, at);
+        }
+        match agent {
+            Some(agent) => self::touched(&v, agent, &mut cwd, &mut touched),
+            None => {
+                early.push(v);
+                if let Some((name, _)) = scan.opening() {
+                    agent = Some(name);
+                    for v in early.drain(..) {
+                        self::touched(&v, name, &mut cwd, &mut touched);
+                    }
+                }
+            }
+        }
+    }
+    let mut session = scan.session(path, Vec::new())?;
+    session.touched = touched;
+    Ok((session, span))
+}
+
+/// The sessions of an opencode store with a message created after `since`,
+/// each with the paths its tool parts name and when it was active. What the
+/// store says it holds and vessa does not read is a warning.
+fn active_store(
+    store: &Path,
+    since: chrono::DateTime<chrono::FixedOffset>,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<(Session, Option<Span>)>> {
+    let (stored, said) = crate::opencode::sessions(store)?;
+    warnings.extend(
+        said.into_iter()
+            .map(|why| format!("{}: {why}", store.display())),
+    );
+    let after =
+        |s: &crate::opencode::Stored| s.facts.last.is_some_and(|ms| ms > since.timestamp_millis());
+    // The sessions active since, and each one they count with, up its
+    // chain: a subagent's session places it.
+    let by_id: HashMap<String, &crate::opencode::Stored> =
+        stored.iter().map(|s| (s.session.id.clone(), s)).collect();
+    let mut kept = std::collections::BTreeSet::new();
+    for s in stored.iter().filter(|s| after(s)) {
+        let mut at = Some(s);
+        while let Some(s) = at.filter(|s| kept.insert(s.session.id.clone())) {
+            at = s
+                .session
+                .root
+                .as_ref()
+                .and_then(|up| by_id.get(up).copied());
+        }
+    }
+    drop(by_id);
+    let stored: Vec<_> = stored
+        .into_iter()
+        .filter(|s| kept.contains(&s.session.id))
+        .collect();
+    if stored.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut responses = crate::opencode::responses(store)?;
+    let mut sessions = Vec::new();
+    for s in stored {
+        let mut session = s.session;
+        // Its newest message, whoever wrote it, then its responses.
+        let mut span = None;
+        if let Some(last) = s
+            .facts
+            .last
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .filter(|last| *last > since)
+        {
+            widen(&mut span, last.fixed_offset());
+        }
+        for (_, v) in responses.remove(&session.id).unwrap_or_default() {
+            if let Some(at) = timestamp(&v)
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+                .filter(|at| *at > since)
+            {
+                widen(&mut span, at);
+            }
+            for path in v["data"]["paths"].as_array().into_iter().flatten() {
+                if let Some(path) = path.as_str() {
+                    touch(&mut session.touched, path, &session.cwd);
+                }
+            }
+        }
+        sessions.push((session, span));
+    }
+    Ok(sessions)
 }
 
 /// Counts each request once across the sessions, and says what the usage
@@ -1545,17 +1791,37 @@ fn pi(
 const REPLY_TAIL: usize = 600;
 
 /// What `vessa messages` selects, besides its inputs.
+#[derive(Default)]
 pub struct Selection {
     pub agent: Option<String>,
     pub session: Option<String>,
+    /// Only the sessions a commit names, by agent and id, each with its
+    /// subagents; empty for every session. One whose own transcript is not
+    /// read is not found, and said in [`Listing::named`], not an error.
+    pub named: Vec<(String, String)>,
+    /// Only messages after `since`, and up to `until`.
     pub since: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub until: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
 /// What `vessa messages` read, beside the messages it handed on.
+#[derive(Default)]
 pub struct Listing {
     pub sessions: Vec<Conversation>,
     pub coverage: Coverage,
     pub warnings: Vec<String>,
+    /// Each session [`Selection::named`] names, in its order: whether its
+    /// own transcript was read, and how many messages it and its subagents
+    /// gave.
+    pub named: Vec<Named>,
+}
+
+/// A session a commit names, as `messages` found it.
+pub struct Named {
+    pub agent: String,
+    pub id: String,
+    pub found: bool,
+    pub messages: usize,
 }
 
 /// The human messages of the transcripts under `paths`, each handed to
@@ -1574,6 +1840,8 @@ pub fn messages(
     let mut warnings = Vec::new();
     let mut coverage = Coverage {
         since: select.since.map(|t| t.to_rfc3339()),
+        until: select.until.map(|t| t.to_rfc3339()),
+        later: select.until.map(|_| 0),
         ..Default::default()
     };
     // Each transcript's header, read as `sessions --headers` reads it, and
@@ -1604,12 +1872,31 @@ pub fn messages(
         &mut headers.iter_mut().map(|(_, s)| s).collect::<Vec<_>>(),
         false,
     );
+    // Each named session, and whether its own transcript was read: only
+    // then are it and its subagents listed.
+    let named: Vec<(&str, &str, bool)> = select
+        .named
+        .iter()
+        .map(|(agent, id)| {
+            let found = headers
+                .iter()
+                .any(|(_, s)| s.agent == *agent && s.id == *id);
+            (agent.as_str(), id.as_str(), found)
+        })
+        .collect();
+    // The named session a session is listed for: itself, or its session.
+    let named_as = |s: &Session| {
+        named.iter().position(|(agent, id, found)| {
+            *found && *agent == s.agent && (*id == s.id || s.subagent_of() == Some(*id))
+        })
+    };
     let chosen = |s: &Session| {
         select.agent.as_ref().is_none_or(|a| *a == s.agent)
             && select
                 .session
                 .as_ref()
                 .is_none_or(|id| *id == s.id || s.subagent_of() == Some(id.as_str()))
+            && (named.is_empty() || named_as(s).is_some())
     };
     if let Some(id) = &select.session {
         // A subagent's own id selects it; a session's selects it with its
@@ -1705,6 +1992,7 @@ pub fn messages(
     }
     let mut seen = std::collections::HashSet::new();
     let mut sessions: BTreeMap<(String, String), Conversation> = BTreeMap::new();
+    let mut counts = vec![0; named.len()];
     for (path, s) in work {
         let mut read = match turns(path, s, scrub) {
             Ok(read) => read,
@@ -1738,16 +2026,20 @@ pub fn messages(
             s,
             read,
             &parents,
-            select.since,
+            (select.since, select.until),
             &mut seen,
             &mut coverage,
             emit,
         )?;
+        if let Some(i) = named_as(s) {
+            counts[i] += listed.messages;
+        }
         match sessions.entry((s.agent.clone(), s.id.clone())) {
             std::collections::btree_map::Entry::Occupied(mut old) => {
                 let old = old.get_mut();
                 old.messages += listed.messages;
                 old.headless &= listed.headless;
+                old.limited |= listed.limited;
             }
             std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert(listed);
@@ -1758,6 +2050,16 @@ pub fn messages(
         sessions: sessions.into_values().collect(),
         coverage,
         warnings,
+        named: named
+            .iter()
+            .zip(counts)
+            .map(|((agent, id, found), messages)| Named {
+                agent: (*agent).to_owned(),
+                id: (*id).to_owned(),
+                found: *found,
+                messages,
+            })
+            .collect(),
     })
 }
 
@@ -2232,12 +2534,16 @@ fn pi_turn(v: &Value) -> Option<Turn> {
 }
 
 /// Decides which of a transcript's user turns are a person's messages,
-/// hands those inside the window to `emit`, and counts the rest by rule.
+/// hands those inside the window (after its first time, up to its second)
+/// to `emit`, and counts the rest by rule.
 fn list(
     s: &Session,
     read: Turns,
     parents: &HashMap<String, Vec<Vec<u64>>>,
-    since: Option<chrono::DateTime<chrono::FixedOffset>>,
+    (since, until): (
+        Option<chrono::DateTime<chrono::FixedOffset>>,
+        Option<chrono::DateTime<chrono::FixedOffset>>,
+    ),
     seen: &mut std::collections::HashSet<(String, String, String)>,
     coverage: &mut Coverage,
     emit: &mut dyn FnMut(&Message) -> Result<()>,
@@ -2299,7 +2605,7 @@ fn list(
     // The person's last message, and whether the agent answered it since.
     let mut last: Option<String> = None;
     let mut answered = false;
-    let (mut humans, mut prompts, mut listed) = (0, 0, 0);
+    let (mut humans, mut prompts, mut listed, mut undated) = (0, 0, 0, 0);
     for (index, turn) in read.turns.into_iter().enumerate() {
         let in_copy = turn.copied && turn.digest.is_some() && {
             copied += 1;
@@ -2396,10 +2702,16 @@ fn list(
             answered = false;
         }
         // `since` is exclusive, as ohjaa intake windows: a reader can pass
-        // the time of the last message it handled.
-        match (since, at) {
-            (Some(_), None) => coverage.undated += 1,
-            (Some(since), Some(at)) if at <= since => coverage.earlier += 1,
+        // the time of the last message it handled. `until` is inclusive.
+        match at {
+            None if since.is_some() || until.is_some() => {
+                coverage.undated += 1;
+                undated += 1;
+            }
+            Some(at) if since.is_some_and(|since| at <= since) => coverage.earlier += 1,
+            Some(at) if until.is_some_and(|until| at > until) => {
+                *coverage.later.get_or_insert(0) += 1;
+            }
             _ => {
                 coverage.human += 1;
                 listed += 1;
@@ -2420,6 +2732,9 @@ fn list(
             }
         }
     }
+    // A message no time places may be in the window or not: how many are
+    // is unknown, as it is with a limitation.
+    let limited = !limitations.is_empty() || undated > 0;
     coverage.limitations.extend(
         limitations
             .into_iter()
@@ -2435,6 +2750,7 @@ fn list(
         source: s.source.clone(),
         headless: prompts > 0 && humans == 0,
         messages: listed,
+        limited,
     })
 }
 
@@ -2522,12 +2838,14 @@ const CONTINUATION: &str =
 /// The fixed first sentence of the prompt Codex sends for `/init`.
 const INIT: &str =
     "Generate a file named AGENTS.md that serves as a contributor guide for this repository.";
-/// The fixed openings of toimija's launch prompts, inside and outside a
-/// repository, which an agent gets as its first message. A person's task,
-/// when there is one, follows the harness text.
-const LAUNCH: [&str; 2] = [
+/// The fixed openings of toimija's launch prompts, inside a repository,
+/// outside any, and in a workspace (a folder that holds repositories),
+/// which an agent gets as its first message. A person's task, when there is
+/// one, follows the harness text.
+const LAUNCH: [&str; 3] = [
     "Your toimija session packet is below. It is your workset contract:",
     "You are in a toimija session outside any Git repository (",
+    "You are in a toimija session in a workspace, a folder that holds repositories (",
 ];
 /// The heading of the alerts toimija puts in front of a launch prompt.
 const ALERTS: &str = "## Before anything else (from the launcher)\n";

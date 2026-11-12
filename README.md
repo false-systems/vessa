@@ -15,7 +15,8 @@ format, and none of them gives you one view across all of them. vessa reads
 those files where they are and counts what they recorded, by session,
 provider and model. It keeps measured numbers apart from anything inferred.
 A count that is missing stays unknown; it never becomes zero. Nothing leaves
-your machine unless you run `vessa share`, which shares numbers only, and the
+your machine unless you run `vessa share`, which shares numbers only, or push
+commits its hook pointed to their sessions, which carry pointers only. The
 files it reads are never changed.
 
 ## See it
@@ -92,7 +93,6 @@ vessa usage --by-agent             # token totals for each agent and model
 vessa stats --period week          # usage by day, week, month or year, in UTC
 vessa status --session ID          # the latest recorded usage of one session
 vessa report --output report.html  # a private, standalone HTML report
-vessa secrets --since 7d           # whether a credential this machine holds reached a session
 ```
 
 `vessa messages` lists the messages people typed, with secret-looking tokens
@@ -116,6 +116,24 @@ vessa share   # your sessions in this repository, as numbers, pushed
 vessa team    # each person's latest share, and the team total
 ```
 
+## From a commit back to what was asked
+
+With its hook installed, each commit names the agent sessions of the clone
+that were active since its parent, in one `Agent-Session` trailer each: the
+agent, the session's id, how many messages people typed in it, and when.
+Only those pointers go out with the commit. What was typed stays on your
+machine, where `vessa messages --commit` lists it. The hook never stops a
+commit.
+
+```sh
+vessa hook install             # once per clone, for every worktree of it
+vessa messages --commit HEAD   # what people typed in the sessions HEAD names
+```
+
+```text
+Agent-Session: claude 8f3fa77a-5e7d-4a63-a519-d62bbb9a6b1d (3 messages, 2026-11-12 11:02–11:40 UTC)
+```
+
 ## How it fits
 
 vessa is one of four small tools for working with coding agents. Each one works
@@ -126,7 +144,7 @@ alone.
 - **toimija** starts the session and gives the agent the facts of the repository.
 - **sykli** runs the declared checks, keeps the proof, and reviews, lands and deploys the work.
 - **ohjaa** holds what agents are told. A person decides it.
-- **vessa** counts what agents used.
+- **vessa** counts what agents used, and keeps the thread from a commit back to what people asked.
 
 [Your first loop](https://github.com/false-systems/toimija/blob/main/docs/first-loop.md) walks one change through all four tools.
 
@@ -138,8 +156,6 @@ alone.
   provider's account.
 - It does not run, launch or control agents, and it does not run in the
   background.
-- `vessa secrets` finds credentials this machine holds. It cannot recognize
-  every possible secret, and it never prints a value.
 
 ## More
 

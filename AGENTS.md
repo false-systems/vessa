@@ -10,15 +10,14 @@ said is scrubbed of secret-looking tokens first; only `messages --raw`
 prints them as written. Vessa does not judge what a message means: that
 belongs to whoever reads its output. Usage exports, receipts and reports
 carry no message text.
-`secrets` scans native records on demand for the credentials this machine
-holds (secret-named environment variables, gh's login, the credential files
-`docs/reference.md` lists), read at the start of the scan, compared in memory and never
-printed, logged or written; it emits only scrubbed metadata, never matched
-values or conversation text. A finding is one of those credentials in a
-transcript; every other secret-shaped string is a count. It includes tool
-traffic and subagents; unreadable sources or temporally unknown findings
-cannot become an all-clear. Its optional JSON output creates no dependency
-on any consumer.
+
+The commit hook (`vessa hook prepare-commit-msg`) writes pointers only: one
+`Agent-Session` trailer per session of the clone, placed by `share`'s rule,
+active since the commit's parent, holding the agent, the agent's own
+session id, how many messages people typed then (by `messages`' rules) and
+when, to the minute. Never message text, a path, a user or machine name. It
+never stops a commit: on any error it adds nothing, says so on stderr and
+exits 0. `messages --commit` lists the words, on this machine only.
 
 `share` writes numbers only: never what anyone wrote, a path or the
 machine's name. It adds, under the repository's own `refs/vessa/usage/`,
