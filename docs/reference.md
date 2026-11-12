@@ -818,7 +818,7 @@ The parent's time is HEAD's commit time, with these exceptions:
 | Commit | Window and pointers |
 | --- | --- |
 | The first of a repository | It has no parent: sessions active in the last 24 hours. |
-| A merge | After the newest of the commits it joins. The merged commits name their own sessions; the merge, those active after all of them, as in resolving a conflict. |
+| A merge | After the newest of the commits it joins, whether git writes its message or `git commit -m` concludes it (`MERGE_HEAD` says it is one). The merged commits name their own sessions; the merge, those active after all of them, as in resolving a conflict. |
 | `git merge --squash` | The trailers of the commits it squashes, as git reads them, each as it was, then the sessions active after HEAD. |
 | An amend | git does not tell the hook it is one: after HEAD's time. The message's own pointers stay, unless `-m` replaces the message. |
 | A rebase, cherry-pick or `git am` | None added: the replayed commit keeps the pointers its message carries. A squash in a rebase keeps them as text in the message; a fixup drops the folded message, and its pointers with it. |
@@ -838,8 +838,10 @@ the commit is made; to abort that commit, delete them too.
 
 The hook never stops or holds up a commit. On any error it adds nothing,
 says why in one line on stderr, and exits 0. It gives up after 3 seconds
-and says so. The hook script ends in `|| true`, so a commit goes on even
-where `vessa` is not on `PATH`. It uses no network.
+and says so. It writes the message beside the file git gave it, then
+renames it over that file, so a write that fails leaves the message as it
+was. The hook script ends in `|| true`, so a commit goes on even where
+`vessa` is not on `PATH`. It uses no network.
 
 How long it takes depends on how many session files were written since the
 parent. On one machine with about 1,100 transcripts, it took 0.1 seconds with 13

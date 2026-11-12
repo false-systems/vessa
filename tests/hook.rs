@@ -512,6 +512,32 @@ fn the_hook_never_stops_a_commit_and_says_why_it_added_nothing() {
         "{}",
         stderr(&out)
     );
+    // A write that fails part way, here at a file size limit of nothing,
+    // never costs the person their message.
+    let file = world.root.join("COMMIT_EDITMSG");
+    let said = "Fix it.\n\nThe words the person wrote.\n";
+    std::fs::write(&file, said).unwrap();
+    let out = world
+        .command("sh", &widget)
+        .args([
+            "-c",
+            "ulimit -f 0; exec \"$0\" \"$@\"",
+            env!("CARGO_BIN_EXE_vessa"),
+            "--input",
+            text(&folder),
+            "hook",
+            "prepare-commit-msg",
+            text(&file),
+            "message",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        said,
+        "{}",
+        stderr(&out)
+    );
 }
 
 #[test]
@@ -547,12 +573,17 @@ fn a_merge_points_to_the_work_after_every_commit_it_joins() {
             ),
         ],
     );
-    let (message, out) = world.prepare(&widget, &folder, "Merge branch 'side'\n", &["merge"]);
-    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
-    assert_eq!(
-        trailers(&message),
-        ["Agent-Session: claude after (1 message, 2026-10-01 10:35 UTC)"]
-    );
+    // Concluded with `git commit -m`, git says the message is the person's,
+    // and the merge is still the merge.
+    for source in ["merge", "message"] {
+        let (message, out) = world.prepare(&widget, &folder, "Merge branch 'side'\n", &[source]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(
+            trailers(&message),
+            ["Agent-Session: claude after (1 message, 2026-10-01 10:35 UTC)"],
+            "{source}"
+        );
+    }
 }
 
 #[test]

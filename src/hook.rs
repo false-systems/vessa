@@ -154,7 +154,7 @@ pub fn prepare_commit_msg(file: &Path, source: Option<&str>, paths: Vec<PathBuf>
         return 0;
     };
     // Written here, by vessa alone: no command git is configured with runs.
-    match std::fs::write(file, message) {
+    match replace(file, &message) {
         Ok(()) => eprintln!(
             "vessa: this commit points to {} ({KEY} trailers, {} ms)",
             many(found.added, "agent session"),
@@ -166,6 +166,23 @@ pub fn prepare_commit_msg(file: &Path, source: Option<&str>, paths: Vec<PathBuf>
         ),
     }
     0
+}
+
+/// `file` holds `text` in place of what it held, or, should anything fail,
+/// still what it held: written beside it, then renamed over it.
+fn replace(file: &Path, text: &str) -> std::io::Result<()> {
+    let mut beside = file.as_os_str().to_owned();
+    beside.push(format!(".vessa-{}", std::process::id()));
+    let beside = PathBuf::from(beside);
+    let written = std::fs::metadata(file).and_then(|old| {
+        std::fs::write(&beside, text)?;
+        std::fs::set_permissions(&beside, old.permissions())?;
+        std::fs::rename(&beside, file)
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&beside);
+    }
+    written
 }
 
 /// What the hook says on stderr of what it read, as every command says it:
@@ -278,10 +295,13 @@ fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Foun
         return Ok(found);
     }
     let mut parents: Vec<String> = head.into_iter().map(str::to_owned).collect();
-    if source == Some("merge") {
-        // A merge's own work is what came after every commit it joins.
-        let merged = std::fs::read_to_string(git_dir.join("MERGE_HEAD")).unwrap_or_default();
-        parents.extend(merged.split_whitespace().map(str::to_owned));
+    // A merge's own work is what came after every commit it joins. git
+    // says `merge` only of the message it wrote: one concluded with `-m`
+    // is a merge too, as its `MERGE_HEAD` says.
+    match std::fs::read_to_string(git_dir.join("MERGE_HEAD")) {
+        Ok(merged) => parents.extend(merged.split_whitespace().map(str::to_owned)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => bail!("cannot read MERGE_HEAD: {error}"),
     }
     let since = match newest(&parents)? {
         Some(at) => at,
