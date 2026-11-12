@@ -2822,12 +2822,14 @@ const CONTINUATION: &str =
 /// The fixed first sentence of the prompt Codex sends for `/init`.
 const INIT: &str =
     "Generate a file named AGENTS.md that serves as a contributor guide for this repository.";
-/// The fixed openings of toimija's launch prompts, inside and outside a
-/// repository, which an agent gets as its first message. A person's task,
-/// when there is one, follows the harness text.
-const LAUNCH: [&str; 2] = [
+/// The fixed openings of toimija's launch prompts, inside a repository,
+/// outside any, and in a workspace (a folder that holds repositories),
+/// which an agent gets as its first message. A person's task, when there is
+/// one, follows the harness text.
+const LAUNCH: [&str; 3] = [
     "Your toimija session packet is below. It is your workset contract:",
     "You are in a toimija session outside any Git repository (",
+    "You are in a toimija session in a workspace, a folder that holds repositories (",
 ];
 /// The heading of the alerts toimija puts in front of a launch prompt.
 const ALERTS: &str = "## Before anything else (from the launcher)\n";

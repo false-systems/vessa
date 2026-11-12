@@ -724,7 +724,9 @@ harness's words:
   reason is listed as `rejection`. A rejection with no reason stays a
   `tool_result`.
 - **A task in a launch prompt.** A toimija launch prompt opens with a fixed
-  sentence, after the launcher's alerts when there are any
+  sentence, one for a session in a repository, one outside any, and one in
+  a workspace (a folder that holds repositories), after the launcher's
+  alerts when there are any
   (`## Before anything else (from the launcher)`). It holds the session
   packet, then `\nTask: <task>\n`, then a briefing. The task is the text
   between the last `Task:` line and the start of the briefing, and is listed

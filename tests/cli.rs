@@ -4165,6 +4165,37 @@ fn a_launch_task_is_what_the_person_typed_without_the_briefing() {
 }
 
 #[test]
+fn a_launch_prompt_in_a_workspace_counts_only_its_task() {
+    // toimija's prompt for a session launched in a folder that holds
+    // repositories: its packet, then the task a person typed, if any.
+    let workspace = |task: &str| {
+        format!(
+            "You are in a toimija session in a workspace, a folder that holds repositories (/demo). \
+             It is not a Git repository, so the packet below is the workspace's.\n\n\
+             # Toimija Workspace\n- folder: /demo\n{task}"
+        )
+    };
+    let v = launches(
+        "workspace-launch.jsonl",
+        &[
+            workspace(""),
+            workspace("\nTask: Compare the two parsers.\n"),
+            workspace(&format!(
+                "\nTask: Tidy the docs.\n\n{}\n",
+                ohjaa_briefing(false)
+            )),
+        ],
+    );
+    assert_eq!(texts(&v), ["Compare the two parsers.", "Tidy the docs."]);
+    assert!(v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["kind"] == "task"));
+    assert_eq!(excluded(&v)["harness_prompt"], 1);
+}
+
+#[test]
 fn every_opening_of_an_older_briefing_ends_the_task() {
     // Before its sentinel, ohjaa's briefing was known only by how each of
     // its parts opens. Each opening, after a blank line, ends the task.
