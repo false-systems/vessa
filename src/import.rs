@@ -2605,7 +2605,7 @@ fn list(
     // The person's last message, and whether the agent answered it since.
     let mut last: Option<String> = None;
     let mut answered = false;
-    let (mut humans, mut prompts, mut listed) = (0, 0, 0);
+    let (mut humans, mut prompts, mut listed, mut undated) = (0, 0, 0, 0);
     for (index, turn) in read.turns.into_iter().enumerate() {
         let in_copy = turn.copied && turn.digest.is_some() && {
             copied += 1;
@@ -2704,7 +2704,10 @@ fn list(
         // `since` is exclusive, as ohjaa intake windows: a reader can pass
         // the time of the last message it handled. `until` is inclusive.
         match at {
-            None if since.is_some() || until.is_some() => coverage.undated += 1,
+            None if since.is_some() || until.is_some() => {
+                coverage.undated += 1;
+                undated += 1;
+            }
             Some(at) if since.is_some_and(|since| at <= since) => coverage.earlier += 1,
             Some(at) if until.is_some_and(|until| at > until) => {
                 *coverage.later.get_or_insert(0) += 1;
@@ -2729,7 +2732,9 @@ fn list(
             }
         }
     }
-    let limited = !limitations.is_empty();
+    // A message no time places may be in the window or not: how many are
+    // is unknown, as it is with a limitation.
+    let limited = !limitations.is_empty() || undated > 0;
     coverage.limitations.extend(
         limitations
             .into_iter()

@@ -788,7 +788,8 @@ Agent-Session: claude 8f3fa77a-5e7d-4a63-a519-d62bbb9a6b1d (3 messages, 2026-11-
   message](#what-counts-as-a-persons-message): harness, tool, subagent and
   headless turns are not a person's, and a toimija launch prompt counts by
   its task. `at least 3 messages` when a transcript holds a record vessa
-  could not read, so more may have been said. A session that worked with
+  could not read, a message with no time, or a transcript that could not
+  be read, so more may have been said. A session that worked with
   no one typing, such as `claude -p`, has `0 messages`;
 - when it was active after the parent, to the minute, in UTC: its first and
   last record then.

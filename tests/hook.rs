@@ -509,13 +509,25 @@ fn the_hook_never_stops_a_commit_and_says_why_it_added_nothing() {
                 "secret.jsonl",
                 claude(&key, &widget, &[("10:06:00", "Hide it.")]),
             ),
+            // A message with no time cannot be placed in the window.
+            (
+                "undated.jsonl",
+                claude("undated", &widget, &[("10:07:00", "Run the checks.")])
+                    + &json!({"type":"user","uuid":"undated-u9","sessionId":"undated","cwd":text(&widget),
+                        "entrypoint":"cli","isSidechain":false,"message":{"role":"user","content":"When was this?"}})
+                    .to_string()
+                    + "\n",
+            ),
         ],
     );
     let (message, out) = world.prepare(&widget, &folder, "Fix it.\n", &["message"]);
     assert_eq!(out.status.code(), Some(0));
     assert_eq!(
         trailers(&message),
-        ["Agent-Session: claude damaged (at least 1 message, 2026-10-01 10:05 UTC)"]
+        [
+            "Agent-Session: claude damaged (at least 1 message, 2026-10-01 10:05 UTC)",
+            "Agent-Session: claude undated (at least 1 message, 2026-10-01 10:07 UTC)",
+        ]
     );
     assert!(!message.contains(&key));
     assert!(
