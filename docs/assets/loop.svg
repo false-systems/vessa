@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" fill="none" role="img" aria-labelledby="t d">
 <title id="t">How the four tools fit</title>
-<desc id="d">A piece of work moves left to right through five steps: start, check, review, land, deploy. toimija starts it; sykli checks, reviews, lands and deploys it. Above the row, ohjaa holds what agents know. Below it, vessa counts what agents used. The part that vessa does is filled in.</desc>
+<desc id="d">A piece of work moves left to right through five steps: start, check, review, land, deploy. toimija starts it. sykli checks and reviews it, lets it land on main only with proof and a review, and runs the deploy. Above the row, ohjaa holds what agents know. Below it, vessa counts what agents used and points each commit back to its session. The part that vessa does is filled in.</desc>
 <rect width="1200" height="300" fill="#f1ebdc"/>
 <g stroke="#171715" stroke-width="2">
 <path d="M64 36H1136V84H64Z" stroke-dasharray="6 8" stroke="#171715"/>
@@ -19,8 +19,8 @@
 </g>
 <g font-family="'Geist Mono', ui-monospace, Menlo, monospace" font-size="16" fill="#57594f">
 <text x="80" y="66" fill="#57594f">OHJAA · WHAT AGENTS KNOW</text>
-<text x="64" y="218">TOIMIJA</text><text x="290" y="218">SYKLI</text>
-<text x="64" y="278" fill="#c75b36">VESSA · WHAT AGENTS USED</text>
+<text x="64" y="218">TOIMIJA</text><text x="290" y="218">SYKLI · DECIDES WHAT REACHES MAIN</text>
+<text x="64" y="278" fill="#c75b36">VESSA · WHAT AGENTS USED, AND WHICH SESSION MADE EACH COMMIT</text>
 </g>
 <path d="M290 226H1136" stroke="#b9b3a5" stroke-width="2"/>
 </svg>
