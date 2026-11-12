@@ -806,10 +806,15 @@ a record, or an opencode message, dated after the parent's commit time.
 
 Only transcripts, and opencode stores, last written after that time are
 opened; the rest are only looked at. A store counts as written when its
-log, `opencode.db-wal`, was, since SQLite writes there first. `--input`
-reads other places than the agents' own folders, as elsewhere. A source
-that cannot be read is said on stderr: the commit may then miss a pointer,
-and the hook does not pretend otherwise.
+log, `opencode.db-wal`, was, since SQLite writes there first. One more is
+opened: the session of a subagent active since, when its own transcript is
+older, so that its folder and files place the subagent too. It is the
+transcript whose name ends with the session's id, as Claude Code and Codex
+name them, checked once read. It counts toward the subagent's place, not
+its time or messages. opencode keeps both in one store. `--input` reads
+other places than the agents' own folders, as elsewhere. A source that
+cannot be read is said on stderr: the commit may then miss a pointer, and
+the hook does not pretend otherwise.
 
 ### What git says the commit is
 
@@ -822,7 +827,7 @@ The parent's time is HEAD's commit time, with these exceptions:
 | `git merge --squash` | The trailers of the commits it squashes, as git reads them, each as it was, then the sessions active after HEAD. |
 | An amend | git does not tell the hook it is one: after HEAD's time. The message's own pointers stay, unless `-m` replaces the message. |
 | A rebase, cherry-pick or `git am` | None added: the replayed commit keeps the pointers its message carries. A squash in a rebase keeps them as text in the message; a fixup drops the folded message, and its pointers with it. |
-| `git commit` without `-m` or `-F`, or with a template | None added, and said: git aborts a commit left empty, or left as its template, only while it is, and a pointer would make it neither. Commit with `-m` or `-F` to have them. |
+| `git commit` without `-m` or `-F`, or with a template, or with a message of no words (`-m ""`) | None added, and said: git aborts a commit left empty, or left as its template, only while it is, and a pointer would make it neither. Commit with words, given with `-m` or `-F`, to have them. |
 
 A session already named on an `Agent-Session` line anywhere in the message
 (down to the diff `git commit -v` shows) is not named again, so running the

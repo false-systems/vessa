@@ -459,6 +459,18 @@ fn the_hook_never_stops_a_commit_and_says_why_it_added_nothing() {
             stderr(&out)
         );
     }
+    // `git commit -m ""`, or an empty file to -F: git aborts it, and a
+    // pointer would keep it from doing so.
+    for empty in ["", "\n", "\n\n# Please enter the commit message.\n"] {
+        let (message, out) = world.prepare(&widget, &folder, empty, &["message"]);
+        assert_eq!(out.status.code(), Some(0));
+        assert_eq!(message, empty);
+        assert!(
+            stderr(&out).contains("no Agent-Session pointers"),
+            "{}",
+            stderr(&out)
+        );
+    }
     // A source that cannot be read is said; what could be read still
     // counts.
     let missing = world.root.join("missing");
@@ -535,6 +547,98 @@ fn the_hook_never_stops_a_commit_and_says_why_it_added_nothing() {
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         said,
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// Sets `path`'s modification time to `time` on the fixtures' day.
+fn written_at(path: &Path, time: &str) {
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    let at = std::time::UNIX_EPOCH
+        + std::time::Duration::from_millis(u64::try_from(millis(time)).unwrap());
+    file.set_modified(at).unwrap();
+}
+
+#[test]
+fn a_subagent_active_since_counts_with_its_session_however_old() {
+    let world = World::new("subagents");
+    let widget = world.clone("widget");
+    let elsewhere = world.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    // Each session began in the clone and was last written before the
+    // parent, at 10:00; its subagent works elsewhere, after it.
+    let claude_sub = [
+        json!({"isSidechain":true,"agentId":"helper","type":"user","uuid":"s1","sessionId":"claude-main",
+            "cwd":text(&elsewhere),"timestamp":at("10:20:00"),"message":{"role":"user","content":"Count the tests."}}),
+        json!({"isSidechain":true,"agentId":"helper","type":"assistant","uuid":"s2","requestId":"req_s2",
+            "sessionId":"claude-main","cwd":text(&elsewhere),"timestamp":at("10:21:00"),
+            "message":{"id":"msg_01s2","role":"assistant","model":"demo-model","content":[{"type":"text","text":"Three."}],
+                "usage":{"input_tokens":1,"output_tokens":1}}}),
+    ]
+    .map(|v| v.to_string() + "\n")
+    .concat();
+    let codex_sub = [
+        json!({"timestamp":at("10:30:00"),"type":"session_meta","payload":{"id":"codex-helper","cwd":text(&elsewhere),
+            "source":{"subagent":{"thread_spawn":{}}},"session_id":"codex-main","originator":"codex-tui","timestamp":at("10:30:00")}}),
+        json!({"timestamp":at("10:31:00"),"type":"response_item","payload":{"type":"message","role":"assistant",
+            "content":[{"type":"output_text","text":"Done."}]}}),
+    ]
+    .map(|v| v.to_string() + "\n")
+    .concat();
+    let folder = world.sessions(
+        "sessions",
+        &[
+            (
+                "claude-main.jsonl",
+                claude("claude-main", &widget, &[("09:40:00", "Delegate it.")]),
+            ),
+            ("claude-main/subagents/agent-helper.jsonl", claude_sub),
+            (
+                "rollout-codex-main.jsonl",
+                codex(
+                    "codex-main",
+                    &widget,
+                    "09:40:00",
+                    "09:41:00",
+                    "Delegate it.",
+                ),
+            ),
+            ("rollout-codex-helper.jsonl", codex_sub),
+        ],
+    );
+    written_at(&folder.join("claude-main.jsonl"), "09:59:00");
+    written_at(&folder.join("rollout-codex-main.jsonl"), "09:59:00");
+    // opencode keeps both in one store, written since.
+    let user =
+        json!({"text":"Delegate it.","time":{"created":0},"files":[],"agents":[]}).to_string();
+    let prompt = json!({"text":"Count the tests.","time":{"created":0}}).to_string();
+    support::store(
+        &folder.join("opencode.db"),
+        support::LAYOUT,
+        &[
+            ("ses_main", None, text(&widget), millis("09:40:00")),
+            (
+                "ses_helper",
+                Some("ses_main"),
+                text(&elsewhere),
+                millis("10:40:00"),
+            ),
+        ],
+        &[
+            ("msg_1", "ses_main", "user", 0, millis("09:40:00"), user),
+            ("msg_2", "ses_helper", "user", 0, millis("10:40:00"), prompt),
+        ],
+    );
+    let (message, out) = world.prepare(&widget, &folder, "Fix.\n", &["message"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        trailers(&message),
+        [
+            "Agent-Session: claude claude-main (0 messages, 2026-10-01 10:20–10:21 UTC)",
+            "Agent-Session: codex codex-main (0 messages, 2026-10-01 10:30–10:31 UTC)",
+            "Agent-Session: opencode ses_main (0 messages, 2026-10-01 10:40 UTC)",
+        ],
         "{}",
         stderr(&out)
     );

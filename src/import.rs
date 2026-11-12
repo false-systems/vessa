@@ -236,6 +236,8 @@ pub fn widen(span: &mut Option<Span>, at: chrono::DateTime<chrono::FixedOffset>)
 pub struct Written {
     /// Transcripts and opencode stores, by their canonical paths.
     pub paths: Vec<PathBuf>,
+    /// The other transcripts: what a session active since may count with.
+    pub others: Vec<PathBuf>,
     /// What could not be listed or looked at.
     pub warnings: Vec<String>,
 }
@@ -246,7 +248,7 @@ pub struct Written {
 pub fn written_since(paths: &[PathBuf], since: chrono::DateTime<chrono::FixedOffset>) -> Written {
     let mut warnings = Vec::new();
     let (files, stores) = transcripts(paths, &mut warnings);
-    let mut written = Vec::new();
+    let (mut written, mut others) = (Vec::new(), Vec::new());
     let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified());
     for path in files.into_iter().chain(stores.iter().cloned()) {
         if path.extension().is_some_and(|s| s == "json") {
@@ -264,12 +266,14 @@ pub fn written_since(paths: &[PathBuf], since: chrono::DateTime<chrono::FixedOff
         }
         match at {
             Ok(at) if chrono::DateTime::<chrono::Utc>::from(at) > since => written.push(path),
+            Ok(_) if !stores.contains(&path) => others.push(path),
             Ok(_) => {}
             Err(error) => warnings.push(format!("{}: {error}", path.display())),
         }
     }
     Written {
         paths: written,
+        others,
         warnings,
     }
 }
@@ -289,29 +293,34 @@ pub struct Active {
     pub warnings: Vec<String>,
 }
 
-/// The sessions of `sources` (from [`written_since`]), each with when it was
+/// The sessions of `written` (from [`written_since`]), each with when it was
 /// active after `since`: a transcript read one record at a time, keeping
 /// none, several at once; of a store, only its sessions with a message
-/// after `since`. Copies of one session are one, as every reader merges
-/// them.
-pub fn active(sources: &[PathBuf], since: chrono::DateTime<chrono::FixedOffset>) -> Active {
+/// after `since`, and those they count with. A subagent counts with its
+/// session, whose folder and files place it: a session whose own transcript
+/// was last written before `since` is read too, for that, when a subagent of
+/// it was active after. Copies of one session are one, as every reader
+/// merges them.
+pub fn active(written: &Written, since: chrono::DateTime<chrono::FixedOffset>) -> Active {
     let mut found = Active::default();
-    let (stores, files): (Vec<PathBuf>, Vec<PathBuf>) = sources
+    let (stores, files): (Vec<PathBuf>, Vec<PathBuf>) = written
+        .paths
         .iter()
         .cloned()
         .partition(|path| crate::opencode::is_store(path));
     let mut read = Vec::new();
-    for (path, result) in files
-        .iter()
-        .zip(each(&files, |path| active_file(path, since)))
-    {
-        match result {
-            Ok(session) => read.push((path.clone(), session)),
-            Err(error) => found
-                .warnings
-                .push(format!("{}: {error:#}", path.display())),
+    let take = |files: &[PathBuf], read: &mut Vec<_>, warnings: &mut Vec<String>| {
+        for (path, result) in files
+            .iter()
+            .zip(each(files, |path| active_file(path, since)))
+        {
+            match result {
+                Ok(session) => read.push((path.clone(), session)),
+                Err(error) => warnings.push(format!("{}: {error:#}", path.display())),
+            }
         }
-    }
+    };
+    take(&files, &mut read, &mut found.warnings);
     for store in &stores {
         match active_store(store, since, &mut found.warnings) {
             Ok(sessions) => read.extend(sessions.into_iter().map(|s| (store.clone(), s))),
@@ -319,6 +328,48 @@ pub fn active(sources: &[PathBuf], since: chrono::DateTime<chrono::FixedOffset>)
                 .warnings
                 .push(format!("{}: {error:#}", store.display())),
         }
+    }
+    // The sessions subagents count with that were not read: each in the
+    // transcript whose name ends with its id, as the agents name them,
+    // read and checked. A Codex subagent may name a thread that is a
+    // subagent too, so this goes on until none is wanted.
+    let mut looked = std::collections::HashSet::new();
+    loop {
+        let mut sessions: Vec<&mut Session> = read.iter_mut().map(|(_, (s, _))| s).collect();
+        roots(&mut sessions, false);
+        let have: std::collections::HashSet<(String, String)> = read
+            .iter()
+            .map(|(_, (s, _))| (s.agent.clone(), s.id.clone()))
+            .collect();
+        let wanted: BTreeMap<(String, String), Vec<PathBuf>> = read
+            .iter()
+            .filter_map(|(_, (s, _))| Some((s.agent.clone(), s.subagent_of()?.to_owned())))
+            .filter(|key| !have.contains(key) && looked.insert(key.clone()))
+            .map(|(agent, id)| {
+                let named = written
+                    .others
+                    .iter()
+                    .filter(|p| {
+                        p.file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|stem| stem.ends_with(id.as_str()))
+                    })
+                    .cloned()
+                    .collect();
+                ((agent, id), named)
+            })
+            .collect();
+        if wanted.is_empty() {
+            break;
+        }
+        let mut more = Vec::new();
+        for named in wanted.values() {
+            take(named, &mut more, &mut found.warnings);
+        }
+        read.extend(
+            more.into_iter()
+                .filter(|(_, (s, _))| wanted.contains_key(&(s.agent.clone(), s.id.clone()))),
+        );
     }
     let mut merged: BTreeMap<(String, String), Session> = BTreeMap::new();
     for (path, (session, span)) in read {
@@ -437,9 +488,27 @@ fn active_store(
         said.into_iter()
             .map(|why| format!("{}: {why}", store.display())),
     );
+    let after =
+        |s: &crate::opencode::Stored| s.facts.last.is_some_and(|ms| ms > since.timestamp_millis());
+    // The sessions active since, and each one they count with, up its
+    // chain: a subagent's session places it.
+    let by_id: HashMap<String, &crate::opencode::Stored> =
+        stored.iter().map(|s| (s.session.id.clone(), s)).collect();
+    let mut kept = std::collections::BTreeSet::new();
+    for s in stored.iter().filter(|s| after(s)) {
+        let mut at = Some(s);
+        while let Some(s) = at.filter(|s| kept.insert(s.session.id.clone())) {
+            at = s
+                .session
+                .root
+                .as_ref()
+                .and_then(|up| by_id.get(up).copied());
+        }
+    }
+    drop(by_id);
     let stored: Vec<_> = stored
         .into_iter()
-        .filter(|s| s.facts.last.is_some_and(|ms| ms > since.timestamp_millis()))
+        .filter(|s| kept.contains(&s.session.id))
         .collect();
     if stored.is_empty() {
         return Ok(Vec::new());
@@ -454,6 +523,7 @@ fn active_store(
             .facts
             .last
             .and_then(chrono::DateTime::from_timestamp_millis)
+            .filter(|last| *last > since)
         {
             widen(&mut span, last.fixed_offset());
         }

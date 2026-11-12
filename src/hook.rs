@@ -283,6 +283,18 @@ fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Foun
     let git_dir = PathBuf::from(lines.next().context("not inside a git repository")?);
     let head = lines.next().filter(|_| out.status.success());
     let mut found = Found::default();
+    // `git commit -m ""`, or an empty file to -F: git aborts a commit whose
+    // message holds no words, and a pointer would keep it from doing so.
+    let words = message
+        .lines()
+        .take_while(|line| !scissors(line))
+        .any(|line| !line.trim().is_empty() && !line.starts_with('#'));
+    if !words {
+        found.notes.push(
+            "no Agent-Session pointers: the message holds no words, and a pointer would keep git from aborting the commit".into(),
+        );
+        return Ok(found);
+    }
     // The trailers' values, in the order they are added.
     let mut values: Vec<String> = Vec::new();
     // A rebase, a cherry-pick or `git am` replays commits made before: each
@@ -327,15 +339,18 @@ fn pointers(file: &Path, source: Option<&str>, paths: &[PathBuf]) -> Result<Foun
     }
     let mut here = Here::clone()?;
     let sources = import::written_since(paths, since);
-    found.notes.extend(sources.warnings);
-    let active = import::active(&sources.paths, since);
+    found.notes.extend(sources.warnings.iter().cloned());
+    let active = import::active(&sources, since);
     found.notes.extend(active.warnings.iter().cloned());
     // The sessions of this clone active since, each with its subagents:
     // placed by the rule `share` uses.
     let mut chosen = Vec::new();
     for family in model::families(&active.sessions) {
+        // Those of it active since: a session read only to place its
+        // subagents was not, and says nothing of this window.
         let members: Vec<&model::Session> = std::iter::once(family.main)
             .chain(family.subagents.iter().copied())
+            .filter(|s| active.spans.contains_key(&(s.agent.clone(), s.id.clone())))
             .collect();
         let mut span = None;
         for s in &members {
