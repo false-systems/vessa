@@ -632,6 +632,22 @@ fn a_subagent_active_since_counts_with_its_session_however_old() {
                 .map(|v| v.to_string() + "\n")
                 .concat(),
             ),
+            // Another subagent of it, elsewhere, that a person wrote to: one
+            // trailer for the session holds both.
+            (
+                "lost-main/subagents/agent-second.jsonl",
+                [
+                    json!({"isSidechain":true,"agentId":"second","type":"user","uuid":"t1","sessionId":"lost-main",
+                        "cwd":text(&elsewhere),"timestamp":at("10:55:00"),"isMeta":true,"origin":{"kind":"human"},
+                        "message":{"role":"user","content":"Also check the docs."}}),
+                    json!({"isSidechain":true,"agentId":"second","type":"assistant","uuid":"t2","requestId":"req_t2",
+                        "sessionId":"lost-main","cwd":text(&elsewhere),"timestamp":at("10:56:00"),
+                        "message":{"id":"msg_01t2","role":"assistant","model":"demo-model","content":[{"type":"text","text":"Checked."}],
+                            "usage":{"input_tokens":1,"output_tokens":1}}}),
+                ]
+                .map(|v| v.to_string() + "\n")
+                .concat(),
+            ),
         ],
     );
     written_at(&folder.join("claude-main.jsonl"), "09:59:00");
@@ -665,7 +681,7 @@ fn a_subagent_active_since_counts_with_its_session_however_old() {
             "Agent-Session: claude claude-main (0 messages, 2026-10-01 10:20–10:21 UTC)",
             "Agent-Session: codex codex-main (0 messages, 2026-10-01 10:30–10:31 UTC)",
             "Agent-Session: opencode ses_main (0 messages, 2026-10-01 10:40 UTC)",
-            "Agent-Session: claude lost-main (at least 0 messages, 2026-10-01 10:50–10:51 UTC)",
+            "Agent-Session: claude lost-main (at least 1 message, 2026-10-01 10:50–10:56 UTC)",
         ],
         "{}",
         stderr(&out)

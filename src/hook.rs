@@ -191,6 +191,19 @@ fn shown(text: &str) -> String {
     crate::render::for_terminal(&crate::scrub::Redactions::default().text(text))
 }
 
+/// A session the hook points to: the one a trailer names.
+struct Pointed<'a> {
+    agent: String,
+    id: String,
+    /// It and its subagents, those active since the parent.
+    members: Vec<&'a crate::model::Session>,
+    span: Option<Span>,
+    /// Placed in this clone, by any of them.
+    placed: bool,
+    /// Read only through subagents: its own transcript was not found.
+    alone: bool,
+}
+
 /// What the hook found to add, and what it has to say.
 #[derive(Default)]
 struct Found {
@@ -350,33 +363,51 @@ fn pointers(file: &Path, paths: &[PathBuf]) -> Result<Found> {
     let active = import::active(&sources, since);
     found.notes.extend(active.warnings.iter().cloned());
     // The sessions of this clone active since, each with its subagents:
-    // placed by the rule `share` uses.
-    let mut chosen = Vec::new();
+    // placed by the rule `share` uses. One trailer names one session, so
+    // subagents read without their session, each standing alone, are one
+    // with it, and placed when any of them is.
+    let mut chosen: Vec<Pointed> = Vec::new();
     for family in model::families(&active.sessions) {
+        let agent = family.main.agent.clone();
+        let id = family
+            .main
+            .subagent_of()
+            .unwrap_or(&family.main.id)
+            .to_owned();
+        let i = match chosen.iter().position(|p| p.agent == agent && p.id == id) {
+            Some(i) => i,
+            None => {
+                chosen.push(Pointed {
+                    agent,
+                    id,
+                    members: Vec::new(),
+                    span: None,
+                    placed: false,
+                    alone: false,
+                });
+                chosen.len() - 1
+            }
+        };
+        let pointed = &mut chosen[i];
         // Those of it active since: a session read only to place its
         // subagents was not, and says nothing of this window.
-        let members: Vec<&model::Session> = std::iter::once(family.main)
-            .chain(family.subagents.iter().copied())
-            .filter(|s| active.spans.contains_key(&(s.agent.clone(), s.id.clone())))
-            .collect();
-        let mut span = None;
-        for s in &members {
+        for s in std::iter::once(family.main).chain(family.subagents.iter().copied()) {
             if let Some(&(first, last)) = active.spans.get(&(s.agent.clone(), s.id.clone())) {
-                import::widen(&mut span, first);
-                import::widen(&mut span, last);
+                import::widen(&mut pointed.span, first);
+                import::widen(&mut pointed.span, last);
+                pointed.members.push(s);
             }
         }
-        if span.is_none() || here.placed(&family).is_none() {
-            continue;
-        }
-        chosen.push((family.main, members, span));
+        pointed.alone |= family.main.subagent_of().is_some();
+        pointed.placed |= here.placed(&family).is_some();
     }
+    chosen.retain(|p| p.span.is_some() && p.placed);
     // Their messages, read from their own transcripts, and from the
     // transcript a Codex fork was forked from, which tells the history it
     // copied from its own turns.
     let mut read_from: Vec<PathBuf> = chosen
         .iter()
-        .flat_map(|(_, members, _)| members)
+        .flat_map(|p| &p.members)
         .flat_map(|s| {
             let fork = (s.agent == "codex" && !s.subagent)
                 .then(|| s.parent.clone())
@@ -427,10 +458,18 @@ fn pointers(file: &Path, paths: &[PathBuf]) -> Result<Found> {
         .map(|c| ((c.agent.as_str(), c.id.as_str()), c.limited))
         .collect();
     let mut withheld = 0;
-    for (main, members, mut span) in chosen {
-        // A session read only by its subagent: what was typed in it is
+    for Pointed {
+        agent,
+        id,
+        members,
+        mut span,
+        alone,
+        ..
+    } in chosen
+    {
+        // A session read only by its subagents: what was typed in it is
         // unknown.
-        let (mut messages, mut partial) = (0, main.subagent_of().is_some());
+        let (mut messages, mut partial) = (0, alone);
         for s in &members {
             let typed = said.get(&(s.agent.clone(), s.id.clone()));
             if let Some((first, last)) = typed.and_then(|t| t.1) {
@@ -449,8 +488,6 @@ fn pointers(file: &Path, paths: &[PathBuf]) -> Result<Found> {
         let Some(span) = span else {
             continue;
         };
-        let agent = main.agent.clone();
-        let id = main.subagent_of().unwrap_or(&main.id).to_owned();
         if named.contains(&(agent.clone(), id.clone())) {
             continue;
         }
