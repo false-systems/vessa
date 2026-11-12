@@ -25,7 +25,6 @@ Contents:
 - [Messages](#messages)
 - [Redaction](#redaction)
 - [What counts as a person's message](#what-counts-as-a-persons-message)
-- [Secrets scan](#secrets-scan)
 - [With a team](#with-a-team)
 - [Privacy](#privacy)
 - [Limits](#limits)
@@ -42,7 +41,6 @@ Contents:
 | `vessa report --output FILE` | Writes a standalone, private HTML report. Refuses to overwrite. |
 | `vessa receipt` | Emits one session's usage as an `agent-usage.v1` receipt. |
 | `vessa messages` | Lists the messages people typed, each with the agent reply it follows. `--since`, `--raw`. |
-| `vessa secrets` | Scans for credentials this machine holds. Prints location, rule and count, never a value. `--since`. |
 | `vessa claude-statusline` | Renders Claude Code's status-line JSON from stdin. |
 | `vessa share` | Shares your usage in this repository with its team: one record of numbers, committed under `refs/vessa/usage/` and pushed. `--dry-run`, `--no-push`, `--remote`. |
 | `vessa team` | What the team shared: each person's latest share, and a team total. `--by agent\|model\|week\|branch`, `--no-fetch`, `--remote`. |
@@ -267,11 +265,6 @@ database) is a source warning, never an empty store. So is a store when
   as a prompt.
 - **`--since`.** A session whose newest message is not after the given time
   is counted in `unmodified_transcripts` and not read.
-- **Secrets scan.** A `user` message is `person`. An assistant's text and
-  reasoning blocks are `agent`. A tool block's `state.input` is
-  `tool_input`, and every other field of its `state` is `tool_output`.
-  Everything else is `other`. A message whose data is not JSON is a gap, and
-  is still scanned as text.
 
 ## Session headers
 
@@ -492,8 +485,7 @@ session's agent and id. Directory and time never establish a link.
 - A record that names no session vessa read is reported as a warning.
 - A session the export says it could not read is reported as a warning.
 - Receipt totals and transcript totals are never added together.
-- An export holds no conversation content. `messages` does not read one,
-  and `secrets` reports it as unreadable.
+- An export holds no conversation content, and `messages` does not read one.
 
 ```sh
 vessa report --input /path/to/session.jsonl --input /path/to/export.json --output work.html
@@ -747,122 +739,6 @@ The briefing in a launch prompt starts in one of two ways:
   `Sessions in the other worktrees of this clone at launch`,
   `System perimeter (derived by ohjaa at launch; …`. In this case a task
   that contains a blank line followed by one of those openings ends early.
-
-## Secrets scan
-
-`vessa secrets` scans Claude Code, Codex, pi and opencode records for the
-credentials this machine holds. It covers subagent and headless transcripts,
-user and assistant text, tool inputs and tool outputs. A finding is an
-alarm: one of your credentials reached an agent session, and so the provider
-that ran it. Nothing is stored, and no network is used.
-
-```sh
-vessa secrets --input examples/codex.jsonl --json
-vessa secrets --since 7d --agent claude
-```
-
-### What it compares with
-
-The credentials are read at the start of each scan, kept in memory only,
-compared by value, and never printed, logged or written. The sources are:
-
-- environment variables with a secret-like name: one containing `TOKEN`,
-  `SECRET`, `PASSWORD`, `PASSWD`, `KEY`, `CREDENTIAL` or `AUTH`, but not a
-  socket, path, file, folder or session key;
-- the GitHub CLI's login (`gh auth token`), when `gh` is on `PATH`;
-- `~/.aws/credentials`, `~/.config/gh/hosts.yml`, `~/.git-credentials`,
-  `~/.netrc`, `~/.npmrc`, `~/.docker/config.json`, `~/.codex/auth.json`,
-  `~/.pi/agent/auth.json`, `~/.claude/.credentials.json` and
-  `~/.ssh/id_{ed25519,rsa,ecdsa}`.
-
-From a file, a credential is each secret-shaped string the detector
-recognizes in it. From a variable or `gh`, it is also the whole value, when
-that is 16 bytes or more, whatever its shape. Each credential is looked for
-in every record as it stands, so it is found however it is labelled there.
-macOS Keychain items are not read, since reading one can prompt. A source
-that exists but cannot be read leaves the scan partial.
-
-The report names each source in `compared_with`: its name, whether it was
-`read`, `absent` or `unreadable`, and how many credentials it held. It never
-shows a value.
-
-### Other secret-shaped strings
-
-Every other secret-shaped string the detector finds is counted by rule in
-`candidates` and never listed: other people's keys, test fixtures, examples,
-signatures, ids. The detector is the one [Redaction](#redaction) uses. Of
-those, `placeholders` counts the plain ones: a few characters repeated
-(`sk-a1a1a1…`), a straight run of the alphabet or digits, or an AWS
-documentation example (`…EXAMPLE`).
-
-Recognized key formats take precedence, then explicit secret labels
-(`password`, `api_key`, `token` and similar words), then the generic long
-mixed-string rule. A finding's `rule` is the one the detector gives the
-credential where it stands, or `no_known_shape` where it gives none. Its
-`held` names the source that holds it.
-
-### `vessa-secrets.v1`
-
-The document has `complete`, `since`, `transcripts`, `findings`,
-`unreadable`, `compared_with`, `candidates` and `placeholders`.
-
-Each finding has:
-
-- `agent` and `session`, and optional `cwd`;
-- `at`, with `at_inferred`;
-- the source path and line. For opencode, the source is its store and the
-  line is the message's `seq`;
-- `where`: `person`, `agent`, `tool_input`, `tool_output` or `other`.
-  `person` means a user-role input. It does not prove a human wrote it;
-- `rule`, `held` and `count`;
-- `opaque_count` and `opaque_native` (below).
-
-`count` is the number of matched occurrences in the selected records, not
-the number of unique credentials. Mirrored or copied records can repeat an
-occurrence.
-
-**Opaque fields.** `opaque_count` is the part of `count` found in Claude
-Code thinking-signature fields or Codex encrypted-reasoning fields. These
-fields are scanned like any other. Being in one is not an exemption, and
-does not mean the content is safe. `opaque_native: true` says the opaque
-occurrences were found at the agent's own positions for those fields: Claude
-Code assistant thinking blocks or Codex response-item reasoning payloads.
-User blocks, tool content, unknown records and fields that merely share a
-name do not count. A report without `opaque_count` leaves it unknown, not
-zero. A report without `opaque_native` is unverified and must not be used to
-dismiss an alert.
-
-**Time.** A record with no valid time of its own takes the time of the
-record before it in its transcript, and says so (`at_inferred: true`). Known
-file-history snapshots use their nested timestamp. Without a record before
-it, a finding's time stays unknown (`at: null`). `undated_records` counts
-finding records that produced a timestamp warning under `--since`.
-
-**Damaged records.** Valid records around a damaged record are still
-scanned. A match found in a damaged record has null time and location kind,
-because its fields could not be decoded. Summaries keep known counts as
-lower bounds. Unknown record shapes are scanned as `other`.
-
-No value, message text or fingerprint is emitted. Metadata is scrubbed too,
-including session ids and path components. There is no `--raw` mode.
-
-### Selection and coverage
-
-`--since` has the same syntax and exclusive boundary as for `messages`. An
-inferred time places a finding only when it is inside the window. A finding
-that stays undated makes a time-filtered scan partial; it does not silently
-fall outside the window.
-
-`--session` selects a session and its known subagents. A subagent alone does
-not establish coverage of its unread parent.
-
-Damaged JSON or UTF-8 records, unreadable paths, identity failures, missing
-selected sessions, unsupported exports and opencode stores that could not be
-read are reported in `unreadable`, with `complete: false` and exit 4.
-
-A complete scan means the selected sources were read. It does not mean the
-detector can recognize every possible secret. The plain output gives the
-same metadata and coverage status as the JSON.
 
 ## With a team
 
@@ -1197,5 +1073,4 @@ generated reports do not belong in this repository.
 
 The exports use these schemas: `vessa-usage.v2`, `vessa-status.v2`,
 `vessa-statistics.v2`, `vessa-session-headers.v1`, `vessa-messages.v1`,
-`vessa-secrets.v1`, `vessa-team-usage.v1`, `vessa-team.v1` and
-`agent-usage.v1`. Consumers must check the schema.
+`vessa-team-usage.v1`, `vessa-team.v1` and `agent-usage.v1`. Consumers must check the schema.

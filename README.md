@@ -92,7 +92,6 @@ vessa usage --by-agent             # token totals for each agent and model
 vessa stats --period week          # usage by day, week, month or year, in UTC
 vessa status --session ID          # the latest recorded usage of one session
 vessa report --output report.html  # a private, standalone HTML report
-vessa secrets --since 7d           # whether a credential this machine holds reached a session
 ```
 
 `vessa messages` lists the messages people typed, with secret-looking tokens
@@ -138,8 +137,6 @@ alone.
   provider's account.
 - It does not run, launch or control agents, and it does not run in the
   background.
-- `vessa secrets` finds credentials this machine holds. It cannot recognize
-  every possible secret, and it never prints a value.
 
 ## More
 

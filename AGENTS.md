@@ -10,15 +10,6 @@ said is scrubbed of secret-looking tokens first; only `messages --raw`
 prints them as written. Vessa does not judge what a message means: that
 belongs to whoever reads its output. Usage exports, receipts and reports
 carry no message text.
-`secrets` scans native records on demand for the credentials this machine
-holds (secret-named environment variables, gh's login, the credential files
-`docs/reference.md` lists), read at the start of the scan, compared in memory and never
-printed, logged or written; it emits only scrubbed metadata, never matched
-values or conversation text. A finding is one of those credentials in a
-transcript; every other secret-shaped string is a count. It includes tool
-traffic and subagents; unreadable sources or temporally unknown findings
-cannot become an all-clear. Its optional JSON output creates no dependency
-on any consumer.
 
 `share` writes numbers only: never what anyone wrote, a path or the
 machine's name. It adds, under the repository's own `refs/vessa/usage/`,

@@ -1,11 +1,9 @@
-mod held;
 mod import;
 mod metrics;
 mod model;
 mod opencode;
 mod render;
 mod scrub;
-mod secrets;
 mod team;
 mod work;
 
@@ -45,14 +43,6 @@ struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum Cmd {
-    /// Scan native input/output for secret-shaped tokens. Prints only location,
-    /// rule and count metadata, never values. With --json: vessa-secrets.v1.
-    Secrets {
-        /// RFC 3339, UTC date or age (7d, 12h); exclusive. Undated findings
-        /// remain visible and make a time-filtered scan partial (exit 4).
-        #[arg(long)]
-        since: Option<String>,
-    },
     /// List native sessions and source coverage.
     Sessions {
         /// Each session's header alone (identity, lineage, start, folder,
@@ -175,9 +165,6 @@ fn run_once(cli: Cli) -> Result<i32> {
     if let Cmd::Messages { since, raw } = &cli.command {
         return messages(&cli, since.as_deref(), *raw);
     }
-    if let Cmd::Secrets { since } = &cli.command {
-        return scan_secrets(&cli, since.as_deref());
-    }
     if let Cmd::Share {
         remote,
         no_push,
@@ -275,11 +262,9 @@ fn run_once(cli: Cli) -> Result<i32> {
         eprintln!("vessa: {}", clean(warning));
     }
     match cli.command {
-        Cmd::ClaudeStatusline
-        | Cmd::Messages { .. }
-        | Cmd::Secrets { .. }
-        | Cmd::Share { .. }
-        | Cmd::Team { .. } => unreachable!(),
+        Cmd::ClaudeStatusline | Cmd::Messages { .. } | Cmd::Share { .. } | Cmd::Team { .. } => {
+            unreachable!()
+        }
         Cmd::Status => {
             let families = model::families(&report.sessions);
             ensure!(
@@ -755,137 +740,6 @@ fn plain(
         writeln!(out, "  {}", clean(line))?;
     }
     Ok(())
-}
-
-/// On-demand secret-shaped occurrences: metadata only, with honest coverage.
-fn scan_secrets(cli: &Cli, from: Option<&str>) -> Result<i32> {
-    if let Some(agent) = &cli.agent {
-        supported(agent)?;
-    }
-    let select = import::Selection {
-        agent: cli.agent.clone(),
-        session: cli.session.clone(),
-        since: from.map(since).transpose()?,
-    };
-    let (paths, warnings) = inputs(cli)?;
-    // The credentials this machine holds: a finding is one of them in a
-    // transcript. Read now, compared in memory, never printed.
-    let mut held = held::Held::read(
-        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
-        std::env::vars_os().filter_map(|(name, value)| {
-            Some((name.into_string().ok()?, value.into_string().ok()?))
-        }),
-        std::env::var_os("PATH").as_deref(),
-    );
-    let mut report = import::secrets(&paths, &select, &held);
-    report.compared(&mut held);
-    drop(held);
-    for warning in warnings {
-        report.gap("requested source", None, warning);
-    }
-    let complete = report.complete;
-    let mut value = serde_json::to_value(report)?;
-    // Metadata can itself contain a matched value (including a native ID).
-    // Scrub the entire document, not just its human-readable rendering.
-    secrets::scrub_metadata(&mut value);
-    if cli.json {
-        json(&value)?;
-    } else {
-        let findings = value["findings"].as_array().context("missing findings")?;
-        let total = findings.iter().try_fold(0u64, |sum, f| {
-            sum.checked_add(f["count"].as_u64().context("finding without a count")?)
-                .context("finding count overflow")
-        })?;
-        let scope = if complete {
-            "scan complete"
-        } else {
-            "scan incomplete (exit 4)"
-        };
-        if total == 0 {
-            println!(
-                "None of this machine's credentials appears in {} transcript(s) · {scope}",
-                value["transcripts"]
-            );
-        } else {
-            println!(
-                "{total} occurrence(s) of this machine's credentials in {} transcript(s) · {scope}",
-                value["transcripts"]
-            );
-            println!("  Each is a credential of yours that reached an agent session: rotate it.");
-        }
-        let undated = value["undated_records"]
-            .as_u64()
-            .context("missing timestamp coverage")?;
-        if undated > 0 {
-            println!("  {undated} finding record(s) have no timestamp; they remain included.");
-        }
-        for f in findings {
-            let text = |key: &str| render::for_terminal(f[key].as_str().unwrap_or("unknown"));
-            println!(
-                "  {}/{} · {} · {} ({}) × {} · {}:{} · {}{}",
-                text("agent"),
-                text("session"),
-                text("where"),
-                text("held"),
-                text("rule"),
-                f["count"],
-                text("source"),
-                f["line"],
-                text("at"),
-                if f["at_inferred"] == true {
-                    " (time of the record before)"
-                } else {
-                    ""
-                }
-            );
-        }
-        let sources = value["compared_with"]
-            .as_array()
-            .context("missing credential sources")?;
-        let held: u64 = sources
-            .iter()
-            .filter_map(|s| s["credentials"].as_u64())
-            .sum();
-        let read: Vec<String> = sources
-            .iter()
-            .filter(|s| s["status"] == "read" && s["credentials"].as_u64() > Some(0))
-            .map(|s| render::for_terminal(s["source"].as_str().unwrap_or("unknown")))
-            .collect();
-        println!(
-            "  Compared with {held} credential(s) this machine holds{}",
-            if read.is_empty() {
-                String::new()
-            } else {
-                format!(": {}", read.join(", "))
-            }
-        );
-        let others: u64 = value["candidates"]
-            .as_object()
-            .context("missing candidate counts")?
-            .values()
-            .filter_map(serde_json::Value::as_u64)
-            .sum();
-        if others > 0 {
-            println!(
-                "  Not alarms: {others} other secret-shaped string(s), none of them this machine's credentials ({} plainly placeholders).",
-                value["placeholders"]
-            );
-        }
-    }
-    for gap in value["unreadable"]
-        .as_array()
-        .context("missing unreadable coverage")?
-    {
-        eprintln!(
-            "vessa: {}: {}",
-            render::for_terminal(gap["path"].as_str().unwrap_or("unknown")),
-            render::for_terminal(gap["why"].as_str().unwrap_or("unknown"))
-        );
-    }
-    if !complete {
-        eprintln!("vessa: partial secrets scan (exit 4); findings do not establish an all-clear");
-    }
-    Ok(if complete { 0 } else { 4 })
 }
 
 /// Each message is written as its transcript is read; secrets are scrubbed
