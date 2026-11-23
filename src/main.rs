@@ -1,6 +1,7 @@
 mod digest;
 mod hook;
 mod import;
+mod imported;
 mod line;
 mod metrics;
 mod model;
@@ -73,6 +74,16 @@ enum Cmd {
     Stats {
         #[arg(long, value_enum, default_value = "month")]
         period: metrics::Period,
+    },
+    /// Keep a usage receipt from elsewhere — an `agent-usage.v1` document
+    /// exactly as `vessa receipt` writes it — in vessa's own state, one per
+    /// session, so `vessa usage` and `vessa stats` count sessions that ran
+    /// on another machine. Strict: only that schema, no money fields.
+    /// Repeatable. Exit codes: 0 kept, 2 a file refused.
+    Import {
+        /// One receipt file.
+        #[arg(long = "file", required = true)]
+        file: Vec<PathBuf>,
     },
     /// Render Claude Code's native status-line JSON from stdin.
     ClaudeStatusline,
@@ -229,6 +240,9 @@ fn run_once(cli: Cli) -> Result<i32> {
         println!("{}", metrics::claude_statusline(&input));
         return Ok(0);
     }
+    if let Cmd::Import { file } = &cli.command {
+        return imported::store(file);
+    }
     if let Cmd::Line { always } = cli.command {
         // A line reads the agents' own folders unless told otherwise, and
         // never fails a terminal: its errors are said, and it exits 0.
@@ -318,6 +332,29 @@ fn run_once(cli: Cli) -> Result<i32> {
         import::read(&paths)?
     };
     report.warnings.extend(not_installed);
+    // Receipts imported from elsewhere count with the native sessions, in
+    // the commands that count. A receipt whose session is also read from
+    // its transcript here is skipped, said, never counted twice.
+    if matches!(cli.command, Cmd::Usage { .. } | Cmd::Stats { .. }) {
+        let native: std::collections::BTreeSet<(&str, &str)> = report
+            .sessions
+            .iter()
+            .map(|session| (session.agent.as_str(), session.id.as_str()))
+            .collect();
+        let mut adding = Vec::new();
+        for session in imported::sessions() {
+            if native.contains(&(session.agent.as_str(), session.id.as_str())) {
+                eprintln!(
+                    "vessa: an imported receipt of {} session {} is not counted; its transcript is read here",
+                    crate::render::for_terminal(&session.agent),
+                    crate::render::for_terminal(&session.id)
+                );
+                continue;
+            }
+            adding.push(session);
+        }
+        report.sessions.extend(adding);
+    }
     if let Some(agent) = cli.agent {
         supported(&agent)?;
         report.sessions.retain(|s| s.agent == agent);
@@ -370,6 +407,7 @@ fn run_once(cli: Cli) -> Result<i32> {
         Cmd::ClaudeStatusline
         | Cmd::Messages { .. }
         | Cmd::Hook { .. }
+        | Cmd::Import { .. }
         | Cmd::Line { .. }
         | Cmd::Collect { .. }
         | Cmd::Digest { .. }
