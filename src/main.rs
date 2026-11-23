@@ -1,5 +1,7 @@
+mod digest;
 mod hook;
 mod import;
+mod line;
 mod metrics;
 mod model;
 mod opencode;
@@ -74,6 +76,40 @@ enum Cmd {
     },
     /// Render Claude Code's native status-line JSON from stdin.
     ClaudeStatusline,
+    /// What happened, for the person at a terminal's opening: today's agent
+    /// sessions and their usage, one line, from this machine's session
+    /// folders. Prints only at a terminal with no agent session running,
+    /// once a day or when it changes; gaps are said, never an all-clear.
+    /// Reads no git and no network, starts nothing, always exits 0.
+    Line {
+        /// Print now, whatever the cursor and stdout say; counts as shown.
+        #[arg(long)]
+        always: bool,
+    },
+    /// Gather what `vessa digest` reads into one snapshot: the sessions of
+    /// the last seven days, with their subagents, usage and last record's
+    /// time, and the sources' warnings. No git, no network; one collect at
+    /// a time. Exit codes: 0 all read, 4 partial, 1 the snapshot could not
+    /// be written.
+    Collect {
+        /// Started by `digest`: says nothing.
+        #[arg(long, hide = true)]
+        background: bool,
+    },
+    /// What happened since the last digest (or `--since`, which moves no
+    /// cursor): one line per session, a day at a time, who is live, and
+    /// the gaps said as gaps. Collects first when the snapshot is old,
+    /// waiting at most 10 s. Exit codes: 0 all read, 4 partial or nothing
+    /// collected.
+    Digest {
+        /// Show everything since then instead (`7d`, `24h`, a date or an
+        /// RFC 3339 time); the cursor does not move.
+        #[arg(long, value_parser = crate::since)]
+        since: Option<chrono::DateTime<chrono::FixedOffset>>,
+        /// Use the snapshot as it is, however old.
+        #[arg(long)]
+        no_collect: bool,
+    },
     /// The messages people typed into agent sessions, each with the agent
     /// reply it follows; harness, tool, subagent and headless turns are
     /// counted by rule, not listed. Every secret-looking token in what is
@@ -193,6 +229,31 @@ fn run_once(cli: Cli) -> Result<i32> {
         println!("{}", metrics::claude_statusline(&input));
         return Ok(0);
     }
+    if let Cmd::Line { always } = cli.command {
+        // A line reads the agents' own folders unless told otherwise, and
+        // never fails a terminal: its errors are said, and it exits 0.
+        let (paths, not_installed) = match inputs(&cli) {
+            Ok(found) => found,
+            Err(error) => {
+                eprintln!("vessa line: {error:#}");
+                return Ok(0);
+            }
+        };
+        return line::run(&paths, &not_installed, cli.json, always);
+    }
+    if let Cmd::Collect { background } = cli.command {
+        let (paths, not_installed) = inputs(&cli)?;
+        return digest::collect(&paths, &not_installed, background);
+    }
+    if let Cmd::Digest { since, no_collect } = &cli.command {
+        let (paths, _not_installed) = inputs(&cli)?;
+        return digest::digest(
+            &paths,
+            since.map(|since| since.to_rfc3339()).as_deref(),
+            *no_collect,
+            cli.json,
+        );
+    }
     if let Cmd::Messages { since, raw, commit } = &cli.command {
         return messages(&cli, since.as_deref(), *raw, commit.as_deref());
     }
@@ -309,6 +370,9 @@ fn run_once(cli: Cli) -> Result<i32> {
         Cmd::ClaudeStatusline
         | Cmd::Messages { .. }
         | Cmd::Hook { .. }
+        | Cmd::Line { .. }
+        | Cmd::Collect { .. }
+        | Cmd::Digest { .. }
         | Cmd::Share { .. }
         | Cmd::Team { .. } => unreachable!(),
         Cmd::Status => {
@@ -641,7 +705,7 @@ fn supported(agent: &str) -> Result<()> {
 }
 
 /// `--since`: RFC 3339, a UTC date, or an age in days or hours.
-fn since(text: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
+pub(crate) fn since(text: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
     if let Ok(time) = chrono::DateTime::parse_from_rfc3339(text) {
         return Ok(time);
     }
