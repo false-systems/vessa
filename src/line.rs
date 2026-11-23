@@ -66,6 +66,12 @@ fn agent_marker(var: impl Fn(&str) -> Option<OsString>) -> Option<&'static str> 
         .copied()
 }
 
+/// Whether a person is watching: no agent session's marker is set. Whether
+/// stdout is a terminal is the caller's to judge.
+pub(crate) fn person_watching(var: impl Fn(&str) -> Option<OsString>) -> bool {
+    agent_marker(var).is_none()
+}
+
 /// The day's line, as `--json` prints it.
 #[derive(Serialize)]
 struct Line {
@@ -101,7 +107,7 @@ const LINE_SCHEMA: &str = "vessa-line.v1";
 
 /// Now, as an RFC 3339 UTC time: the crate's clock-less chrono builds
 /// `now` from the system clock, as `--since` does.
-fn now() -> chrono::DateTime<chrono::Utc> {
+pub(crate) fn now() -> chrono::DateTime<chrono::Utc> {
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("the system clock is before the epoch")
@@ -250,7 +256,7 @@ fn text(
 /// A token count for a person: plain below a thousand, then `k` and `M`,
 /// one decimal while the count is small enough for it to say something
 /// (1.2k, 9.9k) and a whole number from there (302k, 12M).
-fn magnitude(tokens: u64) -> String {
+pub(crate) fn magnitude(tokens: u64) -> String {
     let count = tokens as f64;
     let (divided, suffix) = if count < 1_000.0 {
         return tokens.to_string();

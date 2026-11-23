@@ -19,6 +19,7 @@ Contents:
 - [Statistics](#statistics)
 - [Claude Code status line](#claude-code-status-line)
 - [The terminal line](#the-terminal-line)
+- [The digest](#the-digest)
 - [Usage export](#usage-export)
 - [Receipts](#receipts)
 - [Linked session records](#linked-session-records)
@@ -47,6 +48,8 @@ Contents:
 | `vessa hook prepare-commit-msg FILE [SOURCE [SHA]]` | What that hook runs: adds an `Agent-Session` trailer per session. Never stops a commit. |
 | `vessa claude-statusline` | Renders Claude Code's status-line JSON from stdin. |
 | `vessa line` | What happened, for a person at a terminal's opening: today's agent sessions and their usage, one line. See [The terminal line](#the-terminal-line). |
+| `vessa collect` | Gathers what `vessa digest` reads into one snapshot: the last seven days' sessions, their usage, and the sources' warnings. |
+| `vessa digest` | What happened since the last digest (`--since` asks instead), from that snapshot: a line per session, who is live, gaps said as gaps. See [The digest](#the-digest). |
 | `vessa share` | Shares your usage in this repository with its team: one record of numbers, committed under `refs/vessa/usage/` and pushed. `--dry-run`, `--no-push`, `--remote`. |
 | `vessa team` | What the team shared: each person's latest share, and a team total. `--by agent\|model\|week\|branch`, `--no-fetch`, `--remote`. |
 
@@ -456,6 +459,36 @@ To show it as a terminal opens, add to `~/.zshrc`:
 ```sh
 command -v vessa >/dev/null && vessa line
 ```
+
+## The digest
+
+```sh
+vessa collect               # gather the snapshot now, and say what it read
+vessa digest                # what happened since the last digest
+vessa digest --since 7d     # a question; the cursor does not move
+vessa digest --json         # the vessa-digest.v1 record, nothing kept
+```
+
+`collect` writes one snapshot, `$XDG_STATE_HOME/vessa/collected.json`
+(`vessa-collected.v1`): every session of the last seven days with its
+subagents, its summed usage (an entry lacking a category makes the
+category unknown, never zero) and the last time a record names, plus the
+sources' warnings and how many sessions no record places in time. One
+collect runs at a time, under `collect.lock`; a lock whose holder died is
+taken over. It reads the same folders every command reads and nothing
+else — no git, no network. Exit codes: 0 all read, 4 partial or sessions
+unplaced, 1 the snapshot could not be written.
+
+`digest` shows what happened since the last digest (or the last 24 h the
+first time): one line per session — when, the agent, the folder it worked
+in, its tokens — a day at a time, then by-agent totals, who is live (a
+record within the last 30 minutes), and the gaps said as gaps. A snapshot
+older than five minutes is collected first: the digest starts a collect
+and waits at most 10 s, then shows the snapshot it has while the collect
+goes on. The cursor (`vessa/digest.json`, `vessa-digest-cursor.v1`) moves
+only when a person at a terminal catches up — `--since` answers a
+question, and an agent's shell moves nothing. Exit codes: 0 all read, 4
+partial or nothing collected yet.
 
 ## Usage export
 

@@ -16,8 +16,12 @@ fn now() -> chrono::DateTime<chrono::Utc> {
 }
 
 fn temp(name: &str) -> PathBuf {
+    // A counter apart from the clock: two tests that make a folder in the
+    // same nanosecond must not share it.
+    static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     std::env::temp_dir().join(format!(
-        "vessa-line-test-{}-{}-{name}",
+        "vessa-line-test-{}-{}-{call}-{name}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
