@@ -84,6 +84,7 @@
         "src/hook.rs",
         "src/import.rs",
         "src/line.rs",
+        "src/imported.rs",
         "src/digest.rs",
         "src/main.rs",
         "src/metrics.rs",
@@ -97,6 +98,7 @@
         "tests/hook.rs",
         "tests/instructions.rs",
         "tests/line.rs",
+        "tests/imported.rs",
         "tests/digest.rs",
         "tests/support/mod.rs",
         "tests/team.rs"
@@ -138,6 +140,7 @@
         "src/hook.rs",
         "src/import.rs",
         "src/line.rs",
+        "src/imported.rs",
         "src/digest.rs",
         "src/main.rs",
         "src/metrics.rs",
@@ -151,6 +154,7 @@
         "tests/hook.rs",
         "tests/instructions.rs",
         "tests/line.rs",
+        "tests/imported.rs",
         "tests/digest.rs",
         "tests/support/mod.rs",
         "tests/team.rs"
