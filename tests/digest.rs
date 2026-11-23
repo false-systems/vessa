@@ -348,3 +348,181 @@ fn what_cannot_be_read_is_counted_never_hidden() {
     std::fs::remove_dir_all(state).unwrap();
     std::fs::remove_dir_all(given).unwrap();
 }
+
+#[test]
+fn the_digest_names_the_work_and_what_waits() {
+    let state = temp("state");
+    let given = temp("given");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&given).unwrap();
+    transcript(&given, "fresh", 0, 1_400_000, 302_000);
+    // A git repository the session ran in: sykli says its main is proven.
+    let repo = temp("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let cwd = repo.display().to_string();
+    let at = chrono::DateTime::from_timestamp(now().timestamp(), 0)
+        .unwrap()
+        .to_rfc3339();
+    let user = serde_json::json!({
+        "type": "user", "uuid": "u-r", "sessionId": "in-a-repo",
+        "cwd": cwd, "timestamp": at,
+        "message": {"role": "user", "content": "hi"}
+    });
+    std::fs::write(given.join("repo.jsonl"), format!("{user}\n")).unwrap();
+    // The sykli of the test: one fixed answer, whatever it is asked.
+    let fake = temp("bin");
+    std::fs::create_dir_all(&fake).unwrap();
+    let answer = serde_json::json!({
+        "schema": "sykli-branch-status.v1",
+        "base": {"branch": "main", "commit": "0000000000000000000000000000000000000000"},
+        "branches": [{
+            "branch": "main", "current": true,
+            "proof": "proven", "review": "-",
+            "ahead": 0, "behind": 0
+        }],
+        "warnings": []
+    });
+    std::fs::write(
+        fake.join("sykli"),
+        format!("#!/bin/sh\necho '{}'\n", answer),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(fake.join("sykli"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Three proposals wait for the person.
+    std::fs::create_dir_all(state.join("ohjaa/proposals/ours")).unwrap();
+    for name in ["a.md", "b.md", "c.md"] {
+        std::fs::write(state.join("ohjaa/proposals/ours").join(name), "x").unwrap();
+    }
+
+    let path = std::env::var_os("PATH").unwrap();
+    let run = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_vessa"));
+        command
+            .args(args)
+            .arg("--input")
+            .arg(given.to_str().unwrap())
+            .env("XDG_STATE_HOME", &state)
+            .env("PATH", {
+                let mut paths = std::env::split_paths(&path).collect::<Vec<_>>();
+                paths.insert(0, fake.clone());
+                std::env::join_paths(paths).unwrap()
+            })
+            .env_remove("HOME");
+        for marker in [
+            "TOIMIJA_SESSION",
+            "TOIMIJA_RUN",
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CLAUDE_CODE_SESSION_ID",
+            "CODEX_THREAD_ID",
+            "CODEX_SESSION_ID",
+            "CODEX_CI",
+            "CODEX_SANDBOX",
+            "CODEX_SANDBOX_NETWORK_DISABLED",
+            "CODEX_MANAGED_BY_NPM",
+            "PI_SESSION_ID",
+            "PI_CODING_AGENT",
+            "OPENCODE",
+            "OPENCODE_SESSION_ID",
+            "AI_AGENT",
+        ] {
+            command.env_remove(marker);
+        }
+        command.output().unwrap()
+    };
+
+    let out = run(&["collect"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = run(&["digest", "--no-collect"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        said.contains(&format!(
+            "{}  main proven",
+            repo.file_name().unwrap().to_string_lossy()
+        )),
+        "the digest must name the repository and its proof: {said}"
+    );
+    assert!(
+        said.contains("waiting for you: 3 proposals in ohjaa"),
+        "the digest must count what waits: {said}"
+    );
+    // The line carries what waits, from the fresh snapshot.
+    let out = run(&["line", "--always"]);
+    let line = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        line.contains("3 waiting for you (vessa digest)"),
+        "the line must carry what waits: {line}"
+    );
+    std::fs::remove_dir_all(state).unwrap();
+    std::fs::remove_dir_all(given).unwrap();
+    std::fs::remove_dir_all(repo).unwrap();
+}
+
+#[test]
+fn a_missing_sykli_is_said_not_guessed() {
+    let state = temp("state");
+    let given = temp("given");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&given).unwrap();
+    let repo = temp("repo2");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::process::Command::new("git")
+        .args(["init", "--quiet"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    let at = chrono::DateTime::from_timestamp(now().timestamp(), 0)
+        .unwrap()
+        .to_rfc3339();
+    let user = serde_json::json!({
+        "type": "user", "uuid": "u-r2", "sessionId": "in-a-repo2",
+        "cwd": repo.display().to_string(), "timestamp": at,
+        "message": {"role": "user", "content": "hi"}
+    });
+    std::fs::write(given.join("repo2.jsonl"), format!("{user}\n")).unwrap();
+    // A PATH with git but no sykli: the repository is found, its judge is
+    // not, and that is said.
+    let fake = temp("bin2");
+    std::fs::create_dir_all(&fake).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/usr/bin/git", fake.join("git")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vessa"))
+        .args(["collect"])
+        .arg("--input")
+        .arg(given.to_str().unwrap())
+        .env("XDG_STATE_HOME", &state)
+        .env("PATH", &fake)
+        .env_remove("HOME")
+        .env_remove("PI_SESSION_ID")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let snapshot: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(state.join("vessa/collected.json")).unwrap())
+            .unwrap();
+    let repos = snapshot["repos"].as_array().unwrap();
+    assert!(!repos.is_empty(), "the repository is still named");
+    assert!(
+        repos[0]["warning"]
+            .as_str()
+            .is_some_and(|why| why.contains("sykli")),
+        "the missing sykli must be said: {repos:?}"
+    );
+    std::fs::remove_dir_all(state).unwrap();
+    std::fs::remove_dir_all(given).unwrap();
+    std::fs::remove_dir_all(repo).unwrap();
+}

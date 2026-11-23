@@ -19,6 +19,7 @@ Contents:
 - [Statistics](#statistics)
 - [Claude Code status line](#claude-code-status-line)
 - [The terminal line](#the-terminal-line)
+- [Backup and restore](#backup-and-restore)
 - [Imported usage receipts](#imported-usage-receipts)
 - [The digest](#the-digest)
 - [Usage export](#usage-export)
@@ -48,6 +49,7 @@ Contents:
 | `vessa hook install` | Writes a `prepare-commit-msg` hook into this clone: each commit then points to the agent sessions that made it. See [Commit pointers](#commit-pointers). |
 | `vessa hook prepare-commit-msg FILE [SOURCE [SHA]]` | What that hook runs: adds an `Agent-Session` trailer per session. Never stops a commit. |
 | `vessa claude-statusline` | Renders Claude Code's status-line JSON from stdin. |
+| `vessa backup` | Copies every kept imported receipt into a directory of your choosing, with a manifest. Restore by importing again. |
 | `vessa import` | Keeps a usage receipt from elsewhere (`agent-usage.v1`, exactly as `vessa receipt` writes it) in vessa's own state, one per session, so `usage` and `stats` count sessions that ran on another machine. Strict: only that schema, no money. |
 | `vessa line` | What happened, for a person at a terminal's opening: today's agent sessions and their usage, one line. See [The terminal line](#the-terminal-line). |
 | `vessa collect` | Gathers what `vessa digest` reads into one snapshot: the last seven days' sessions, their usage, and the sources' warnings. |
@@ -424,6 +426,20 @@ spending, budgets, quotas or limits. Keep any existing status-line
 customization when you add this. See the
 [Claude Code status-line contract](https://code.claude.com/docs/en/statusline).
 
+## Backup and restore
+
+```sh
+vessa backup --to ~/somewhere-safe
+```
+
+The one part of vessa's state that cannot be re-read from anywhere is
+the imported receipts: everything else — cursors, the line log — the tools
+rebuild. `vessa backup --to DIR` copies every kept receipt into a directory
+of your choosing with a `vessa-backup.v1` manifest; run it whenever you
+import. Restoring is importing again: `vessa import --file DIR/<name>.json`
+per file, exactly as the first time. Point it at whatever backup you keep;
+vessa starts no daemon and mounts nothing.
+
 ## Imported usage receipts
 
 ```sh
@@ -489,6 +505,16 @@ command -v vessa >/dev/null && vessa line
 ```
 
 ## The digest
+
+The digest also names the work: the repositories the sessions ran in,
+each judged by this machine's sykli (`the work` section — name, main's proof,
+ahead/behind), and counts what waits for the person (`waiting for you: 3
+proposals in ohjaa`). The repositories come from where the sessions ran:
+their working directories, resolved to their git roots at collect time. A
+sykli that cannot run, or answers what vessa cannot read, is said as that,
+never guessed. The line carries what waits too: a fresh snapshot appends
+`· 3 waiting for you (vessa digest)` to the terminal line, so the terminal
+opening is where the person learns there is something to decide.
 
 ```sh
 vessa collect               # gather the snapshot now, and say what it read

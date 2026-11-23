@@ -104,6 +104,8 @@ struct Cursor {
 
 const CURSOR_SCHEMA: &str = "vessa-line-cursor.v1";
 const LINE_SCHEMA: &str = "vessa-line.v1";
+/// How long a collect's word on what waits still rides the line.
+const WAITING_WITHIN: chrono::TimeDelta = chrono::TimeDelta::seconds(12 * 3_600);
 
 /// Now, as an RFC 3339 UTC time: the crate's clock-less chrono builds
 /// `now` from the system clock, as `--since` does.
@@ -190,6 +192,22 @@ pub fn run(paths: &[PathBuf], warnings: &[String], json: bool, always: bool) -> 
     let shown_at = now().to_rfc3339();
     if !always && !due(cursor().ok().flatten().as_ref(), &line.day, &text) {
         return Ok(0);
+    }
+    // What waits for the person rides the line, from the last collect: the
+    // terminal opening is where the person actually looks. No process is
+    // started here; a snapshot older than half a day says nothing, and the
+    // next digest refreshes it.
+    let mut text = text;
+    if let Some(snapshot) = crate::digest::read_snapshot() {
+        let fresh = chrono::DateTime::parse_from_rfc3339(&snapshot.at)
+            .ok()
+            .is_some_and(|at| now() - at.with_timezone(&chrono::Utc) < WAITING_WITHIN);
+        if fresh && snapshot.waiting > 0 {
+            text.push_str(&format!(
+                " · {} waiting for you (vessa digest)",
+                snapshot.waiting
+            ));
+        }
     }
     println!("{text}");
     keep(&Cursor {
