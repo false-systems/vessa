@@ -319,3 +319,47 @@ fn a_session_read_here_is_never_counted_twice() {
     std::fs::remove_dir_all(state).unwrap();
     std::fs::remove_dir_all(given).unwrap();
 }
+
+#[test]
+fn a_backup_copies_every_kept_receipt_with_a_manifest() {
+    let state = temp("state");
+    let given = temp("given");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(&given).unwrap();
+    let file = receipt(&given, 11_111);
+    let out = vessa(&["import", "--file", file.to_str().unwrap()], &state);
+    assert_eq!(out.status.code(), Some(0));
+
+    let backup = given.join("backup");
+    let out = vessa(&["backup", "--to", backup.to_str().unwrap()], &state);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(backup.join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["schema"], "vessa-backup.v1");
+    assert_eq!(manifest["receipts"], 1);
+    assert!(backup.join("claude-elsewhere-1.json").exists());
+    // What was backed up imports again, whole: the round trip holds.
+    let restored = temp("restored");
+    std::fs::create_dir_all(&restored).unwrap();
+    let out = vessa(
+        &[
+            "import",
+            "--file",
+            backup.join("claude-elsewhere-1.json").to_str().unwrap(),
+        ],
+        &restored,
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert!(restored
+        .join("vessa/imported/claude-elsewhere-1.json")
+        .exists());
+    std::fs::remove_dir_all(state).unwrap();
+    std::fs::remove_dir_all(given).unwrap();
+    std::fs::remove_dir_all(restored).unwrap();
+}

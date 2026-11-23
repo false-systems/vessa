@@ -76,6 +76,28 @@ pub(crate) struct Collected {
     /// not hidden either.
     pub unplaced: usize,
     pub warnings: Vec<String>,
+    /// The repositories the sessions worked in, each judged by the sykli
+    /// of this machine. Absent in an older snapshot: none known then.
+    #[serde(default)]
+    pub repos: Vec<RepoState>,
+    /// Decisions waiting for the person: proposals in ohjaa's state.
+    #[serde(default)]
+    pub waiting: usize,
+}
+
+/// One repository the work touched, as the digest reports it.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub(crate) struct RepoState {
+    /// The git root's folder name.
+    pub name: String,
+    /// The git root, absolute.
+    pub root: String,
+    /// The default branch's proof there, as sykli says it: `proven`,
+    /// `failed`, `none` — or `unknown`, with `warning` saying why.
+    pub proof: String,
+    pub ahead: Option<u64>,
+    pub behind: Option<u64>,
+    pub warning: Option<String>,
 }
 
 /// The digest cursor: when a person last read a full digest.
@@ -159,12 +181,41 @@ pub fn collect(paths: &[PathBuf], warnings: &[String], background: bool) -> Resu
         });
     }
     sessions.sort_by(|a, b| b.last_at.cmp(&a.last_at));
+    // The work: the repositories the sessions ran in, each judged by this
+    // machine's sykli (the repos part of the human view; a session's folder
+    // is where it ran, resolved to its git root). Collected apart, so a
+    // session that cannot be placed in time still names its repository.
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for session in &report.sessions {
+        let cwd = PathBuf::from(&session.cwd);
+        if cwd.as_os_str().is_empty() || roots.iter().any(|known| known == &cwd) {
+            continue;
+        }
+        if let Ok(root) = git(
+            &cwd,
+            &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+        ) {
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+    roots.sort();
+    let repos: Vec<RepoState> = roots.iter().map(|root| repo_state(root)).collect();
+    // Waiting for the person: proposals in ohjaa's state, counted, nothing
+    // else read of them.
+    let waiting = state_dir()
+        .and_then(|vessa| vessa.parent().map(|state| state.join("ohjaa/proposals")))
+        .map(|proposals| count_files(&proposals))
+        .unwrap_or(0);
     let collected = Collected {
         schema: COLLECTED_SCHEMA.to_owned(),
         at: now.to_rfc3339(),
         sessions,
         unplaced,
         warnings,
+        repos,
+        waiting,
     };
     write(
         &dir.join("collected.json"),
@@ -339,7 +390,37 @@ pub fn digest(paths: &[PathBuf], since: Option<&str>, no_collect: bool, json: bo
             agents.join(", ")
         ));
     }
-    let gaps = collected.warnings.len() + collected.unplaced;
+    // The work: the repositories the sessions ran in, each judged by sykli.
+    // Said whatever the snapshot holds, however old — a collect refreshes it.
+    if !collected.repos.is_empty() {
+        text.push_str("\nthe work\n");
+        for repo in &collected.repos {
+            let mut line = format!("  {}  main {}", repo.name, repo.proof);
+            if let Some(ahead) = repo.ahead.filter(|ahead| *ahead > 0) {
+                line.push_str(&format!(", {ahead} ahead"));
+            }
+            if let Some(behind) = repo.behind.filter(|behind| *behind > 0) {
+                line.push_str(&format!(", {behind} behind"));
+            }
+            if let Some(why) = &repo.warning {
+                line.push_str(&format!(" ({why})"));
+            }
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    if collected.waiting > 0 {
+        text.push_str(&format!(
+            "\nwaiting for you: {} in ohjaa (`ohjaa review`)\n",
+            crate::render::many(collected.waiting, "proposal")
+        ));
+    }
+    let repos_unread = collected
+        .repos
+        .iter()
+        .filter(|repo| repo.warning.is_some())
+        .count();
+    let gaps = collected.warnings.len() + collected.unplaced + repos_unread;
     if gaps > 0 {
         let mut said = Vec::new();
         if collected.unplaced > 0 {
@@ -382,6 +463,8 @@ pub fn digest(paths: &[PathBuf], since: Option<&str>, no_collect: bool, json: bo
         "live": live.iter().map(|session| session.agent.clone()).collect::<Vec<_>>(),
         "warnings": collected.warnings,
         "unplaced": collected.unplaced,
+        "repos": collected.repos,
+        "waiting": collected.waiting,
     });
     if json {
         println!("{}", serde_json::to_string_pretty(&record)?);
@@ -431,6 +514,99 @@ fn parse(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
         .map(|at| at.with_timezone(&chrono::Utc))
 }
 
+/// One git answer, run in `cwd`: its stdout, trimmed. `git` is how a
+/// repository is found and named; vessa itself reads nothing of it beyond
+/// the root.
+fn git(cwd: &Path, args: &[&str]) -> Result<PathBuf, String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .map_err(|error| format!("git cannot run: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("git {:?} failed in {}", args, cwd.display()));
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim(),
+    ))
+}
+
+/// What this machine's sykli says of the repository at `root`: its default
+/// branch's proof, ahead and behind. Sykli absent, or an answer vessa cannot
+/// read, is a warning in the report — never a guess.
+fn repo_state(root: &Path) -> RepoState {
+    let name = root
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+    let said = std::process::Command::new("sykli")
+        .args(["status", "--json"])
+        .current_dir(root)
+        .output();
+    let mut state = RepoState {
+        name,
+        root: root.display().to_string(),
+        proof: "unknown".to_owned(),
+        ahead: None,
+        behind: None,
+        warning: None,
+    };
+    let output = match said {
+        Ok(output) => output,
+        Err(error) => {
+            state.warning = Some(format!("sykli cannot run: {error}"));
+            return state;
+        }
+    };
+    if !output.status.success() {
+        state.warning = Some(format!(
+            "sykli status exited {} in {}",
+            output.status.code().unwrap_or(-1),
+            root.display()
+        ));
+        return state;
+    }
+    let read: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(read) => read,
+        Err(error) => {
+            state.warning = Some(format!("sykli's answer is not JSON: {error}"));
+            return state;
+        }
+    };
+    // `sykli-branch-status.v1`: the base names the default branch, and the
+    // entry of that branch carries its proof.
+    let base = read["base"]["branch"].as_str().unwrap_or("main").to_owned();
+    let entry = read["branches"]
+        .as_array()
+        .and_then(|branches| {
+            branches
+                .iter()
+                .find(|entry| entry["branch"].as_str() == Some(base.as_str()))
+                .cloned()
+        })
+        .unwrap_or(serde_json::Value::Null);
+    state.proof = entry["proof"].as_str().unwrap_or("unknown").to_owned();
+    state.ahead = entry["ahead"].as_u64();
+    state.behind = entry["behind"].as_u64();
+    state
+}
+
+/// Every regular file under `dir`, recursively: the count of what waits.
+fn count_files(dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut count = 0;
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => count += count_files(&entry.path()),
+            Ok(_) => count += 1,
+            Err(_) => {}
+        }
+    }
+    count
+}
+
 fn state_dir() -> Option<PathBuf> {
     let absolute = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
@@ -444,6 +620,12 @@ fn state_dir() -> Option<PathBuf> {
                 .join("vessa")
         }),
     }
+}
+
+/// The last snapshot, wherever this command runs: what the line reads for
+/// what waits. Old snapshots parse too — their absent parts are defaults.
+pub(crate) fn read_snapshot() -> Option<Collected> {
+    state_dir().and_then(|dir| read(&dir))
 }
 
 fn read(dir: &Path) -> Option<Collected> {

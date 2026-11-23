@@ -26,7 +26,7 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 
 use crate::model;
 
@@ -341,6 +341,54 @@ fn unreadable(name: &str, why: &str) -> model::Session {
         subagent: false,
         partly_sidechain: false,
     }
+}
+
+/// `vessa backup --to DIR`: copy every kept receipt into a directory of the
+/// person's choosing, with a manifest. The receipts are the part of vessa's
+/// state that cannot be re-read from anywhere; the cursors can. Restoring
+/// is importing again: `vessa import --file DIR/<name>.json` per file.
+pub fn backup(to: &std::path::Path) -> Result<i32> {
+    let Some(dir) = state_dir() else {
+        bail!("neither XDG_STATE_HOME nor HOME names a state directory");
+    };
+    std::fs::create_dir_all(to).with_context(|| format!("{} cannot be made", to.display()))?;
+    let imported = dir.join("imported");
+    let mut kept = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&imported) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                let name = path.file_name().unwrap_or_default();
+                let there = to.join(name);
+                std::fs::copy(&path, &there)
+                    .with_context(|| format!("{} cannot be written", there.display()))?;
+                kept.push(name.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let manifest = serde_json::json!({
+        "schema": "vessa-backup.v1",
+        "receipts": kept.len(),
+        "at": chrono::DateTime::from_timestamp(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64,
+            0,
+        )
+        .unwrap_or_default()
+        .to_rfc3339(),
+    });
+    std::fs::write(
+        to.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )
+    .with_context(|| format!("{} cannot be written", to.join("manifest.json").display()))?;
+    println!(
+        "vessa: backed up {} to {}",
+        crate::render::many(kept.len(), "receipt"),
+        to.display()
+    );
+    Ok(0)
 }
 
 fn state_dir() -> Option<PathBuf> {

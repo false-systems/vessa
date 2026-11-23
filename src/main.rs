@@ -85,6 +85,15 @@ enum Cmd {
         #[arg(long = "file", required = true)]
         file: Vec<PathBuf>,
     },
+    /// Copy every kept imported receipt into a directory of your choosing,
+    /// with a manifest — the one part of vessa's state that cannot be re-read
+    /// from anywhere. Restore by importing the files again. Exit codes: 0
+    /// written, 2 the directory cannot be made or written.
+    Backup {
+        /// Where to write the backup.
+        #[arg(long = "to", required = true)]
+        to: PathBuf,
+    },
     /// Render Claude Code's native status-line JSON from stdin.
     ClaudeStatusline,
     /// What happened, for the person at a terminal's opening: today's agent
@@ -242,6 +251,9 @@ fn run_once(cli: Cli) -> Result<i32> {
     }
     if let Cmd::Import { file } = &cli.command {
         return imported::store(file);
+    }
+    if let Cmd::Backup { to } = &cli.command {
+        return imported::backup(to);
     }
     if let Cmd::Line { always } = cli.command {
         // A line reads the agents' own folders unless told otherwise, and
@@ -408,6 +420,7 @@ fn run_once(cli: Cli) -> Result<i32> {
         | Cmd::Messages { .. }
         | Cmd::Hook { .. }
         | Cmd::Import { .. }
+        | Cmd::Backup { .. }
         | Cmd::Line { .. }
         | Cmd::Collect { .. }
         | Cmd::Digest { .. }
