@@ -19,6 +19,7 @@ Contents:
 - [Statistics](#statistics)
 - [Claude Code status line](#claude-code-status-line)
 - [The terminal line](#the-terminal-line)
+- [Imported usage receipts](#imported-usage-receipts)
 - [The digest](#the-digest)
 - [Usage export](#usage-export)
 - [Receipts](#receipts)
@@ -47,6 +48,7 @@ Contents:
 | `vessa hook install` | Writes a `prepare-commit-msg` hook into this clone: each commit then points to the agent sessions that made it. See [Commit pointers](#commit-pointers). |
 | `vessa hook prepare-commit-msg FILE [SOURCE [SHA]]` | What that hook runs: adds an `Agent-Session` trailer per session. Never stops a commit. |
 | `vessa claude-statusline` | Renders Claude Code's status-line JSON from stdin. |
+| `vessa import` | Keeps a usage receipt from elsewhere (`agent-usage.v1`, exactly as `vessa receipt` writes it) in vessa's own state, one per session, so `usage` and `stats` count sessions that ran on another machine. Strict: only that schema, no money. |
 | `vessa line` | What happened, for a person at a terminal's opening: today's agent sessions and their usage, one line. See [The terminal line](#the-terminal-line). |
 | `vessa collect` | Gathers what `vessa digest` reads into one snapshot: the last seven days' sessions, their usage, and the sources' warnings. |
 | `vessa digest` | What happened since the last digest (`--since` asks instead), from that snapshot: a line per session, who is live, gaps said as gaps. See [The digest](#the-digest). |
@@ -421,6 +423,32 @@ line always prints and exits 0. It makes no model calls and shows no
 spending, budgets, quotas or limits. Keep any existing status-line
 customization when you add this. See the
 [Claude Code status-line contract](https://code.claude.com/docs/en/statusline).
+
+## Imported usage receipts
+
+```sh
+vessa receipt --session ID --json > receipt.json   # on the other machine
+vessa import --file receipt.json                    # kept, one per session
+```
+
+A receipt is an `agent-usage.v1` document exactly as `vessa receipt` writes
+it. The import is strict, as an import of an assertion must be: only that
+schema, only the fields that schema has, and no field of money — prices,
+credits, billing are out for good, so a receipt that carries one is refused
+whole, never stripped and counted. An import never changes the file it
+reads; the receipt is kept in vessa's own state, one file per session
+(`$XDG_STATE_HOME/vessa/imported/`), so a session is never counted twice
+however often its receipt is imported: the same bytes again are said to be
+kept already, different bytes replace what was there, and are said to.
+Remove one by deleting its file.
+
+What is kept is counted by `vessa usage` and `vessa stats`, placed at the
+receipt's observation time, alongside the native sessions. A receipt whose
+session is also read from its transcript here is skipped by those commands
+and said so, so nothing is counted twice. A receipt carries its own
+limitations, so a count that includes one is usually partial (exit 4) with
+the numbers still there. A kept file that no longer passes the import"s
+check is a session with a limitation, never a silent gap.
 
 ## The terminal line
 
