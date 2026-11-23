@@ -1,5 +1,6 @@
 mod hook;
 mod import;
+mod line;
 mod metrics;
 mod model;
 mod opencode;
@@ -74,6 +75,16 @@ enum Cmd {
     },
     /// Render Claude Code's native status-line JSON from stdin.
     ClaudeStatusline,
+    /// What happened, for the person at a terminal's opening: today's agent
+    /// sessions and their usage, one line, from this machine's session
+    /// folders. Prints only at a terminal with no agent session running,
+    /// once a day or when it changes; gaps are said, never an all-clear.
+    /// Reads no git and no network, starts nothing, always exits 0.
+    Line {
+        /// Print now, whatever the cursor and stdout say; counts as shown.
+        #[arg(long)]
+        always: bool,
+    },
     /// The messages people typed into agent sessions, each with the agent
     /// reply it follows; harness, tool, subagent and headless turns are
     /// counted by rule, not listed. Every secret-looking token in what is
@@ -193,6 +204,18 @@ fn run_once(cli: Cli) -> Result<i32> {
         println!("{}", metrics::claude_statusline(&input));
         return Ok(0);
     }
+    if let Cmd::Line { always } = cli.command {
+        // A line reads the agents' own folders unless told otherwise, and
+        // never fails a terminal: its errors are said, and it exits 0.
+        let (paths, not_installed) = match inputs(&cli) {
+            Ok(found) => found,
+            Err(error) => {
+                eprintln!("vessa line: {error:#}");
+                return Ok(0);
+            }
+        };
+        return line::run(&paths, &not_installed, cli.json, always);
+    }
     if let Cmd::Messages { since, raw, commit } = &cli.command {
         return messages(&cli, since.as_deref(), *raw, commit.as_deref());
     }
@@ -309,6 +332,7 @@ fn run_once(cli: Cli) -> Result<i32> {
         Cmd::ClaudeStatusline
         | Cmd::Messages { .. }
         | Cmd::Hook { .. }
+        | Cmd::Line { .. }
         | Cmd::Share { .. }
         | Cmd::Team { .. } => unreachable!(),
         Cmd::Status => {

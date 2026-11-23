@@ -28,6 +28,7 @@
         "rust-toolchain.toml",
         "src/hook.rs",
         "src/import.rs",
+        "src/line.rs",
         "src/main.rs",
         "src/metrics.rs",
         "src/model.rs",
@@ -39,6 +40,7 @@
         "tests/cli.rs",
         "tests/hook.rs",
         "tests/instructions.rs",
+        "tests/line.rs",
         "tests/support/mod.rs",
         "tests/team.rs"
       ],
@@ -77,6 +79,7 @@
         "rust-toolchain.toml",
         "src/hook.rs",
         "src/import.rs",
+        "src/line.rs",
         "src/main.rs",
         "src/metrics.rs",
         "src/model.rs",
@@ -88,6 +91,7 @@
         "tests/cli.rs",
         "tests/hook.rs",
         "tests/instructions.rs",
+        "tests/line.rs",
         "tests/support/mod.rs",
         "tests/team.rs"
       ],
@@ -127,6 +131,7 @@
         "rust-toolchain.toml",
         "src/hook.rs",
         "src/import.rs",
+        "src/line.rs",
         "src/main.rs",
         "src/metrics.rs",
         "src/model.rs",
@@ -138,6 +143,7 @@
         "tests/cli.rs",
         "tests/hook.rs",
         "tests/instructions.rs",
+        "tests/line.rs",
         "tests/support/mod.rs",
         "tests/team.rs"
       ],
